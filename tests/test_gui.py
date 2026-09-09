@@ -8534,6 +8534,167 @@ def test_linked_lesion_identity():
 
 
 
+def test_global_ui_state_fixes(app):
+    """六项已复现缺陷：真实对比入口、离线工程读写与Qt滚轮，不运行模型。"""
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from pydicom.uid import generate_uid
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtTest import QTest
+
+    from project_store import capture_project_snapshot, load_project_snapshot, save_project_snapshot
+    from study_data import StudyDocument, read_series_directory
+
+    print('[全局UI状态：对比/离线工程/即时Zoom]')
+    with tempfile.TemporaryDirectory() as directory:
+        paths = []
+        for case in range(2):
+            path = Path(directory) / str(case); path.mkdir(); uid = generate_uid(); paths.append(path)
+            for z in range(8):
+                _write_min_dcm(str(path / f'{z}.dcm'), (64, 80), uid, z*2, z+1,
+                               pixels=np.arange(64*80, dtype=np.int16).reshape(64, 80)+case*20,
+                               pixel_spacing=(.7, .7), rescale_type='HU')
+        source = read_series_directory(str(paths[1])).series[0]
+        offline = StudyDocument(source.study_uid); offline.attach_sources([source])
+        offline.edit_mask(source.series_uid, [10], 255)
+        project = Path(directory) / 'offline.miwproj'
+        save_project_snapshot(capture_project_snapshot(offline), project)
+        check(all(record.source is None for record in load_project_snapshot(project).series.values()),
+              '离线候选从真实工程包读取，未携带源影像')
+        v = m.MedicalViewer(project_dir=str(Path(directory)/'projects'), autosave=False)
+        v._kickoff_ai = lambda: None
+        try:
+            v.show(); v.load_data(str(paths[0])); v.resize(1280, 800)
+            v.combo_layout.setCurrentIndex(2); v.btn_mpr.setChecked(True); QTest.qWait(150)
+            v.views[2]['cb_proj'].setCurrentIndex(1); v.views[2]['sp_thick'].setValue(3)
+            view = v.views[2]['view']; view.scale(3, 3); view._user_zoomed = True; view.centerOn(30, 4)
+            camera = view.transform(); center = view.mapToScene(view.viewport().rect().center())
+            v.top_splitter.setSizes([500, 350]); QTest.qWait(30)
+            center = view.mapToScene(view.viewport().rect().center())
+            sizes = [s.sizes() for s in (v.top_splitter, v.bottom_splitter, v.main_splitter)]
+            planes = [vd['plane'] for vd in v.views.values()]; revision = v.study_document.revision
+            for via_recon in (False, True):
+                with patch('compare_lab.QFileDialog.getExistingDirectory', return_value=str(paths[1])):
+                    v.toggle_compare()
+                QTest.qWait(40)
+                check(v.compare_mode_active and view.image_item.pixmap().height() == 64,
+                      '真实对比入口绘制既往轴位影像')
+                check(all(not vd[key].isVisible() for vd in v.views.values()
+                          for key in ('cb_plane', 'preset', 'cb_proj', 'sp_thick', 'chk_anno')),
+                      '对比隐藏不适用的方向/投影/独立窗位控件，不伪示冠状面')
+                check(not view._user_zoomed and not v.btn_mpr.isChecked(),
+                      '对比使用自己的适配状态并暂停临床MPR')
+                if via_recon:
+                    v.tabs.setCurrentIndex(1); v.tabs.setCurrentIndex(0)
+                else:
+                    v.toggle_compare()
+                QTest.qWait(40)
+                check(all(vd['title_label'].text() == f'V{vid}' for vid, vd in v.views.items()),
+                      '退出对比后临床标题不残留既往或差值')
+                check(v.btn_mpr.isChecked() and planes == [vd['plane'] for vd in v.views.values()]
+                      and v.views[2]['cb_proj'].currentIndex() == 1 and v.views[2]['sp_thick'].value() == 3,
+                      '对比往返保留MPR、每窗平面和投影参数，不触发默认平面重排')
+                after = view.mapToScene(view.viewport().rect().center())
+                check(view.transform() == camera and abs(after.x()-center.x()) < 1 and abs(after.y()-center.y()) < 1,
+                      '直接退出或经重建返回均恢复原临床观察位置')
+                check(sizes == [s.sizes() for s in (v.top_splitter, v.bottom_splitter, v.main_splitter)]
+                      and v.study_document.revision == revision, '对比往返恢复分隔比例且不修改文档')
+            zoom_view = v.views[1]['view']; v.update_display(); QTest.qWait(30)
+            pos = QPointF(zoom_view.viewport().rect().center()); before = zoom_view.transform().m11()
+            event = QWheelEvent(pos, QPointF(zoom_view.viewport().mapToGlobal(pos.toPoint())), QPoint(),
+                                QPoint(0, 120), Qt.NoButton, Qt.ControlModifier, Qt.NoScrollPhase, False)
+            app.sendEvent(zoom_view.viewport(), event); QTest.qWait(30)
+            check(zoom_view.transform().m11() != before and
+                  f'Zoom: {zoom_view.transform().m11()*100:.0f}%' in zoom_view.overlay_lines['bl'],
+                  '实际Ctrl滚轮后Zoom即时反映画面变换，无需翻片')
+            v.resize(1024, 800); v.reset_all_states(); QTest.qWait(40)
+            check(f'Zoom: {zoom_view.transform().m11()*100:.0f}%' in zoom_view.overlay_lines['bl'],
+                  '布局/显示重置后的Zoom同样与当前变换一致')
+            v.on_auto_ai_finished(np.full(v.volume_hu.shape, 5, np.uint8), 1); QTest.qWait(30)
+            check(bool(v.lbl_ai_legend.text()) and v.btn_export_stats.isEnabled(), '合成AI完成回调建立旧结果前提')
+            check(v.open_project(str(project)), '通过产品入口打开不同来源的离线工程')
+            QTest.qWait(40)
+            check(v.volume_hu is None and not v.lbl_ai_legend.text() and not v.lbl_ai_stats.text()
+                  and not v.btn_export_stats.isEnabled() and not v.btn_mesh3d.isEnabled()
+                  and '检出' not in v.lbl_ai_status.text(), '离线工程同步清旧AI状态、图例、统计及结果按钮')
+            check(v.primary_view_stack.currentIndex() == 1 and v.study_document.series[source.series_uid].working_mask.any(),
+                  '离线来源引导可见且已保存标注仍在')
+            v.tabs.setCurrentIndex(1); v.PHANTOM_N = 32; v.toggle_phantom(); QTest.qWait(30)
+            check(v.open_project(str(project)), '重建模体在场时可重新打开离线工程')
+            QTest.qWait(40)
+            check(v._phantom_img is not None and not v.views[1]['view'].image_item.pixmap().isNull()
+                  and v.btn_gen_sino.isEnabled() and '模体' in v.views[1]['title_label'].text(),
+                  '独立模体保留时V1同步重绘，不出现可计算却纯黑的状态')
+            v.tabs.setCurrentIndex(0); QTest.qWait(30)
+            check(v.primary_view_stack.currentIndex() == 1 and v.btn_empty_import.isVisible(),
+                  '模体与离线工程分开显示，回阅片仍可连接原始DICOM')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_workspace_frame_stability(app):
+    """以实际viewport边界拒绝工具条塌缩；空态不参与影像几何或抢占鼠标。"""
+    import tempfile
+
+    from pydicom.uid import generate_uid
+    from PySide6.QtTest import QTest
+
+    print('[功能区框架与重建空态]')
+    with tempfile.TemporaryDirectory() as directory:
+        uid = generate_uid()
+        for z in range(3):
+            _write_min_dcm(os.path.join(directory, f'{z}.dcm'), (32, 40), uid, z, z+1, pix=100)
+        v = m.MedicalViewer(project_dir=os.path.join(directory, 'projects'), autosave=False)
+        v._kickoff_ai = lambda: None
+        def frames():
+            return [(vd['toolbar'].height(), vd['view'].viewport().mapTo(v, vd['view'].viewport().rect().topLeft()),
+                     vd['view'].viewport().size()) for vd in v.views.values()]
+        try:
+            v.show(); v.load_data(directory); v.combo_layout.setCurrentIndex(2); QTest.qWait(150)
+            for english in (False, True):
+                if v.is_english != english:
+                    v.toggle_language()
+                for width in (1600, 1024):
+                    v.resize(width, 800); QTest.qWait(50); before = frames()
+                    v.tabs.setCurrentIndex(1); QTest.qWait(50)
+                    check(frames() == before, f'{width}px/EN={english}切入重建：四窗工具栏高度、画布位置尺寸完全一致')
+                    check(all(v.views[i]['view'].empty_label.isVisible() for i in (2, 3, 4))
+                          and all(v.views[i]['view'].image_item.pixmap().isNull() for i in (2, 3, 4)),
+                          f'{width}px/EN={english}空窗说明可见，未用伪图像填充场景')
+                    check(all(v.views[i]['view'].empty_label.testAttribute(Qt.WA_TransparentForMouseEvents)
+                              and v.views[i]['view'].empty_label.text() for i in (2, 3, 4)),
+                          f'{width}px/EN={english}空态有文字且不拦截影像鼠标事件')
+                    v.tabs.setCurrentIndex(0); QTest.qWait(50)
+                    check(frames() == before and all(not vd['view'].empty_label.isVisible() for vd in v.views.values()),
+                          f'{width}px/EN={english}切回阅片边界不动，重建空态无残留')
+            v.resize(1600, 800); QTest.qWait(40)
+            v.top_splitter.setSizes([700, 500]); v.bottom_splitter.setSizes([500, 700])
+            v.main_splitter.setSizes([450, 300]); QTest.qWait(40); before = frames()
+            v.tabs.setCurrentIndex(1); QTest.qWait(40)
+            check(frames() == before, '用户拖动分隔线后的四窗边界在切入重建时保留')
+            v.tabs.setCurrentIndex(0); QTest.qWait(40)
+            check(frames() == before, '切回阅片恢复用户分隔比例，不强制均分')
+            v.tabs.setCurrentIndex(1); v.PHANTOM_N = 32; v.toggle_phantom()
+            v.rad_60.setChecked(True); v.generate_sinogram(); QTest.qWait(40)
+            check(not v.views[2]['view'].empty_label.isVisible()
+                  and v.views[3]['view'].empty_label.isVisible() and v.views[4]['view'].empty_label.isVisible(),
+                  '生成投影后仅投影窗退出空态，未计算的结果窗继续提供引导')
+            v.run_fbp(); QTest.qWait(40)
+            check(all(not v.views[i]['view'].empty_label.isVisible() for i in (2, 3, 4)),
+                  'FBP输出显示后全部对应空态退场')
+            v.tabs.setCurrentIndex(0); v.tabs.setCurrentIndex(1); QTest.qWait(40)
+            check(all(not v.views[i]['view'].empty_label.isVisible() for i in (2, 3, 4)),
+                  '缓存结果切回后不被空态覆盖')
+            v.toggle_phantom(); QTest.qWait(40)
+            check(all(v.views[i]['view'].empty_label.isVisible() for i in (2, 3, 4)),
+                  '更换来源作废结果后空态重新出现')
+        finally:
+            v.close(); app.processEvents()
+
+
 def test_ui_transition_continuity(app):
     """真实Qt切换往返：浏览状态保留，重建结果按来源失效，旧回调不得改新功能区。"""
     import tempfile
@@ -8626,6 +8787,163 @@ def test_ui_transition_continuity(app):
             check(view.transform() == expected, '旧重建延迟回调不覆盖返回后的临床缩放')
         finally:
             v.close(); app.processEvents()
+
+
+def test_help_search():
+    """全文检索在无Qt模块中完成；片段必须指向真实内容而非模糊占位。"""
+    from help_topics import TOPICS, search_topics
+
+    check(set(TOPICS) == {'browse', 'window', 'mpr', 'roi', 'annotation', 'ai', 'compare', 'project', 'recon'},
+          '帮助覆盖九个约定的任务主题')
+    check(all(len(t['sections']) >= 3 and all(k in TOPICS for k in t['related']) for t in TOPICS.values()),
+          '所有主题具备详细小节且关联无断链')
+    for english, term in ((False, 'HU'), (True, 'calibration')):
+        matches = search_topics(term, english)
+        check(any(m['topic'] == 'window' and m['section'] == 2 and term.casefold() in m['snippet'].casefold()
+                  for m in matches), f'全文搜索含折叠正文与真实匹配摘要 EN={english}')
+    check(search_topics('  ', False) == [] and search_topics('unfindable-xx-zz', True) == [], '空白或无匹配搜索不伪造结果')
+    check(search_topics('roi', True) == search_topics(' ROI ', True), '英文搜索忽略大小写与首尾空格')
+    check(any(m['topic'] == 'project' for m in search_topics('DICOM 保存')), '多关键词共同限定搜索结果')
+    check(any(m['section'] is not None for m in search_topics('无法标注')), '常见问题搜索能定位操作前提小节')
+
+
+def test_help_navigation(app):
+    import tempfile
+
+    from PySide6.QtTest import QTest
+
+    from help_topics import TOPICS
+
+    with tempfile.TemporaryDirectory() as directory:
+        v = m.MedicalViewer(project_dir=directory, autosave=False)
+        v.show(); v.show_help_center(); QTest.qWait(40)
+        h = v._help_center; h.select_topic('window', 0); QTest.qWait(40)
+        parent_state = (v.slider_ww.value(), v.slider_wl.value(), v.tabs.currentIndex(), v.tool_btn_group.checkedId(),
+                        tuple(v.current_3d_pos), v.views[1]['view'].transform(), v.main_splitter.sizes())
+        h.diagram.width_slider.setValue(20); h.diagram.level_slider.setValue(70)
+        check(h.diagram.plot.width_value == 20 and h.diagram.plot.level_value == 70, '教学图解滑条确实更新映射')
+        h.scroll.verticalScrollBar().setValue(150); before = h.scroll.verticalScrollBar().value()
+        QTest.mouseClick(h.related_buttons['roi'], Qt.LeftButton); QTest.qWait(40)
+        check(h.topic_id == 'roi', '相关主题按钮可跳转')
+        QTest.mouseClick(h.back_button, Qt.LeftButton); QTest.qWait(40)
+        check(h.topic_id == 'window' and h.sections[0][0].isChecked()
+              and abs(h.scroll.verticalScrollBar().value() - before) <= 1, '返回恢复展开状态与滚动位置')
+        check(h.diagram.width_slider.value() == 20 and h.diagram.level_slider.value() == 70, '返回保留教学示例参数')
+        QTest.mouseClick(h.forward_button, Qt.LeftButton); QTest.qWait(40)
+        check(h.topic_id == 'roi', '前进恢复下一页')
+        h.go_back(); QTest.qWait(20); h.select_topic('project'); QTest.qWait(20)
+        check(not h.forward_button.isEnabled(), '返回后新导航截断旧前进分支')
+        h.select_topic('recon', 0); QTest.qWait(30)
+        h.scroll.verticalScrollBar().setValue(300); before = h.scroll.verticalScrollBar().value()
+        h.search.setText('重建实验室'); QTest.qWait(20)
+        overview = next(h.results.item(i) for i in range(h.results.count())
+                        if h.results.item(i).data(Qt.UserRole) == ('recon', None))
+        QTest.mouseClick(h.results.viewport(), Qt.LeftButton, pos=h.results.visualItemRect(overview).center()); QTest.qWait(30)
+        check(h.topic_id == 'recon' and h.scroll.verticalScrollBar().value() == 0, '同主题搜索概览定位顶部')
+        h.go_back(); QTest.qWait(30)
+        check(abs(h.scroll.verticalScrollBar().value() - before) <= 1, '概览跳转可返回原阅读位置')
+        h.search.setText('HU'); QTest.qWait(20)
+        result = next(h.results.item(i) for i in range(h.results.count())
+                      if h.results.item(i).data(Qt.UserRole) == ('window', 2))
+        h.results.setCurrentItem(result); h.results.scrollToItem(result)
+        QTest.keyClick(h.results, Qt.Key_Return); QTest.qWait(30)
+        check(h.topic_id == 'window' and h.sections[2][0].isChecked(), '键盘搜索结果展开对应小节')
+        anchor_y = h.sections[2][0].mapTo(h.scroll.viewport(), h.sections[2][0].rect().topLeft()).y()
+        check(0 <= anchor_y < h.scroll.viewport().height(), '搜索小节标题定位在可见区域')
+        h.resize(430, 600); QTest.qWait(30)
+        check(not h.sidebar.isVisible() and h.scroll.isVisible(), '窄窗默认将宽度留给正文')
+        QTest.mouseClick(h.catalog_button, Qt.LeftButton); QTest.qWait(20)
+        check(h.sidebar.isVisible() and not h.scroll.isVisible(), '窄窗目录不与正文挤在一起')
+        h.search.setText('找不到的主题xyz'); QTest.qWait(20)
+        check(h.no_results.isVisible(), '窄窗无结果提示可见')
+        h.close(); v.show_help_center(); QTest.qWait(30)
+        check(h.scroll.isVisible() and not h.sidebar.isVisible(), '窄窗搜索后重开直接显示当前功能正文')
+        v.clinical_sections.setCurrentIndex(2); QTest.qWait(20)
+        old_topic = h.topic_id
+        check(old_topic != 'ai', '主窗切到结果页不自动跳转帮助')
+        QTest.mouseClick(h.current_button, Qt.LeftButton); QTest.qWait(30)
+        check(h.topic_id == 'ai', '主动查看当前功能定位结果主题')
+        v.clinical_sections.setCurrentIndex(0)
+        check((v.slider_ww.value(), v.slider_wl.value(), v.tabs.currentIndex(), v.tool_btn_group.checkedId(),
+               tuple(v.current_3d_pos), v.views[1]['view'].transform(), v.main_splitter.sizes()) == parent_state,
+              '导航搜索图解交互未修改主窗调窗camera工具与切片')
+        for key in TOPICS:
+            h.select_topic(key, 0); QTest.qWait(5)
+        check(not v._phantom_img and v.current_sinogram is None and v.study_document is None,
+              '浏览所有主题不加载数据或创建实验结果')
+        v.close(); v.deleteLater(); app.processEvents()
+
+
+def test_help_center(app):
+    """帮助只读契约：真实窗口操作不能改画布、浏览状态或触发主窗快捷键。"""
+    import tempfile
+
+    from PySide6.QtTest import QTest
+
+    with tempfile.TemporaryDirectory() as directory:
+        v = m.MedicalViewer(project_dir=directory, autosave=False)
+        v.show(); app.processEvents()
+        check(getattr(v, '_help_center', None) is None, '帮助默认关闭且延迟创建')
+        v.views[1]['view'].scale(1.3, 1.3)
+
+        def snapshot():
+            return (tuple(v.main_splitter.sizes()), tuple(v.top_splitter.sizes()),
+                    tuple(v.current_3d_pos), v.tool_btn_group.checkedId(),
+                    tuple((d['view'].viewport().size(), d['view'].transform(),
+                           d['view'].mapToScene(d['view'].viewport().rect().center()))
+                          for d in v.views.values()))
+
+        before = snapshot()
+        QTest.mouseClick(v.btn_help, Qt.LeftButton); app.processEvents()
+        h = v._help_center
+        check(h.isVisible() and not h.isModal(), '帮助为非模态独立窗口')
+        check(h.topic_id == 'browse', '空载帮助定位开始阅片')
+        h.select_topic('window'); app.processEvents()
+        check(all(not b.isVisible() for _, b in h.sections), '深入内容默认折叠')
+        QTest.mouseClick(h.sections[0][0], Qt.LeftButton); app.processEvents()
+        check(h.sections[0][1].isVisible(), '展开原理可阅读')
+        QTest.keyClick(h.search, Qt.Key_Return); app.processEvents()
+        check(h.sections[0][1].isVisible(), '搜索Enter不重置阅读展开状态')
+        item = h.topic_items['window']
+        QTest.mouseClick(h.directory.viewport(), Qt.LeftButton, pos=h.directory.visualItemRect(item).center())
+        check(h.sections[0][1].isVisible() and h.directory.currentItem() is item, '重选当前主题保留阅读与选中状态')
+        h.search.setText('HU'); app.processEvents()
+        check(h.results.count() > 0 and any(h.results.item(i).data(Qt.UserRole) == ('window', 2)
+                                          for i in range(h.results.count())), '搜索包含折叠正文并返回小节定位')
+        h.search.setText('no-matching-topic'); app.processEvents()
+        check(h.no_results.isVisible() and h.topic_id == 'window', '无匹配提示不替换阅读页')
+        h.search.clear()
+        calls = []
+        old_key = v.keyPressEvent
+        v.keyPressEvent = lambda event: calls.append(event.key())
+        h.sections[0][0].setFocus()
+        for key in (Qt.Key_Space, Qt.Key_PageDown, Qt.Key_PageUp):
+            QTest.keyClick(h.sections[0][0], key)
+        QTest.keyClick(h.search, Qt.Key_Z, Qt.ControlModifier)
+        v.keyPressEvent = old_key
+        check(not calls, '帮助Space/翻页/Ctrl+Z不传播到主窗')
+        check(snapshot() == before, '打开搜索展开帮助不改变画布尺寸camera切片工具')
+        v.show_help_center(); app.processEvents()
+        check(v._help_center is h, '重复打开复用窗口')
+        v.tabs.setCurrentWidget(v.tab_recon); app.processEvents()
+        v.show_help_center()
+        check(h.topic_id == 'window', '功能切换不打断已打开的帮助阅读')
+        h.close(); v.show_help_center(); app.processEvents()
+        check(h.topic_id == 'recon', '重新打开定位重建主题')
+        check(v._phantom_img is None and v.current_sinogram is None, '阅读练习不执行模体或重建')
+        QTest.keyClick(h, Qt.Key_Escape); app.processEvents()
+        check(not h.isVisible(), 'Escape关闭帮助')
+        QTest.qWait(100)
+        check(app.activeWindow() is v and app.focusWidget() is not None, '关闭帮助恢复主窗键盘焦点')
+        v.btn_panel_toggle.setChecked(False)
+        QTest.keyClick(v, Qt.Key_F1); QTest.qWait(100)
+        check(h.isVisible(), '收起控制面板后F1仍可打开帮助')
+        h.close()
+        v.toggle_language(); v.show_help_center(); app.processEvents()
+        check(v._help_center.windowTitle() == 'Help and learning', '重开帮助采用当前英文语言')
+        v.close(); app.processEvents()
+        check(not v._help_center.isVisible(), '主窗关闭不残留帮助窗口')
+        v.deleteLater(); app.processEvents()
 
 
 def test_ui_task_workflow(app):
@@ -10400,9 +10718,14 @@ def main_run():
     test_linked_lesion_identity()
     test_document_clear_and_track(app)
     test_ui_task_workflow(app)
+    test_help_center(app)
+    test_help_search()
+    test_help_navigation(app)
     test_ui_empty_and_source_states(app)
     test_compact_view_controls(app)
     test_ui_transition_continuity(app)
+    test_workspace_frame_stability(app)
+    test_global_ui_state_fixes(app)
     test_pixel_transform_boundaries(app)
     test_study_candidate_loading()
     test_patient_plane_sampler()

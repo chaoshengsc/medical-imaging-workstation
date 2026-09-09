@@ -13,6 +13,7 @@
 # =============================================================================
 
 import numpy as np
+from PySide6.QtCore import QSignalBlocker
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
@@ -83,33 +84,95 @@ class CompareMixin:
         return a if a.size and np.isfinite(a).all() else None
 
     def _enter_compare_mode(self):
-        """进入对比模式：强制双窗、关闭 MPR、切换按钮文案。"""
+        """进入独立对比视图；临床观察位置与布局只在有效来源下恢复。"""
         self._cancel_view_interactions()
-        self.compare_mode_active = True
-        self._primary_zpos = self._zpos_array(self.dicom_datasets)
-        self._compare_zpos = self._zpos_array(self.compare_datasets)
         self._pre_compare_layout = self.combo_layout.currentIndex()
-        self.btn_mpr.setChecked(False)
-        for vd in self.views.values():
-            vd['view'].draw_crosshair(0, 0, show=False)
-        self.combo_layout.setCurrentIndex(1)   # 1x2 双窗
-        self.btn_compare.setText("Exit Compare" if self.is_english else "退出对比")
-        self.chk_register.setEnabled(True)      # 配准只在对比模式下有意义
-        self._sync_view_controls()
-        self.update_display()
+        self._compare_clinical_snapshot = {
+            'source': (self.volume_hu, self.active_series_uid),
+            'mpr': self.btn_mpr.isChecked(),
+            'sizes': {name: getattr(self, name).sizes()
+                      for name in ('main_splitter', 'top_splitter', 'bottom_splitter')},
+            'cameras': {vid: (vd['plane'], self._capture_view_camera(vd['view']))
+                        for vid, vd in self.views.items()},
+            'rects': {vid: vd['view'].scene.sceneRect() for vid, vd in self.views.items()},
+        }
+        updates_enabled = self.updatesEnabled()
+        self.setUpdatesEnabled(False)
+        try:
+            self.compare_mode_active = True
+            self._primary_zpos = self._zpos_array(self.dicom_datasets)
+            self._compare_zpos = self._zpos_array(self.compare_datasets)
+            # MPR 回调会重排默认平面；模式切换仅临时收起联动，不能改临床选择。
+            with QSignalBlocker(self.btn_mpr), QSignalBlocker(self.combo_layout):
+                self.btn_mpr.setChecked(False)
+                self.combo_layout.setCurrentIndex(1)
+            for vd in self.views.values():
+                view = vd['view']
+                view.draw_crosshair(0, 0, show=False)
+                view.set_image(QPixmap())
+                view.set_overlay({}, {})
+                view.clear_annotations()
+                view.resetTransform()
+                view._user_zoomed = False
+            self._apply_grid_visibility(1)
+            self._apply_grid_sizes(1)
+            self.btn_compare.setText("Exit Compare" if self.is_english else "退出对比")
+            self.chk_register.setEnabled(True)
+            self._sync_view_controls()
+            self.update_display()
+            self.centralWidget().layout().activate()
+            for vd in self.views.values():
+                if not vd['container'].isHidden():
+                    vd['container'].layout().activate()
+                    vd['view'].fit_if_idle()
+        finally:
+            self.setUpdatesEnabled(updates_enabled)
 
     def _exit_compare_mode(self):
         """退出对比模式：释放对比序列、还原布局与按钮。"""
-        self.compare_mode_active = False
-        self.compare_volume = None
-        self.compare_datasets = []
-        self._primary_zpos = self._compare_zpos = None
-        self.btn_compare.setText("Load Comparison" if self.is_english else "加载对比序列")
-        # 勾选状态刻意保留（下次进入对比仍是用户上次的偏好），只收回可操作性
-        self.chk_register.setEnabled(False)
-        self.combo_layout.setCurrentIndex(self._pre_compare_layout)
-        self._sync_view_controls()
-        self.update_display()
+        self._cancel_view_interactions()
+        saved = getattr(self, '_compare_clinical_snapshot', None)
+        same_source = saved is not None and self._same_view_source(
+            saved['source'], (self.volume_hu, self.active_series_uid))
+        updates_enabled = self.updatesEnabled()
+        self.setUpdatesEnabled(False)
+        try:
+            self.compare_mode_active = False
+            self.compare_volume = None
+            self.compare_datasets = []
+            self._primary_zpos = self._compare_zpos = None
+            self.btn_compare.setText("Load Comparison" if self.is_english else "加载对比序列")
+            # 配准偏好保留；临床 MPR 则仅对原来源恢复，且不触发默认平面重排。
+            self.chk_register.setEnabled(False)
+            with QSignalBlocker(self.btn_mpr), QSignalBlocker(self.combo_layout):
+                self.btn_mpr.setChecked(bool(same_source and saved['mpr']))
+                self.combo_layout.setCurrentIndex(self._pre_compare_layout)
+            for vid, vd in self.views.items():
+                view = vd['view']
+                view.set_image(QPixmap())
+                view.set_overlay({}, {})
+                view.clear_annotations()
+                view.draw_crosshair(0, 0, show=False)
+                view.resetTransform()
+                view._user_zoomed = False
+                self.set_view_title(vid, f"V{vid}")
+            self._apply_grid_visibility(self._pre_compare_layout)
+            if same_source:
+                for name, sizes in saved['sizes'].items():
+                    getattr(self, name).setSizes(sizes)
+            else:
+                self._apply_grid_sizes(self._pre_compare_layout)
+            self._sync_view_controls()
+            self.update_display()
+            if same_source:
+                # 隐藏窗尚未补画；先恢复其场景范围，避免空图把原中心夹到原点。
+                for vid, vd in self.views.items():
+                    if vd['container'].isHidden():
+                        vd['view'].scene.setSceneRect(saved['rects'][vid])
+                self._restore_mode_cameras(saved['cameras'], clinical=True)
+        finally:
+            self._compare_clinical_snapshot = None
+            self.setUpdatesEnabled(updates_enabled)
 
     def _render_compare(self):
         """对比模式渲染：V1=当前序列，V2=既往序列（按比例映射切片），共享窗位。"""

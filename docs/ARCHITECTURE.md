@@ -4,7 +4,7 @@ Technical reference for the module layout, the segmentation-model reverse-engine
 
 ## Module layout
 
-The main window is a `MedicalViewer` **God object** decomposed into five UI mixins plus 15 Qt-free compute modules that are unit-tested in isolation. The packaging inventory is the 24 top-level modules declared by `pyproject.toml`; `constants.py` is Qt-free but is a data table rather than a compute module.
+The main window is a `MedicalViewer` **God object** decomposed into five UI mixins plus 16 Qt-free compute modules that are unit-tested in isolation. The packaging inventory is the 26 top-level modules declared by `pyproject.toml`; `constants.py` is Qt-free but is a data table rather than a compute module. `help_center.py` provides a non-modal Qt help reader with nine bilingual topics, section search, reading history and isolated teaching diagrams; it does not modify image or project state. `help_topics.py` holds shared content and the pure section-search function.
 
 ```
 main.py            MedicalViewer + entry point (--data load, clinical render, W/L, tools, layout, AI scheduling, i18n, keyboard nav)
@@ -17,6 +17,7 @@ annotation_lab.py  AnnotationMixin   annotation, mask editing, organ quantificat
 ai_engine.py       AutoAIEngineThread  background AI inference (sliding window + signal callbacks)
 graphics_view.py   MedicalGraphicsView  interactive image view + ROIGraphicsItem
 —— Qt-free compute modules (unit-tested without the main window) ——
+help_topics.py     bilingual help content and pure section search with ranked excerpts
 recon.py           reconstruction algorithms (Radon / BP / FBP / DFR / DMR / ART / SIRT / ASD-POCS)
 quantify.py        organ quantification (volume mL + seven HU statistics per organ)
 segmentation.py    classical fallback segmentation (lung connected-components)

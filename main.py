@@ -238,6 +238,9 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
         e = self.is_english
         self.btn_lang.setText("中" if e else "EN")
         self._refresh_panel_toggle()
+        self.btn_help.setText('Help' if e else '帮助')
+        self.btn_help.setToolTip('Help and learning (F1)' if e else '帮助与学习（F1）')
+        self.btn_help.setAccessibleName(self.btn_help.toolTip())
 
         # 静态文案表：(控件, 英文, 中文) —— setText 类
         for w, en, cn in (
@@ -439,6 +442,7 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
         self._sync_view_controls()
         self._refresh_patient_info()   # 脱敏占位文字随语言刷新
         self.on_slice_changed(self.slider_slice.value())
+        self._refresh_recon_empty_states()
 
     def on_tab_changed(self, index):
         """Tab 切换回调：在临床阅片 (index=0) 和重建实验室 (index=1) 之间切换。
@@ -722,10 +726,10 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
             button.setToolTip(reason or ("Apply to visible views" if e else "应用到当前可见视图"))
         for vd in self.views.values():
             vd['view'].annotation_enabled = self._view_editable(vd)
-            vd['cb_plane'].setVisible(clinical and (anatomical or self.canonical_orientation))
+            vd['cb_plane'].setVisible(independent and (anatomical or self.canonical_orientation))
             vd['cb_plane'].setEnabled(anatomical and independent)
             for key in ('preset', 'chk_anno', 'cb_proj', 'sp_thick'):
-                vd[key].setVisible(clinical)
+                vd[key].setVisible(independent)
             vd['preset'].setEnabled(loaded and self._ct_windows_available() and independent)
             vd['preset'].setToolTip(("Use the WW/WL controls on the right in comparison mode."
                                      if e else "对比模式请使用右侧统一窗宽/窗位。")
@@ -1248,6 +1252,9 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
         if self.ai_thread is not None:
             self.ai_thread.cancel()
         self._stop_cine()
+        if getattr(self, '_help_center', None) is not None:
+            self._closing_help_owner = True
+            self._help_center.close()
         super().closeEvent(event)
 
     def on_slice_changed(self, idx):

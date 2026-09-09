@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsTextItem,
     QGraphicsView,
+    QLabel,
 )
 
 # 常量集中定义在 constants.py，此模块只需要工具 ID（鼠标事件分发用）
@@ -227,6 +228,27 @@ class MedicalGraphicsView(QGraphicsView):
         self.show_overlay = True          # 叠加显隐开关
         self.overlay_lines = {}           # {'tl':[..],'tr':[..],'bl':[..],'br':[..]} 四角文字行
         self.orient_labels = {}           # {'top','bottom','left','right'} 解剖方位字母
+        # 空窗说明属于视口UI，不入影像scene，不改变缩放、标尺或空间坐标。
+        self.empty_label = QLabel(self.viewport())
+        self.empty_label.setTextFormat(Qt.PlainText)
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.empty_label.setFocusPolicy(Qt.NoFocus)
+        self.empty_label.setStyleSheet('background: transparent; color: #8E9CAE; font-size: 12px; border: none; padding: 16px;')
+        self.empty_label.hide()
+
+    def set_empty_message(self, message):
+        """仅显式启用且真实pixmap为空时显示；传空字符串退出该工作区提示。"""
+        self.empty_label.setText(message)
+        self._refresh_empty_message()
+
+    def _refresh_empty_message(self):
+        if not hasattr(self, 'empty_label'):
+            return
+        self.empty_label.setGeometry(self.viewport().rect())
+        self.empty_label.setVisible(bool(self.empty_label.text()) and self.image_item.pixmap().isNull())
+        self.empty_label.raise_()
 
     def set_overlay(self, corners, orient):
         """设置四角信息文字与方位字母并触发重绘。corners/orient 由主窗口按当前切片构建。"""
@@ -241,6 +263,12 @@ class MedicalGraphicsView(QGraphicsView):
         pm = self.image_item.pixmap()
         if not self.show_overlay or pm.isNull():
             return
+        # 缩放、布局适配和相机恢复都可能不重算影像；每次绘制读取实际变换，
+        # 避免角落仍显示上一帧缓存的Zoom。无需为更新文字触发整幅影像重绘计算。
+        if 'bl' in self.overlay_lines:
+            self.overlay_lines['bl'] = [f'Zoom: {self.transform().m11() * 100:.0f}%'
+                                        if line.startswith('Zoom:') else line
+                                        for line in self.overlay_lines['bl']]
         painter.save()
         painter.resetTransform()          # 切换到视口像素坐标系
         W, H = self.viewport().width(), self.viewport().height()
@@ -286,6 +314,7 @@ class MedicalGraphicsView(QGraphicsView):
             self.cancel_interaction()
         old_size, old_spacing = self.image_item.pixmap().size(), self.pixel_spacing
         self.image_item.setPixmap(pixmap)
+        self._refresh_empty_message()
         # None = 保持现有间距。缺省曾是 (1.0, 1.0) 并【无条件覆盖】，于是任何
         # 不传该参数的调用（compare_lab 刷新蒙版、显示单张图）都会把真实间距抹成
         # 1 mm/px：同样 100 像素，临床模式量得 69.9 mm，对比模式量得 99.9 mm。
@@ -412,6 +441,7 @@ class MedicalGraphicsView(QGraphicsView):
         if getattr(self, 'is_drawing', False):
             self.cancel_interaction()
         super().resizeEvent(event)
+        self._refresh_empty_message()
         px = self.image_item.pixmap()
         # 用户手动缩放过则保持其缩放，不因 resize 强制回到适配（与 set_image 的保留缩放一致）
         if px and not px.isNull() and not self._user_zoomed:

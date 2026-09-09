@@ -73,7 +73,7 @@ import mpr_geometry
 import quantify
 import series_registration
 from constants import AXIAL, CORONAL, LABEL_LUT, MANUAL_TRACK_LABEL, SAGITTAL, TOOL_SEG_BRUSH
-from dicom_geometry import series_fingerprint
+from dicom_geometry import SeriesGeometry, series_fingerprint
 from graphics_view import ROIGraphicsItem
 from project_store import (
     HistoryRecoveryRequired,
@@ -1535,16 +1535,34 @@ class AnnotationMixin:
             self._active_source = None; self.dicom_datasets = []
             self.volume_hu = self.volume_mask = self.volume_conf = None
             self.global_annotations = {'all': []}; self._display_layer_id = None
-            self._organ_stats = []; self.lbl_ai_stats.setText('')
+            # 离线工程仍保留完整文档；只撤下上一活动序列的能力、AI与定量显示。
+            self.hu_calibrated = self.canonical_orientation = False
+            self.inplane_spacing_valid = self.uniform_z_geometry_valid = False
+            self.series_geometry = SeriesGeometry(False, False, False, False, None, None, None)
+            self._ct_preview_scale = None
+            self._ai_state = 'standby'; self._ai_time_ms = 0.0
+            self._ai_fallback = False; self._ai_resampled = None
+            self._hidden_organs.clear(); self._mask_cache_clear_requested = False
+            self.lbl_ai_status.setStyleSheet('color: #8B949E; font-weight: bold;')
+            self.lbl_ai_status.setText(self._standby_text())
+            self._update_organ_stats(); self._update_legend([])
             self._refresh_patient_info(); self.lbl_hud.setText(''); self.lbl_hu_value.setText('')
             self._refresh_layer_controls()
+            self._refresh_registration_controls()
             for vd in self.views.values():
                 view = vd['view']; view.cancel_interaction()
-                view.image_item.setPixmap(QPixmap()); view.mask_item.setPixmap(QPixmap())
+                view.set_image(QPixmap()); view.mask_item.setPixmap(QPixmap())
+                vd['patient_plane'] = None
                 view.clear_annotations()
                 view.vline.hide(); view.hline.hide()
                 view.overlay_lines = {}; view.orient_labels = {}; view.viewport().update()
             self._sync_view_controls(); self._sync_matrix_buttons()
+            self.update_display()
+            if self.recon_mode_active and self._phantom_img is not None:
+                # 模体是独立重建源；离线接入不能保留可运行状态却把它的画面清成黑屏。
+                self.display_numpy_image(1, self._phantom_img)
+                self.set_view_title(1, 'V1 [Phantom · known truth]' if self.is_english else 'V1 [模体 · 真值已知]')
+            self._refresh_recon_empty_states()
         self._last_save_error = ''; self._last_saved_at = candidate.saved_at
         self._refresh_project_status()
         self._on_document_changed(candidate)

@@ -12,7 +12,7 @@
 import os
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtGui import QAction, QFontMetrics, QKeySequence
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -73,7 +73,8 @@ class AdaptiveViewToolbar(QFrame):
         if not self._controls:
             return QSize(280, 36)
         title, plane, preset, projection, thickness, annotation = self._controls
-        visible = [w for w in (plane, preset, annotation) if not w.isHidden()]
+        # 功能区隐藏的是操作，不是框架尺寸；重建页沿用阅片所需的最小宽度。
+        visible = [plane, preset, annotation]
         width = 24 + sum(self._control_width(w) for w in visible) + 6 * len(visible) + 16
         return QSize(width, self.height())
 
@@ -82,9 +83,10 @@ class AdaptiveViewToolbar(QFrame):
             return
         title, plane, preset, projection, thickness, annotation = self._controls
         visible = [w for w in self._controls[1:] if not w.isHidden()]
-        wide_width = 24 + sum(self._control_width(w) for w in visible) + 6 * len(visible) + 16
-        compact = self.width() < wide_width and not projection.isHidden()
-        # 模式隐藏控件时仍需重算高度，但相同排布不反复remove/add。
+        reserved = self._controls[1:]
+        wide_width = 24 + sum(self._control_width(w) for w in reserved) + 6 * len(reserved) + 16
+        compact = self.width() < wide_width
+        # 按完整工具条预留高度，隐藏控件后画布上边界不跳；窗口缩放仍可响应式换行。
         signature = (compact, tuple(w.isHidden() for w in self._controls))
         if signature != self._layout_signature:
             self._layout_signature = signature
@@ -106,7 +108,7 @@ class AdaptiveViewToolbar(QFrame):
                 for column, widget in enumerate(self._controls[:5]):
                     self._grid.addWidget(widget, 0, column)
                 self._grid.setColumnStretch(5, 1); self._grid.addWidget(annotation, 0, 6)
-        row_height = max([24, title.sizeHint().height()] + [w.sizeHint().height() for w in visible])
+        row_height = max([24, title.sizeHint().height()] + [w.sizeHint().height() for w in reserved])
         self.setFixedHeight(row_height * (2 if compact else 1) + (8 if compact else 4))
         self.updateGeometry()
 
@@ -201,10 +203,16 @@ class UiBuilderMixin:
 
         # 顶部：语言切换按钮（靠右）
         th = QHBoxLayout()
+        self.btn_help = QPushButton('帮助'); self.btn_help.setObjectName('LanguageBtn')
+        self.btn_help.clicked.connect(self.show_help_center)
+        self.help_action = QAction(self)
+        self.help_action.setShortcut(QKeySequence('F1'))
+        self.help_action.triggered.connect(self.show_help_center)
+        self.addAction(self.help_action)
         self.btn_lang = QPushButton("EN"); self.btn_lang.setFixedWidth(40)
         self.btn_lang.setObjectName("LanguageBtn")
         self.btn_lang.clicked.connect(self.toggle_language)
-        th.addStretch(); th.addWidget(self.btn_lang); rl.addLayout(th)
+        th.addWidget(self.btn_help); th.addStretch(); th.addWidget(self.btn_lang); rl.addLayout(th)
 
         self.btn_import = QPushButton("加载 DICOM 目录"); self.btn_import.setObjectName("PrimaryBtn")
         self.btn_import.clicked.connect(self.select_folder); rl.addWidget(self.btn_import)
@@ -231,6 +239,54 @@ class UiBuilderMixin:
         # 在 btn_dfr 等重建控件尚未创建时调用 on_tab_changed，抛 AttributeError
         self.tabs.currentChanged.connect(self.on_tab_changed)
         rl.addWidget(self.tabs)
+
+    def show_help_center(self):
+        from help_center import HelpCenter
+
+        dialog = getattr(self, '_help_center', None)
+        # 已打开时仅唤回窗口，不因功能切换打断阅读；关闭后再次打开才定位当前主题。
+        if dialog is None or (not dialog.isVisible() and dialog.english != int(self.is_english)):
+            if dialog is not None:
+                dialog.deleteLater()
+            dialog = self._help_center = HelpCenter(self, self.is_english, self._help_topic_for_context)
+        if not dialog.isVisible():
+            dialog.search.clear()
+            dialog.select_topic(self._help_topic_for_context())
+            dialog._finish_navigation()
+        dialog.show(); dialog.raise_(); dialog.activateWindow()
+
+    def _help_topic_for_context(self):
+        """只读取当前任务与焦点，不为了说明而触发功能切换。"""
+        if self.tabs.currentWidget() is self.tab_recon:
+            return 'recon'
+        focus = self.focusWidget()
+        targets = {
+            'project': ('btn_save_proj', 'btn_open_project', 'lbl_project_status'),
+            'window': ('slider_ww', 'slider_wl'),
+            'mpr': ('btn_mpr',),
+            'annotation': ('grp_edit', 'grp_clear'),
+            'ai': ('grp_ai',),
+            'compare': ('grp_registration', 'grp_followup'),
+            'browse': ('btn_import', 'combo_layout', 'slider_slice'),
+        }
+        while focus is not None and focus is not self:
+            for key, names in targets.items():
+                if any(focus is getattr(self, name, None) for name in names):
+                    return key
+            focus = focus.parentWidget()
+        if self.compare_mode_active:
+            return 'compare'
+        section = self.clinical_sections.currentIndex()
+        if section != 0:
+            return {1: 'annotation', 2: 'ai', 3: 'compare'}[section]
+        tool = self.tool_btn_group.checkedId()
+        if tool in (1, 8):
+            return 'roi'
+        if tool in (2, 3, 4, 5, 6, 7):
+            return 'annotation'
+        if self.btn_mpr.isChecked():
+            return 'mpr'
+        return 'browse' if self.volume_hu is None else 'window'
 
     def _scrollable(self, tab):
         """给 Tab 套一层竖向滚动区，返回可继续 addWidget 的内层布局。

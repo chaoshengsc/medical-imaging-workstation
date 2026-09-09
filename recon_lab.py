@@ -25,6 +25,25 @@ from constants import RECON_DL_MODEL, RECON_DL_VIEWS
 class ReconLabMixin:
     """重建实验室相关方法集合，混入 MedicalViewer。"""
 
+    def _refresh_recon_empty_states(self):
+        """明确当前空窗的用途和下一步；真实输出始终由set_image负责显示。"""
+        e = self.is_english
+        roles = {2: ('Projection / frequency domain', '投影 / 频域'),
+                 3: ('Comparison / error', '对照 / 误差'),
+                 4: ('Reconstruction result', '重建结果')}
+        projected = self.current_sinogram is not None
+        for vid in (2, 3, 4):
+            if vid not in self.views:
+                continue
+            if not self.recon_mode_active:
+                message = ''
+            else:
+                role = roles[vid][0 if e else 1]
+                next_step = ('Choose a reconstruction algorithm on the right.' if e else '在右侧选择重建算法。') if projected else (
+                    'Generate the sinogram on the right to begin.' if e else '先在右侧生成弦图，再选择重建算法。')
+                message = role + ('\n\nNot generated yet\n' if e else '\n\n尚未生成\n') + next_step
+            self.views[vid]['view'].set_empty_message(message)
+
     def _recon_source_identity(self):
         # 持有数组引用并按对象身份比较，避免临床翻层误废模体或复用同层号旧病例。
         if self._phantom_img is not None:
@@ -66,6 +85,8 @@ class ReconLabMixin:
         self._clinical_cameras = {vid: (vd['plane'], self._capture_view_camera(vd['view']))
                                   for vid, vd in self.views.items()}
         self._pre_recon_layout = self.combo_layout.currentIndex()
+        self._pre_recon_splitter_sizes = {name: getattr(self, name).sizes()
+                                         for name in ('top_splitter', 'bottom_splitter', 'main_splitter')}
         saved = getattr(self, '_recon_view_snapshot', None)
         if saved is not None and not self._same_view_source(saved['source'], self._recon_source_identity()):
             self._invalidate_recon_results()
@@ -80,7 +101,8 @@ class ReconLabMixin:
             v.resetTransform()
         # 切到 2x2，setSizes 在 setUpdatesEnabled(False) 下同步生效
         self._apply_grid_visibility(2)
-        self._apply_grid_sizes(2)
+        if self._pre_recon_layout != 2:
+            self._apply_grid_sizes(2)
         if saved is not None:
             self._sync_view_controls(); self._refresh_workspace_state()
             for vid, state in saved['views'].items():
@@ -103,6 +125,7 @@ class ReconLabMixin:
             if self._phantom_img is not None:
                 # 空载模体不进入update_display的DICOM路径，V1标题需单独重译。
                 self.set_view_title(1, 'V1 [Phantom · known truth]' if self.is_english else 'V1 [模体 · 真值已知]')
+            self._refresh_recon_empty_states()
             self._restore_mode_cameras({vid: (None, state['camera']) for vid, state in saved['views'].items()})
             return
         # 标题必须看模体状态：空载时 update_display 会因 volume_hu 为 None 直接返回，
@@ -119,10 +142,13 @@ class ReconLabMixin:
             v['cb_plane'].hide(); v['preset'].hide(); v['chk_anno'].hide()
         self._sync_view_controls()
         self.update_display()
+        self._refresh_recon_empty_states()
 
     def _exit_recon_mode(self):
         """暂存重建画面并恢复阅片；切页不等于更换计算来源。"""
         self._recon_camera_epoch = getattr(self, '_recon_camera_epoch', 0) + 1
+        for vd in self.views.values():
+            vd['view'].set_empty_message('')
         self._recon_view_snapshot = {
             'source': self._recon_source_identity(), 'time': self.lbl_time.text(),
             'buttons': {name: getattr(self, name).isEnabled()
@@ -141,7 +167,12 @@ class ReconLabMixin:
             self.set_view_title(vid, f"V{vid}")
         prev = self._pre_recon_layout
         self._apply_grid_visibility(prev)
-        self._apply_grid_sizes(prev)
+        sizes = getattr(self, '_pre_recon_splitter_sizes', None)
+        if sizes:
+            for name in ('main_splitter', 'top_splitter', 'bottom_splitter'):
+                getattr(self, name).setSizes(sizes[name])
+        else:
+            self._apply_grid_sizes(prev)
         self._sync_view_controls()
         self.update_display()
         if self._same_view_source(getattr(self, '_clinical_camera_source', None),
@@ -155,6 +186,7 @@ class ReconLabMixin:
         txt = "[— run projection —]" if self.is_english else "[— 请先生成弦图 —]"
         for vid in (2, 3, 4):
             self.set_view_title(vid, f"V{vid} {txt}")
+        self._refresh_recon_empty_states()
 
     def _invalidate_recon_results(self):
         """数据来源变更时统一作废弦图及派生结果，不能只拿层号判断是否换数据。"""
@@ -408,6 +440,7 @@ class ReconLabMixin:
         self.views[4]['view'].image_item.setPixmap(QPixmap())
         self.set_view_title(3, "V3 [— run reconstruction —]" if self.is_english else "V3 [— 请选择算法重建 —]")
         self.set_view_title(4, "V4 [— run reconstruction —]" if self.is_english else "V4 [— 请选择算法重建 —]")
+        self._refresh_recon_empty_states()
 
     def run_bp(self):
         """反投影法 (Back Projection, BP) 重建——不加任何滤波器的原始反投影。
