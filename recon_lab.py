@@ -203,6 +203,7 @@ class ReconLabMixin:
                    or getattr(self, 'volume_hu', None) is not None)
         for b in (self.btn_gen_sino, self.btn_dmr, self.btn_art):
             b.setEnabled(has_src)
+        self._refresh_workspace_state()  # 模体直接绘图，不经过update_display；同步退出空态。
 
     def _recon_source_slice(self):
         """返回重建链路的源图（float32，归一化 [0,1]）与来源标签。

@@ -214,6 +214,10 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
         """切换中英文界面，然后刷新所有控件文字。"""
         self.is_english = not self.is_english
         self.update_language()
+        if self.volume_hu is not None:
+            self._update_hud(*self.current_3d_pos)
+        else:
+            self.lbl_hud.clear()
 
     @staticmethod
     def _retranslate_combo(combo, en_items, cn_items, e, idx=None):
@@ -260,8 +264,8 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
             (self.btn_art, "Iterative (ART / SIRT / ASD-POCS)", "迭代重建 (ART / SIRT / ASD-POCS)"),
             (self.lbl_brush, "Brush R:", "画笔半径:"),
             (self.lbl_paint_target, "Paint as:", "画笔目标:"),
-            (self.btn_export_stats, "Export Stats CSV", "导出定量 CSV"),
-            (self.btn_mesh3d, "3D Surface Preview", "三维重建预览"),
+            (self.btn_export_stats, "Export Working Stats CSV", "导出工作结果 CSV"),
+            (self.btn_mesh3d, "Working Result · 3D Preview", "工作结果 · 三维预览"),
             (self.lbl_disclaimer,
              "⚠ AI results & organ labels are auto-inferred — for reference only, not for diagnosis.",
              "⚠ AI 结果与器官标签为自动推断，仅供参考，非诊断依据。"),
@@ -272,7 +276,7 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
             (self.btn_phantom, "Load Shepp-Logan Phantom", "载入 Shepp-Logan 模体"),
             # 英文原作 "Clear Mask" 漏了标注这一半，与中文不对等；此按钮两者都清，补齐
             (self.btn_clear_anno, "Clear Mask && Annotations", "清空蒙版与标注"),
-            (self.btn_clear_slice, "Clear current plane", "清空当前面"),
+            (self.btn_clear_slice, "Clear Selected Plane", "清空所选面"),
             (self.btn_reset, "Reset Display", "重置显示"),
             (self.lbl_ww_hint, "Right-drag on image to adjust WW/WL", "在图像上右键拖拽可快速调节窗宽/窗位"),
             (self.chk_overlay, "Overlay", "信息叠加"),
@@ -300,7 +304,10 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
             (self.grp_view, "VIEW", "视图"),
             (self.grp_followup, "FOLLOW-UP", "随访对比"),
             (self.grp_data, "DATA && PRIVACY", "数据与隐私"),
-            (self.grp_ai, "Automated AI Engine", "自动化 AI 引擎"),
+            (self.grp_ai, "AI && Working Results", "AI 与工作结果"),
+            (self.grp_edit, "Layers && Annotation", "图层与标注"),
+            (self.grp_registration, "Series Correspondence", "序列对应"),
+            (self.grp_clear, "Clear Working Layer", "清理当前工作图层"),
         ):
             g.setTitle(en if e else cn)
 
@@ -335,6 +342,14 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
 
         self.tabs.setTabText(0, "Clinical Mode" if e else "临床阅片")
         self.tabs.setTabText(1, "Recon Lab" if e else "重建实验室")
+
+        for i, title in enumerate(('Read', 'Annotate', 'Results', 'Series') if e
+                                  else ('阅片', '标注', '结果', '序列')):
+            self.clinical_sections.setTabText(i, title)
+        self.cb_clear_view.setToolTip('Choose the visible view to clear; Undo is available.' if e
+                                     else '明确选择要清空的可见视图；可用撤销恢复。')
+        self._refresh_workspace_state()
+        self._refresh_clear_target()
 
         # 保留选中索引的纯文本下拉框
         self._retranslate_combo(self.combo_oversample,
@@ -504,6 +519,8 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
     def change_active_tool(self, tid):
         """切换全局工具，并同步更新所有视图的 current_tool，确保各视图行为一致。"""
         self.active_tool = tid
+        if tid in (TOOL_SEG_BRUSH, TOOL_SEG_ERASE) and hasattr(self, "clinical_sections"):
+            self.clinical_sections.setCurrentIndex(1)
         for v in self.views.values():
             if v['view'].current_tool != tid:
                 v['view'].cancel_interaction()
@@ -646,7 +663,7 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
         source_bound = self._active_source is None or self._active_source.source_binding is not None
         clinical = not self.recon_mode_active
         independent = clinical and not self.compare_mode_active
-        self.btn_clear_slice.setEnabled(loaded and independent and source_bound and self._display_layer_id is None)
+        self._refresh_clear_target()
         self.btn_clear_anno.setEnabled(loaded and independent and source_bound and self._display_layer_id is None)
         self.btn_cine.setEnabled(loaded and clinical and self.volume_hu.shape[0] > 1)
         self.cb_cine_speed.setEnabled(self.btn_cine.isEnabled())
@@ -1240,7 +1257,11 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
         临床阅片模式：对每个可见视图按平面切取 2D 截面、做窗宽窗位映射，
         叠加 AI 蒙版、渲染标注、更新 MPR 十字线。
         """
+        self._refresh_workspace_state()
         if self.volume_hu is None:
+            self.lbl_slice.setText('Slice: —' if self.is_english else '层数: —')
+            self.lbl_ww.setText('WW: —'); self.lbl_wl.setText('WL: —')
+            self._refresh_clear_target()
             return
         z, y, x = self.current_3d_pos
 
@@ -1283,6 +1304,7 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
             self._update_legend(present[present != 0])
         else:
             self._update_legend([])
+        self._refresh_clear_target()
 
     def _patient_display(self):
         """返回用于显示的 (ID, 姓名, 年龄)；脱敏模式下隐去真实身份（仅显示层，不改 DICOM）。"""

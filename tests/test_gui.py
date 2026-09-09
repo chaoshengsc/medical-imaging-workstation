@@ -5157,6 +5157,7 @@ def test_panel_scroll(app):
         vi.volume_mask = mk
         vi.volume_conf = np.full((Z, H, W), 240, np.uint8)
         vi._update_organ_stats()
+        vi.clinical_sections.setCurrentIndex(2)
         # QScrollArea 的 widgetResizable 要走完一个布局周期才把高度分配下去，
         # 而 processEvents() 只处理已排队的事件、不推进时间。不等就会量到中间态
         # （实测 28px），把「布局还没算完」误判成「内容被压缩」。
@@ -5177,13 +5178,13 @@ def test_panel_scroll(app):
             check(a_.horizontalScrollBarPolicy() == _Qt.ScrollBarAlwaysOff,
                   "  水平滚动条关闭——面板宽度固定，出现横向滚动只说明布局错了")
 
-        # 破坏性操作固定在底部：滚动时位置不变，且始终可见
-        y1 = vi.btn_reset.mapTo(vi.right_panel, vi.btn_reset.rect().bottomLeft()).y()
+        # 保存状态固定在滚动区外：结果再长也不能遮住持久化反馈。
+        y1 = vi.lbl_project_status.mapTo(vi.right_panel, vi.lbl_project_status.rect().bottomLeft()).y()
         for a_ in areas:
             a_.verticalScrollBar().setValue(a_.verticalScrollBar().maximum())
         app.processEvents()
-        y2 = vi.btn_reset.mapTo(vi.right_panel, vi.btn_reset.rect().bottomLeft()).y()
-        check(y1 == y2, f"滚到底后「重置工作区」不移动（y={y1}→{y2}）")
+        y2 = vi.lbl_project_status.mapTo(vi.right_panel, vi.lbl_project_status.rect().bottomLeft()).y()
+        check(y1 == y2, f"滚到底后保存状态不移动（y={y1}→{y2}）")
         check(0 < y2 <= vi.right_panel.height(),
               f"始终在可视区内（底边 {y2} ≤ 面板 {vi.right_panel.height()}）")
     finally:
@@ -8437,6 +8438,10 @@ def test_document_ai_lifecycle(app):
             v.cb_layers.setCurrentIndex(v.cb_layers.findData(original.layer_id)); app.processEvents()
             check(not v.views[1]['view'].annotation_enabled and not v.tool_btns['btn_brush'].isEnabled(),
                   '原始 AI 对照模式在编辑入口明确只读')
+            source_lines = v.lbl_stats_source.text().splitlines()
+            check(len(source_lines) == 2 and '原始 AI' in source_lines[0]
+                  and '病灶' in source_lines[1] and '原始 AI' not in source_lines[1],
+                  '原始AI画面与人工病灶统计在结果页明确区分来源')
             v.cb_layers.setCurrentIndex(v.cb_layers.findData(lesion.layer_id)); app.processEvents()
             v._undo_mask_edit()
             check(not v.volume_mask.any() and np.all(original.mask == 5),
@@ -8526,6 +8531,116 @@ def test_linked_lesion_identity():
         check(target_layer not in restored.series[second].layers
               and restored.series[first].layers[source_layer].mask.flat[21] == 255,
               '重开后依次 Undo 目标编辑和关联，不修改参考序列病灶')
+
+
+
+def test_ui_task_workflow(app):
+    """任务页不改文档；按钮清明确所选面；工程离线提示与保存反馈常驻。"""
+    import tempfile
+
+    from pydicom.uid import generate_uid
+    from PySide6.QtTest import QTest
+
+    print('[UI任务组织与明确清空目标]')
+    with tempfile.TemporaryDirectory() as directory:
+        source_dir = os.path.join(directory, 'dicom'); os.mkdir(source_dir)
+        uid = generate_uid()
+        for z in range(5):
+            _write_min_dcm(os.path.join(source_dir, f'{z}.dcm'), (12, 16), uid, z, z + 1, pix=100)
+        v = m.MedicalViewer(project_dir=os.path.join(directory, 'projects'), autosave=False)
+        v._kickoff_ai = lambda: None; v.persistence_dir = os.path.join(directory, 'cache')
+        fresh = None
+        try:
+            v.resize(1280, 800); v.show(); QTest.qWait(50)
+            check(v.empty_state.isVisible() and v.btn_empty_import.isVisible(),
+                  '空载画布提供直接加载入口')
+            v.load_data(source_dir); v.combo_layout.setCurrentIndex(2)
+            v.views[2]['cb_plane'].setCurrentIndex(CORONAL)
+            v.current_3d_pos = [2, 4, 7]; v.volume_mask.fill(5); v.update_display()
+            QTest.qWait(120)
+            v._capture_edit_context(2)
+            v.clinical_sections.setCurrentIndex(1)
+            v.cb_clear_view.setCurrentIndex(v.cb_clear_view.findData(1)); app.processEvents()
+            before = v.volume_mask.copy()
+            QTest.mouseClick(v.btn_clear_slice, Qt.LeftButton); app.processEvents()
+            expected = before.copy(); expected[2, :, :] = 0
+            check(np.array_equal(v.volume_mask, expected),
+                  '按钮明确清 V1/Axial，不沿用上次编辑 V2/Coronal')
+            v._undo_mask_edit()
+            check(np.array_equal(v.volume_mask, before), '所选面清空通过原有Undo完整恢复')
+            revision = v.study_document.revision
+            y = v.lbl_project_status.mapTo(v, v.lbl_project_status.rect().topLeft()).y()
+            for i in range(4):
+                v.clinical_sections.setCurrentIndex(i); app.processEvents()
+                check(v.lbl_project_status.isVisible() and v.lbl_project_status.mapTo(v, v.lbl_project_status.rect().topLeft()).y() == y,
+                      f'任务页{i}保存状态常驻同一位置')
+            check(v.study_document.revision == revision and np.array_equal(v.volume_mask, before),
+                  '分页仅组织控件，不改变文档revision或mask')
+            v.cb_clear_view.setCurrentIndex(v.cb_clear_view.findData(2))
+            v.combo_layout.setCurrentIndex(0); QTest.qWait(30)
+            check(not v.btn_clear_slice.isEnabled(), '目标视图隐藏后禁用清空，不暗中改选另一面')
+            v._last_save_error = 'TEST: destination unavailable'; v._refresh_project_status()
+            check('TEST:' in v.lbl_project_status.text() and v.lbl_project_status.isVisible(),
+                  '保存失败在常驻状态区显示原因')
+            v._last_save_error = ''; v._refresh_project_status()
+            check(v.save_project(), '分页后仍可保存完整工程')
+            fresh = m.MedicalViewer(project_dir=v.project_dir, autosave=False)
+            fresh.persistence_dir = v.persistence_dir; fresh._kickoff_ai = lambda: None
+            fresh.show(); fresh.open_project(v.study_document.project_path); app.processEvents()
+            check(fresh.empty_state.isVisible() and '工程已打开' in fresh.lbl_empty_title.text()
+                  and '已保留' in fresh.lbl_empty_detail.text(), '离线工程明确标注已保留并引导重连')
+            fresh.toggle_language()
+            check('connect' in fresh.lbl_empty_title.text().lower(), '离线引导支持英文')
+            fresh.load_data(source_dir); QTest.qWait(120)
+            check(not fresh.empty_state.isVisible() and fresh.volume_hu is not None,
+                  '重新连接原始DICOM后恢复画布并移除空态')
+        finally:
+            if fresh is not None:
+                fresh.close()
+            v.close(); app.processEvents()
+
+def test_ui_empty_and_source_states(app):
+    import tempfile
+
+    import pydicom
+    from pydicom.uid import generate_uid
+    from PySide6.QtTest import QTest
+
+    print('[空态：模体显示、原位方向与双语读数]')
+    with tempfile.TemporaryDirectory() as directory:
+        v = m.MedicalViewer(project_dir=os.path.join(directory, 'projects'), autosave=False)
+        v.persistence_dir = os.path.join(directory, 'cache'); v._kickoff_ai = lambda: None
+        try:
+            v.show(); app.processEvents()
+            check('1 / 0' not in v.lbl_slice.text() and v.lbl_ww.text() == 'WW: —'
+                  and not v.slider_ww.isEnabled(), '空载没有虚构层号或无标签滑条')
+            v.tabs.setCurrentIndex(1); v.toggle_phantom(); QTest.qWait(50)
+            check(not v.empty_state.isVisible() and v.views[1]['view'].isVisible()
+                  and not v.views[1]['view'].image_item.pixmap().isNull(),
+                  '空载启动载入模体，实际图像组件可见')
+            v.tabs.setCurrentIndex(0); app.processEvents()
+            check(v.empty_state.isVisible(), '模体只属于重建实验室，空载阅片仍显示引导')
+            v.tabs.setCurrentIndex(1); app.processEvents()
+            check(not v.empty_state.isVisible() and not v.views[1]['view'].image_item.pixmap().isNull(),
+                  '返回重建实验室恢复已有模体画面')
+            v.toggle_phantom(); app.processEvents()
+            check(v.empty_state.isVisible(), '卸下模体后恢复空态引导')
+            v.tabs.setCurrentIndex(0)
+            source_dir = os.path.join(directory, 'raw'); os.mkdir(source_dir); uid = generate_uid()
+            for z in range(3):
+                path = os.path.join(source_dir, f'{z}.dcm')
+                _write_min_dcm(path, (8, 8), uid, z, z + 1, pix=100)
+                ds = pydicom.dcmread(path)
+                del ds.ImageOrientationPatient; del ds.ImagePositionPatient
+                ds.save_as(path, enforce_file_format=True)
+            v.load_data(source_dir); v.clinical_sections.setCurrentIndex(1); QTest.qWait(50)
+            check(v.btn_clear_slice.isEnabled() and '原始体素平面' in v.lbl_clear_target.text()
+                  and 'Axial' not in v.lbl_clear_target.text(), '原位可编辑面不冒充解剖Axial')
+            v.toggle_language()
+            check('Source voxel plane' in v.lbl_clear_target.text() and '原始值' not in v.lbl_hud.text(),
+                  '清空目标与常驻HUD同步切换英文')
+        finally:
+            v.close(); app.processEvents()
 
 
 def test_document_clear_and_track(app):
@@ -10107,6 +10222,8 @@ def main_run():
     test_document_lesion_instances()
     test_linked_lesion_identity()
     test_document_clear_and_track(app)
+    test_ui_task_workflow(app)
+    test_ui_empty_and_source_states(app)
     test_pixel_transform_boundaries(app)
     test_study_candidate_loading()
     test_patient_plane_sampler()

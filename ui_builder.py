@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -109,14 +110,23 @@ class UiBuilderMixin:
         # 顶部：语言切换按钮（靠右）
         th = QHBoxLayout()
         self.btn_lang = QPushButton("EN"); self.btn_lang.setFixedWidth(40)
-        self.btn_lang.setStyleSheet("font-size: 10px; color: #5C677D; border: 1px solid #373E4D;")
+        self.btn_lang.setObjectName("LanguageBtn")
         self.btn_lang.clicked.connect(self.toggle_language)
         th.addStretch(); th.addWidget(self.btn_lang); rl.addLayout(th)
 
         self.btn_import = QPushButton("加载 DICOM 目录"); self.btn_import.setObjectName("PrimaryBtn")
         self.btn_import.clicked.connect(self.select_folder); rl.addWidget(self.btn_import)
         self.btn_save_proj = QPushButton("保存标注工程"); self.btn_save_proj.setProperty("class", "ActionBtn")
-        self.btn_save_proj.clicked.connect(self.save_project); rl.addWidget(self.btn_save_proj)
+        self.btn_save_proj.clicked.connect(self.save_project)
+        self.btn_open_project = QPushButton('打开工程')
+        self.btn_open_project.clicked.connect(self.open_project)
+        project_actions = QHBoxLayout()
+        project_actions.addWidget(self.btn_open_project); project_actions.addWidget(self.btn_save_proj)
+        rl.addLayout(project_actions)
+        self.lbl_project_status = QLabel(''); self.lbl_project_status.setWordWrap(True)
+        self.lbl_project_status.setObjectName('ProjectStatus')
+        self.lbl_project_status.setTextFormat(Qt.PlainText)
+        rl.addWidget(self.lbl_project_status)
 
         self.tabs = QTabWidget()
         self.tab_clinical = QWidget()
@@ -159,17 +169,29 @@ class UiBuilderMixin:
         return lay, outer
 
     def _build_clinical_tab(self):
-        """临床阅片 Tab：患者信息 / 显示控制（布局+MPR+三滑条+预设）/ AI 状态 / 测量与清理。"""
-        t1_lay, t1_outer = self._scrollable(self.tab_clinical)
+        """阅片侧栏按阅片/标注/结果/序列分组；不改变主Tab的模式契约。"""
+        # 任务分页仅组织控件，不切换影像/编辑模式或重置文档。
+        t1_outer = QVBoxLayout(self.tab_clinical)
+        t1_outer.setContentsMargins(0, 0, 0, 0)
+        self.clinical_sections = QTabWidget(); self.clinical_sections.setObjectName('ClinicalSections')
+        self.clinical_sections.tabBar().setObjectName('SectionTabs')
+        section_layouts = []
+        for name in ('阅片', '标注', '结果', '序列'):
+            page = QWidget(); self.clinical_sections.addTab(page, name)
+            content, _ = self._scrollable(page); section_layouts.append(content)
+        t1_lay, edit_lay, result_lay, series_lay = section_layouts
+        t1_outer.addWidget(self.clinical_sections)
+        self.grp_edit = QGroupBox('图层与标注'); edit_controls = QVBoxLayout(self.grp_edit)
+        self.grp_registration = QGroupBox('序列对应'); registration_controls = QVBoxLayout(self.grp_registration)
 
         # 患者信息分组
         self.grp_patient = QGroupBox("患者信息")
-        info_lay = QFormLayout(); info_lay.setContentsMargins(10, 15, 10, 10)
+        info_lay = QFormLayout(); info_lay.setContentsMargins(10, 8, 10, 10)
         self.info_labels = {"ID": QLabel("N/A"), "NAME": QLabel("N/A"), "AGE": QLabel("N/A")}
         for k, v in self.info_labels.items():
             v.setObjectName("ValueText"); info_lay.addRow(QLabel(k), v)
         self.grp_patient.setLayout(info_lay)
-        t1_lay.addWidget(self.grp_patient)
+        series_lay.addWidget(self.grp_patient)
 
         # 显示控制分组（布局下拉、MPR 按钮、三滑条、预设窗口栅格）
         # ---------------------------------------------------------------
@@ -179,7 +201,7 @@ class UiBuilderMixin:
         # 控件名一律不变，只改归属与顺序，故 i18n 表与测试不受影响。
         # ---------------------------------------------------------------
         self.grp_display = QGroupBox("阅片")          # 高频：切片、窗位、播放
-        dl = QVBoxLayout(); dl.setContentsMargins(10, 15, 10, 10)
+        dl = QVBoxLayout(); dl.setContentsMargins(10, 8, 10, 10)
         top_dl = QHBoxLayout()
         self.combo_layout = QComboBox()
         self.combo_layout.currentIndexChanged.connect(self.switch_layout)
@@ -197,19 +219,20 @@ class UiBuilderMixin:
         self.combo_series.currentIndexChanged.connect(self._on_series_selected)
         dl.addWidget(self.combo_series)
         self.chk_series_location = QCheckBox('切换序列时定位同一点'); self.chk_series_location.setChecked(True)
-        dl.addWidget(self.chk_series_location)
+        registration_controls.addWidget(self.chk_series_location)
         self.cb_reference_series = QComboBox(); self.cb_reference_series.setToolTip('对应标注的来源序列')
         self.cb_reference_series.currentIndexChanged.connect(self._on_reference_series_changed)
-        dl.addWidget(self.cb_reference_series)
+        registration_controls.addWidget(self.cb_reference_series)
         self.chk_reference_annotations = QCheckBox('显示参考序列标注（只读）')
         self.chk_reference_annotations.toggled.connect(self._on_reference_series_changed)
-        dl.addWidget(self.chk_reference_annotations)
-        self.lbl_series_link = QLabel(''); self.lbl_series_link.setWordWrap(True); dl.addWidget(self.lbl_series_link)
+        registration_controls.addWidget(self.chk_reference_annotations)
+        self.lbl_series_link = QLabel(''); self.lbl_series_link.setWordWrap(True); registration_controls.addWidget(self.lbl_series_link)
         registration_row = QHBoxLayout()
         self.btn_series_registration = QPushButton('三维刚性配准'); self.btn_series_registration.clicked.connect(self.start_series_registration)
         self.btn_cancel_registration = QPushButton('取消配准'); self.btn_cancel_registration.clicked.connect(self._cancel_series_registration)
         registration_row.addWidget(self.btn_series_registration); registration_row.addWidget(self.btn_cancel_registration)
-        dl.addLayout(registration_row)
+        registration_controls.addLayout(registration_row)
+        series_lay.addWidget(self.grp_registration)
         self.lbl_slice = QLabel(); self.slider_slice = QSlider(Qt.Horizontal)
         self.slider_slice.valueChanged.connect(self.on_slice_changed)
         self.lbl_ww = QLabel(); self.slider_ww = QSlider(Qt.Horizontal)
@@ -226,7 +249,8 @@ class UiBuilderMixin:
                                "WW: 4000", "WL: -1200")) + 6
         for lbl, slider in [(self.lbl_slice, self.slider_slice), (self.lbl_ww, self.slider_ww), (self.lbl_wl, self.slider_wl)]:
             lbl.setFixedWidth(w_need); row = QHBoxLayout(); row.setSpacing(6); row.addWidget(lbl); row.addWidget(slider); dl.addLayout(row)
-        self.lbl_ww_hint = QLabel(); self.lbl_ww_hint.setStyleSheet("color: #5C677D; font-size: 10px;")
+        self.lbl_ww_hint = QLabel(); self.lbl_ww_hint.setStyleSheet("color: #A0AABF; font-size: 11px;")
+        self.lbl_ww_hint.setWordWrap(True)
         dl.addWidget(self.lbl_ww_hint)
         self.lbl_window_status = QLabel()
         self.lbl_window_status.setWordWrap(True)
@@ -284,15 +308,15 @@ class UiBuilderMixin:
 
         # 视图：布局与叠加，中频——设一次就不常动，故排在「阅片」之后
         self.grp_view = QGroupBox("视图")
-        vl = QVBoxLayout(); vl.setContentsMargins(10, 15, 10, 10)
+        vl = QVBoxLayout(); vl.setContentsMargins(10, 8, 10, 10)
         vl.addLayout(top_dl)                      # 布局下拉 + MPR 联动
         vl.addWidget(self.chk_overlay)
         self.grp_view.setLayout(vl)
-        t1_lay.addWidget(self.grp_view)
+        t1_lay.insertWidget(0, self.grp_view)
 
         # AI 状态分组（原 AI 按钮改为状态显示，因为已全自动）
         self.grp_ai = QGroupBox("自动化 AI 引擎")
-        ai_lay = QVBoxLayout(); ai_lay.setContentsMargins(10, 15, 10, 10)
+        ai_lay = QVBoxLayout(); ai_lay.setContentsMargins(10, 8, 10, 10)
         self.lbl_ai_status = QLabel("状态: 待机中")
         self.lbl_ai_status.setWordWrap(True)
         self.lbl_ai_status.setStyleSheet("color: #8B949E; font-weight: bold;")
@@ -303,7 +327,7 @@ class UiBuilderMixin:
         self.lbl_ai_legend.setTextFormat(Qt.RichText)
         self.lbl_ai_legend.setStyleSheet("font-size: 11px;")
         # 图例条目做成可点击链接：单击切换该器官在蒙版叠加中的显隐
-        self.lbl_ai_legend.setTextInteractionFlags(Qt.LinksAccessibleByMouse)
+        self.lbl_ai_legend.setTextInteractionFlags(Qt.LinksAccessibleByMouse | Qt.LinksAccessibleByKeyboard)
         self.lbl_ai_legend.linkActivated.connect(self._toggle_organ)
         ai_lay.addWidget(self.lbl_ai_legend)
         # 器官定量：分割完成后列出各器官体积/平均 HU，并支持导出 CSV
@@ -311,6 +335,9 @@ class UiBuilderMixin:
         self.lbl_ai_stats.setWordWrap(True)
         self.lbl_ai_stats.setTextFormat(Qt.RichText)
         self.lbl_ai_stats.setStyleSheet("font-size: 11px; color: #B0B8C4;")
+        self.lbl_stats_source = QLabel(''); self.lbl_stats_source.setWordWrap(True)
+        self.lbl_stats_source.setObjectName('ResultSource')
+        ai_lay.addWidget(self.lbl_stats_source)
         ai_lay.addWidget(self.lbl_ai_stats)
         self.btn_export_stats = QPushButton("导出定量 CSV")
         self.btn_export_stats.setProperty("class", "ActionBtn")
@@ -326,7 +353,7 @@ class UiBuilderMixin:
         # 合规免责声明：AI 结果非诊断依据，常驻显示
         self.lbl_disclaimer = QLabel("⚠ AI 结果与器官标签为自动推断，仅供参考，非诊断依据。")
         self.lbl_disclaimer.setWordWrap(True)
-        self.lbl_disclaimer.setStyleSheet("color: #C0392B; font-size: 10px;")
+        self.lbl_disclaimer.setStyleSheet("color: #E6AC8B; font-size: 11px;")
         ai_lay.addWidget(self.lbl_disclaimer)
         # 模型说明卡：出处如何被推断出来、实测到什么程度、有哪些已知局限。
         # 常驻可点，不随分割状态禁用——「这个模型可不可信」在跑之前就该能查。
@@ -339,66 +366,61 @@ class UiBuilderMixin:
         self.btn_model_card.clicked.connect(self.show_model_card)
         ai_lay.addWidget(self.btn_model_card)
 
-        # 分割编辑参数归位到本组：画笔半径与画笔目标是**分割编辑**的参数，
-        # 旧版把它们放在「测量与清理」下，与要编辑的对象隔着两个分组。
+        # 图层选择与画笔参数归入标注页；结果页独立标明统计来源。
         h_brush = QHBoxLayout()
         self.lbl_brush = QLabel("画笔半径:")
         self.spin_brush = QSpinBox(); self.spin_brush.setRange(0, 40); self.spin_brush.setValue(6)
         self.spin_brush.setSpecialValueText('1 voxel')
         self.spin_brush.valueChanged.connect(self._set_brush_radius)
         h_brush.addWidget(self.lbl_brush); h_brush.addWidget(self.spin_brush)
-        ai_lay.addLayout(h_brush)
+        edit_controls.addLayout(h_brush)
         h_target = QHBoxLayout()
         self.lbl_paint_target = QLabel("画笔目标:")
         self.cb_paint_target = QComboBox()
         self.cb_paint_target.addItem("手动标注", MANUAL_TRACK_LABEL)
         h_target.addWidget(self.lbl_paint_target); h_target.addWidget(self.cb_paint_target)
-        ai_lay.addLayout(h_target)
+        edit_controls.addLayout(h_target)
         self.cb_layers = QComboBox()
         self.cb_layers.setToolTip('Working layers / original AI · 工作图层 / 原始 AI')
         self.cb_layers.currentIndexChanged.connect(self._on_layer_selected)
-        ai_lay.addWidget(self.cb_layers)
+        edit_controls.insertWidget(0, self.cb_layers)
         self.lbl_layer_status = QLabel(''); self.lbl_layer_status.setWordWrap(True)
-        ai_lay.addWidget(self.lbl_layer_status)
+        edit_controls.insertWidget(1, self.lbl_layer_status)
         self.btn_adopt_ai = QPushButton('采用此 AI 版本为工作结果')
         self.btn_adopt_ai.clicked.connect(self._adopt_selected_ai)
         self.btn_adopt_ai.setEnabled(False)
-        ai_lay.addWidget(self.btn_adopt_ai)
+        edit_controls.addWidget(self.btn_adopt_ai)
         self.btn_new_lesion = QPushButton('新建病灶图层')
         self.btn_new_lesion.clicked.connect(self._new_lesion_layer)
-        ai_lay.addWidget(self.btn_new_lesion)
+        edit_controls.addWidget(self.btn_new_lesion)
         self.btn_link_lesion = QPushButton('关联参考病灶')
         self.btn_link_lesion.clicked.connect(self._link_reference_lesion)
         self.btn_link_lesion.setEnabled(False)
-        ai_lay.addWidget(self.btn_link_lesion)
+        edit_controls.addWidget(self.btn_link_lesion)
         self.btn_undo = QPushButton('撤销上一步 (Ctrl+Z)')
         self.btn_undo.clicked.connect(self._undo_mask_edit)
-        ai_lay.addWidget(self.btn_undo)
+        edit_controls.addWidget(self.btn_undo)
         self.grp_ai.setLayout(ai_lay)
-        t1_lay.addWidget(self.grp_ai)
+        result_lay.addWidget(self.grp_ai)
+        edit_lay.addWidget(self.grp_edit)
 
         # 测量与清理分组
         # 随访对比：独立成组。它是双序列工作流，与单序列阅片是两回事，
         # 旧版混在「显示控制」里，和窗位滑条并排，语义上毫无关系。
         self.grp_followup = QGroupBox("随访对比")
-        fl = QVBoxLayout(); fl.setContentsMargins(10, 15, 10, 10)
+        fl = QVBoxLayout(); fl.setContentsMargins(10, 8, 10, 10)
         h_cmp = QHBoxLayout()
         h_cmp.addWidget(self.btn_compare, 3); h_cmp.addWidget(self.chk_register, 1)
         fl.addLayout(h_cmp)
         self.grp_followup.setLayout(fl)
-        t1_lay.addWidget(self.grp_followup)
+        series_lay.addWidget(self.grp_followup)
 
         # 数据与隐私：低频但重要，单独一组比混在显示选项里更容易找到
         self.grp_data = QGroupBox("数据与隐私")
-        gl = QVBoxLayout(); gl.setContentsMargins(10, 15, 10, 10)
+        gl = QVBoxLayout(); gl.setContentsMargins(10, 8, 10, 10)
         gl.addWidget(self.chk_anon)
         self.chk_global_scope = QCheckBox("来源轴状层重复显示参考标记")
         gl.addWidget(self.chk_global_scope)
-        self.lbl_project_status = QLabel(''); self.lbl_project_status.setWordWrap(True)
-        gl.addWidget(self.lbl_project_status)
-        self.btn_open_project = QPushButton('打开工程')
-        self.btn_open_project.clicked.connect(self.open_project)
-        gl.addWidget(self.btn_open_project)
         self.btn_project_directory = QPushButton('选择保存目录')
         self.btn_project_directory.clicked.connect(self.choose_project_directory)
         gl.addWidget(self.btn_project_directory)
@@ -406,29 +428,41 @@ class UiBuilderMixin:
         self.btn_show_project_directory.clicked.connect(self.show_project_directory)
         gl.addWidget(self.btn_show_project_directory)
         self.grp_data.setLayout(gl)
-        t1_lay.addWidget(self.grp_data)
+        series_lay.addWidget(self.grp_data)
 
-        # 光标读数：只读信息，像状态栏一样贴在底部，不占分组标题
+        # 光标读数固定在任务页之外，切页和滚动仍能对照影像。
         self.lbl_hud = QLabel("")
         self.lbl_hud.setStyleSheet("color: #8B949E; font-family: monospace; font-size: 11px; min-height: 16px; max-height: 16px;")
-        self.lbl_hud.setAlignment(Qt.AlignCenter); t1_lay.addWidget(self.lbl_hud)
+        self.lbl_hud.setAlignment(Qt.AlignCenter); t1_outer.addWidget(self.lbl_hud)
         self.lbl_hu_value = QLabel()
         self.lbl_hu_value.setStyleSheet("color: #00ADB5; font-weight: bold; font-size: 13px; min-height: 18px; max-height: 18px;")
-        self.lbl_hu_value.setAlignment(Qt.AlignCenter); t1_lay.addWidget(self.lbl_hu_value)
+        self.lbl_hu_value.setAlignment(Qt.AlignCenter); t1_outer.addWidget(self.lbl_hu_value)
 
         t1_lay.addStretch()
 
-        # 清理与显示复位固定在滚动区外；清空可撤销，显示复位不丢弃任何工作标注。
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color: #2A3142;"); t1_outer.addWidget(sep)
-        self.btn_clear_anno = QPushButton("清空蒙版与标注"); self.btn_clear_anno.setProperty("class", "ActionBtn")
-        self.btn_clear_anno.clicked.connect(self.clear_mask_and_annotations); t1_outer.addWidget(self.btn_clear_anno)
-        self.btn_clear_slice = QPushButton('清空当前面')
-        self.btn_clear_slice.clicked.connect(lambda: self.clear_current_slice())
-        t1_outer.addWidget(self.btn_clear_slice)
-        self.btn_reset = QPushButton("重置显示"); self.btn_reset.setProperty("class", "ActionBtn")
-        self.btn_reset.clicked.connect(self.reset_all_states); t1_outer.addWidget(self.btn_reset)
-        t1_lay.addStretch()
+        # 清空必须显式选定视图，不能让上次笔画悄悄决定目标。
+        self.grp_clear = QGroupBox('清理当前工作图层')
+        clear_lay = QVBoxLayout(self.grp_clear)
+        self.cb_clear_view = QComboBox()
+        for vid in self.views:
+            self.cb_clear_view.addItem(f'V{vid}', vid)
+        self.cb_clear_view.currentIndexChanged.connect(self._refresh_clear_target)
+        clear_lay.addWidget(self.cb_clear_view)
+        self.lbl_clear_target = QLabel(''); self.lbl_clear_target.setWordWrap(True)
+        self.lbl_clear_target.setTextFormat(Qt.PlainText)
+        clear_lay.addWidget(self.lbl_clear_target)
+        self.btn_clear_slice = QPushButton('清空所选面')
+        self.btn_clear_slice.clicked.connect(lambda: self.clear_current_slice(self.cb_clear_view.currentData()))
+        clear_lay.addWidget(self.btn_clear_slice)
+        self.btn_clear_anno = QPushButton('清空蒙版与标注'); self.btn_clear_anno.setObjectName('DangerBtn')
+        self.btn_clear_anno.clicked.connect(self.clear_mask_and_annotations)
+        clear_lay.addWidget(self.btn_clear_anno)
+        edit_lay.addWidget(self.grp_clear)
+        self.btn_reset = QPushButton('重置显示')
+        self.btn_reset.clicked.connect(self.reset_all_states)
+        self.grp_view.layout().addWidget(self.btn_reset)
+        for content in (edit_lay, result_lay, series_lay):
+            content.addStretch()
 
     def _build_recon_tab(self):
         """重建实验室 Tab：投影生成 / BP-FBP-DFR / DMR-ART-SIRT / 性能监控。"""
@@ -608,7 +642,25 @@ class UiBuilderMixin:
         v.mouse_hovered.connect(lambda pos, id=vid: self.sync_crosshair(pos, id))
         v.seg_paint_requested.connect(lambda pts, er, id=vid: self.handle_seg_paint(id, pts, er))
         v.editing_started.connect(lambda id=vid: self._capture_edit_context(id))
-        lay.addWidget(t); lay.addWidget(v); t.raise_()
+        lay.addWidget(t)
+        if vid == 1:
+            self.primary_view_stack = QStackedWidget(); self.primary_view_stack.addWidget(v)
+            self.empty_state = QWidget(); empty_lay = QVBoxLayout(self.empty_state)
+            empty_lay.setContentsMargins(24, 24, 24, 24); empty_lay.addStretch()
+            self.lbl_empty_title = QLabel(''); self.lbl_empty_title.setObjectName('EmptyTitle')
+            self.lbl_empty_title.setAlignment(Qt.AlignCenter); self.lbl_empty_title.setWordWrap(True)
+            self.lbl_empty_detail = QLabel(''); self.lbl_empty_detail.setAlignment(Qt.AlignCenter)
+            self.lbl_empty_detail.setWordWrap(True); self.lbl_empty_detail.setTextFormat(Qt.PlainText)
+            empty_lay.addWidget(self.lbl_empty_title); empty_lay.addWidget(self.lbl_empty_detail)
+            self.btn_empty_import = QPushButton(''); self.btn_empty_import.setObjectName('PrimaryBtn')
+            self.btn_empty_import.clicked.connect(self.select_folder)
+            self.btn_empty_open = QPushButton(''); self.btn_empty_open.clicked.connect(self.open_project)
+            empty_lay.addWidget(self.btn_empty_import, 0, Qt.AlignCenter)
+            empty_lay.addWidget(self.btn_empty_open, 0, Qt.AlignCenter); empty_lay.addStretch()
+            self.primary_view_stack.addWidget(self.empty_state); lay.addWidget(self.primary_view_stack)
+        else:
+            lay.addWidget(v)
+        t.raise_()
         self.views[vid] = {'container':c, 'cb_plane': cb_plane, 'preset':ps, 'chk_anno':an, 'view':v, 'plane': plane, 'title_label': lt,
                            'cb_proj': cb_proj, 'sp_thick': sp_thick}
         cb_plane.currentIndexChanged.connect(lambda idx, v_id=vid: self.change_view_plane(v_id, idx))

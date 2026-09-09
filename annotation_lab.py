@@ -374,8 +374,8 @@ class AnnotationMixin:
             self.cb_layers.setCurrentIndex(self.cb_layers.findData(selected))
             layer = record.layers[selected]
             if layer.readonly:
-                status = ('Read-only AI; statistics below describe the working result.' if e else
-                          '只读原始 AI；下方统计对应当前工作结果。')
+                status = ('Read-only AI view. The Results tab uses the working layer.' if e else
+                          '画面为只读原始 AI；结果页统计当前工作图层。')
             elif layer.provenance.get('modified'):
                 status = 'Manually revised' if e else '已人工修订'
             elif layer.provenance.get('origin') == 'legacy-unknown':
@@ -394,6 +394,8 @@ class AnnotationMixin:
         self.btn_undo.setText('Undo last operation (Ctrl+Z)' if e else '撤销上一步 (Ctrl+Z)')
         self.btn_undo.setEnabled(doc is not None and bool(len(doc.history)))
         self._refresh_linked_lesion_controls()
+        self._refresh_result_source()
+        self._refresh_clear_target()
 
     def _linked_lesion_reference(self):
         doc = self.study_document
@@ -979,6 +981,68 @@ class AnnotationMixin:
         if not self.recon_mode_active:
             self.update_display()
 
+    def _refresh_clear_target(self):
+        """展示实际清空目标；隐藏视图和只读/投影状态不提供清空入口。"""
+        if not hasattr(self, 'cb_clear_view') or not hasattr(self, 'btn_clear_slice'):
+            return
+        e = self.is_english
+        def plane_name(vd):
+            if vd.get('patient_plane') is not None or self.canonical_orientation:
+                return ('Axial', 'Coronal', 'Sagittal')[vd['plane']]
+            return 'Source voxel plane' if e else '原始体素平面'
+        for index in range(self.cb_clear_view.count()):
+            vid = self.cb_clear_view.itemData(index); vd = self.views[vid]
+            hidden = vd['container'].isHidden()
+            text = f'V{vid} · {plane_name(vd)}' + ((' · hidden' if e else ' · 未显示') if hidden else '')
+            self.cb_clear_view.setItemText(index, text)
+            self.cb_clear_view.model().item(index).setEnabled(not hidden)
+        vid = self.cb_clear_view.currentData(); vd = self.views.get(vid)
+        available = (vd is not None and not vd['container'].isHidden()
+                     and self.study_document is not None and self._view_editable(vd))
+        self.btn_clear_slice.setEnabled(available)
+        if not available:
+            self.lbl_clear_target.setText('Choose a visible, editable single-slice view.' if e
+                                          else '请选择已显示、可编辑的单层视图。')
+            return
+        layer = self.cb_layers.currentText()
+        self.lbl_clear_target.setText(f'Target: V{vid} · {plane_name(vd)}\nLayer: {layer}\nOnly this displayed plane; Undo available.' if e
+            else f'目标：V{vid} · {plane_name(vd)}\n图层：{layer}\n仅清空此视图当前面，可撤销。')
+
+    def _refresh_result_source(self):
+        if not hasattr(self, 'lbl_stats_source'):
+            return
+        e = self.is_english
+        doc = self.study_document
+        record = doc.series.get(self.active_series_uid) if doc else None
+        if record is None:
+            text = 'No connected working result.' if e else '尚无已连接的工作结果。'
+        else:
+            index = self.cb_layers.findData(record.active_layer_id)
+            working = self.cb_layers.itemText(index)
+            display = self.cb_layers.currentText()
+            text = (f'Image: {display}\nStatistics / CSV / 3D: {working}' if e
+                    else f'画面：{display}\n统计 / CSV / 三维：{working}')
+        self.lbl_stats_source.setText(text)
+
+    def _refresh_workspace_state(self):
+        if not hasattr(self, 'primary_view_stack'):
+            return
+        e = self.is_english
+        empty = self.volume_hu is None and not (self.recon_mode_active and self._phantom_img is not None)
+        self.primary_view_stack.setCurrentIndex(1 if empty else 0)
+        doc = self.study_document
+        offline = empty and doc is not None and bool(doc.series)
+        self.lbl_empty_title.setText(('Project opened — connect source images' if e else '工程已打开，请连接原始影像')
+                                    if offline else ('Start with an image or project' if e else '从影像或已有工程开始'))
+        detail = ((f'Annotations are retained. {len(doc.series)} series await their matching DICOM source.' if e
+                   else f'工程标注已保留，{len(doc.series)} 个序列等待连接匹配的原始 DICOM。') if offline
+                  else ('Load a CT / MRI DICOM folder, or open a saved annotation project.' if e
+                        else '加载 CT / MRI DICOM 目录，或继续已有的标注工程。'))
+        self.lbl_empty_detail.setText(detail)
+        self.btn_empty_import.setText(('Connect DICOM Source' if e else '连接原始 DICOM') if offline
+                                      else ('Load DICOM Folder' if e else '加载 DICOM 目录'))
+        self.btn_empty_open.setText('Open Project' if e else '打开工程')
+
     def clear_current_slice(self, vid=None):
         vid = vid or getattr(self, '_last_edit_vid', 1)
         vd = self.views[vid]
@@ -1364,6 +1428,8 @@ class AnnotationMixin:
             stamp = datetime.fromisoformat(self._last_saved_at).astimezone().strftime('%H:%M:%S') if self._last_saved_at else ''
             status = ('Saved ' if e else '已保存 ') + stamp
         self.lbl_project_status.setText(status)
+        self.lbl_project_status.setStyleSheet('color: #F0AB91;' if self._last_save_error else '')
+        self._refresh_workspace_state()
         unbound = sum(not record.source_binding for record in doc.series.values()) if doc else 0
         note = (f'\n{unbound} unbound read-only series are excluded from the project.' if e
                 else f'\n{unbound} 个无稳定来源身份的序列仅供阅片，不纳入工程。') if unbound else ''
