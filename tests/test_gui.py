@@ -8534,6 +8534,100 @@ def test_linked_lesion_identity():
 
 
 
+def test_ui_transition_continuity(app):
+    """真实Qt切换往返：浏览状态保留，重建结果按来源失效，旧回调不得改新功能区。"""
+    import tempfile
+
+    from pydicom.uid import generate_uid
+    from PySide6.QtTest import QTest
+
+    print('[功能区切换画面连续性]')
+    with tempfile.TemporaryDirectory() as directory:
+        source_dir = os.path.join(directory, 'dicom'); os.mkdir(source_dir)
+        uid = generate_uid()
+        for z in range(8):
+            _write_min_dcm(os.path.join(source_dir, f'{z}.dcm'), (64, 80), uid, z * 2, z + 1,
+                           pixel_spacing=(.7, .7), pix=100 + z)
+        v = m.MedicalViewer(project_dir=os.path.join(directory, 'projects'), autosave=False)
+        v._kickoff_ai = lambda: None
+        try:
+            v.resize(1280, 800); v.show(); v.load_data(source_dir); QTest.qWait(150)
+            view = v.views[1]['view']
+            view.scale(3, 3); view._user_zoomed = True
+            view.centerOn(32, 25)
+            before = view.transform()
+            initial_center = view.mapToScene(view.viewport().rect().center())
+            for layout in (2, 1, 0):
+                v.combo_layout.setCurrentIndex(layout); QTest.qWait(30)
+                check(view.transform() == before, f'布局{layout}保留用户放大倍率')
+                current_center = view.mapToScene(view.viewport().rect().center())
+                check(abs(current_center.x()-initial_center.x()) < .2
+                      and abs(current_center.y()-initial_center.y()) < .2,
+                      f'布局{layout}保留放大后的观察中心')
+            for _ in range(2):
+                v.btn_panel_toggle.click(); QTest.qWait(30)
+                current_center = view.mapToScene(view.viewport().rect().center())
+                check(view.transform() == before and abs(current_center.x()-initial_center.x()) < .2
+                      and abs(current_center.y()-initial_center.y()) < .2,
+                      '侧栏显隐保持缩放与观察中心')
+            v.combo_layout.setCurrentIndex(2); QTest.qWait(30)
+            view.centerOn(32, 25)
+            center = view.mapToScene(view.viewport().rect().center())
+            v.views[1]['cb_proj'].setCurrentIndex(1); v.views[1]['sp_thick'].setValue(7)
+            state = (list(v.current_3d_pos), v.slider_ww.value(), v.slider_wl.value(), v.study_document.revision)
+            for page in (1, 2, 3, 0):
+                v.clinical_sections.setCurrentIndex(page); QTest.qWait(20)
+                check(view.transform() == before, f'任务页{page}不重置影像变换')
+            view.draw_crosshair(32, 25, show=True)
+            v.tabs.setCurrentIndex(1); QTest.qWait(30)
+            check(all(not vd['view'].vline.isVisible() and not vd['view'].hline.isVisible()
+                      for vd in v.views.values()), '重建页不残留临床十字线')
+            v.tabs.setCurrentIndex(0); QTest.qWait(40)
+            check(view.transform() == before, '重建往返恢复临床放大倍率')
+            after = view.mapToScene(view.viewport().rect().center())
+            check(abs(after.x()-center.x()) < 1 and abs(after.y()-center.y()) < 1,
+                  '重建往返恢复临床观察中心（允许Qt滚动条亚体素取整）')
+            check(v.views[1]['cb_proj'].currentIndex() == 1 and v.views[1]['sp_thick'].value() == 7,
+                  '重建往返保留MIP及厚度，控件与画面来源一致')
+            check(state == (list(v.current_3d_pos), v.slider_ww.value(), v.slider_wl.value(), v.study_document.revision),
+                  '功能区往返不改切片窗位或文档revision')
+            v.views[2]['cb_plane'].setCurrentIndex(CORONAL); QTest.qWait(30)
+            hidden_view = v.views[2]['view']; hidden_view.scale(2, 2); hidden_view._user_zoomed = True
+            hidden_camera = hidden_view.transform()
+            v.combo_layout.setCurrentIndex(0); v.tabs.setCurrentIndex(1); v.tabs.setCurrentIndex(0)
+            QTest.qWait(30); v.combo_layout.setCurrentIndex(2); QTest.qWait(30)
+            check(hidden_view.transform() == hidden_camera,
+                  '隐藏的各向异性MPR经重建往返再展开，仍保留原缩放与物理比例')
+            # 小型解析模体只验证UI流水线，不运行AI/外部权重。
+            v.PHANTOM_N = 32; v.tabs.setCurrentIndex(1); v.toggle_phantom()
+            v.rad_60.setChecked(True); v.generate_sinogram(); v.run_fbp(); QTest.qWait(40)
+            sino, result = v.current_sinogram, v.views[4]['view'].image_item.pixmap().toImage()
+            title, elapsed = v.views[4]['title_label'].text(), v.lbl_time.text()
+            v.tabs.setCurrentIndex(0); v.slider_slice.setValue(3); v.tabs.setCurrentIndex(1); QTest.qWait(40)
+            check(v.current_sinogram is sino and v.btn_fbp.isEnabled(),
+                  '模体重建切回保留弦图及可用操作，临床翻层不作废独立模体')
+            check(v.views[4]['view'].image_item.pixmap().toImage() == result
+                  and v.views[4]['title_label'].text() == title and v.lbl_time.text() == elapsed,
+                  '重建往返保留输出图、标题和对应耗时')
+            v.toggle_phantom(); v.generate_sinogram(); QTest.qWait(20)
+            v.tabs.setCurrentIndex(0); v.slider_slice.setValue(4); v.tabs.setCurrentIndex(1); QTest.qWait(30)
+            check(v.current_sinogram is None and v.views[4]['view'].image_item.pixmap().isNull()
+                  and not v.btn_fbp.isEnabled() and '--' in v.lbl_time.text(),
+                  '真实来源换层后旧重建图、按钮及耗时一起失效')
+            v.tabs.setCurrentIndex(0); v.is_english = True; v.update_language()
+            v.tabs.setCurrentIndex(1); QTest.qWait(30)
+            check('run projection' in v.views[2]['title_label'].text()
+                  and 'Run Time' in v.lbl_time.text(),
+                  '临床切换语言后重建等待提示与耗时占位同步更新')
+            # 模拟用户在重建延迟fit执行前立即返回临床。
+            v._fit_recon_views(); v.tabs.setCurrentIndex(0)
+            view.scale(1.7, 1.7); view._user_zoomed = True; expected = view.transform()
+            QTest.qWait(40)
+            check(view.transform() == expected, '旧重建延迟回调不覆盖返回后的临床缩放')
+        finally:
+            v.close(); app.processEvents()
+
+
 def test_ui_task_workflow(app):
     """任务页不改文档；按钮清明确所选面；工程离线提示与保存反馈常驻。"""
     import tempfile
@@ -8639,6 +8733,89 @@ def test_ui_empty_and_source_states(app):
             v.toggle_language()
             check('Source voxel plane' in v.lbl_clear_target.text() and '原始值' not in v.lbl_hud.text(),
                   '清空目标与常驻HUD同步切换英文')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_compact_view_controls(app):
+    """窄窗真实布局/点击与状态保持；不能以藏掉控件或缩小字号冒充适配。"""
+    import tempfile
+
+    from pydicom.uid import generate_uid
+    from PySide6.QtTest import QTest
+
+    print('[窄屏四窗：控件换行与侧栏收起]')
+    from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel, QSpinBox
+
+    from ui_builder import AdaptiveViewToolbar
+
+    bar = AdaptiveViewToolbar()
+    controls = (QLabel('V1'), QComboBox(), QComboBox(), QComboBox(), QSpinBox(), QCheckBox())
+    bar.set_controls(*controls)
+    check(all(w.parentWidget() is bar and not w.isWindow() for w in controls),
+          '初始六控件全部纳入工具条，未创建独立顶级控件')
+    bar.deleteLater(); app.processEvents()
+    with tempfile.TemporaryDirectory() as directory:
+        source_dir = os.path.join(directory, 'dicom'); os.mkdir(source_dir); uid = generate_uid()
+        for z in range(5):
+            _write_min_dcm(os.path.join(source_dir, f'{z}.dcm'), (12, 16), uid, z, z + 1, pix=100)
+        v = m.MedicalViewer(project_dir=os.path.join(directory, 'projects'), autosave=False)
+        v.persistence_dir = os.path.join(directory, 'cache'); v._kickoff_ai = lambda: None
+        try:
+            v.show(); v.activateWindow(); app.processEvents()
+            check(all(vd[k].parentWidget() is vd['toolbar'] for vd in v.views.values()
+                      for k in ('cb_plane', 'preset', 'cb_proj', 'sp_thick', 'chk_anno')),
+                  '空载首次show即有正确父级，不依赖载入DICOM修复控件')
+            v.load_data(source_dir); v.combo_layout.setCurrentIndex(2)
+            v.views[2]['cb_plane'].setCurrentIndex(CORONAL)
+            v.views[2]['cb_proj'].setCurrentIndex(1); v.views[2]['sp_thick'].setValue(3)
+            before = (v.study_document.revision, v.volume_mask.copy(), v.slider_ww.value(), v.slider_wl.value())
+            for english in (False, True):
+                if v.is_english != english:
+                    v.toggle_language()
+                v.resize(1024, 768); QTest.qWait(100)
+                check(v.width() == 1024, f'语言{english}：四窗在1024px实际容纳，不撑大窗口')
+                for vid, vd in v.views.items():
+                    controls = [vd[k] for k in ('title_label', 'cb_plane', 'preset', 'cb_proj', 'sp_thick', 'chk_anno')]
+                    rects = [w.geometry() for w in controls]
+                    check(vd['toolbar']._compact and all(w.isVisible() for w in controls)
+                          and all(vd['toolbar'].rect().contains(r) for r in rects)
+                          and all(not a.intersects(b) for i, a in enumerate(rects) for b in rects[i+1:]),
+                          f'语言{english} V{vid}：六控件全部可见、完整落入工具条且无重叠')
+                check(v.views[2]['cb_plane'].currentIndex() == CORONAL
+                      and v.views[2]['cb_proj'].currentIndex() == 1 and v.views[2]['sp_thick'].value() == 3,
+                      f'语言{english}：换行及重译保留平面、投影和厚度')
+            annotation = v.views[1]['chk_anno']; was = annotation.isChecked()
+            QTest.mouseClick(annotation, Qt.LeftButton); app.processEvents()
+            check(annotation.isChecked() != was, '窄工具条中的标注显示开关可以实际点击')
+            QTest.mouseClick(annotation, Qt.LeftButton)
+            QTest.mouseClick(v.btn_panel_toggle, Qt.LeftButton); QTest.qWait(80)
+            check(not v.right_panel.isVisible() and v.btn_panel_toggle.isVisible()
+                  and all(not vd['toolbar']._compact for vd in v.views.values()),
+                  '收起侧栏后保留恢复入口，宽视图自动恢复一行')
+            v.resize(900, 768); QTest.qWait(60)
+            check(v.width() == 900 and all(vd['toolbar']._compact for vd in v.views.values()),
+                  '侧栏收起时900px四窗仍可换行')
+            v.resize(1024, 768); QTest.mouseClick(v.btn_panel_toggle, Qt.LeftButton); QTest.qWait(80)
+            check(v.right_panel.isVisible() and v.width() == 1024
+                  and all(vd['toolbar']._compact for vd in v.views.values()),
+                  '展开侧栏恢复1024px双行工具条')
+            v.btn_panel_toggle.setFocus(); QTest.keyClick(v.btn_panel_toggle, Qt.Key_Space); QTest.qWait(40)
+            check(not v.right_panel.isVisible(), '面板按钮聚焦后可用Space收起')
+            v.btn_panel_toggle.setFocus(); QTest.keyClick(v.btn_panel_toggle, Qt.Key_Space); QTest.qWait(40)
+            check(v.right_panel.isVisible(), '面板按钮聚焦后可用Space展开')
+            check(v.study_document.revision == before[0] and np.array_equal(v.volume_mask, before[1])
+                  and (v.slider_ww.value(), v.slider_wl.value()) == before[2:],
+                  '缩放/折叠/重排不修改文档、mask或窗位')
+            v.resize(1600, 950); QTest.qWait(60)
+            check(all(not vd['toolbar']._compact for vd in v.views.values()), '宽窗口自动恢复一行')
+            v.tabs.setCurrentIndex(1); QTest.qWait(60)
+            check(all(not vd['toolbar']._compact and vd['title_label'].width() > 24
+                      and vd['cb_proj'].isHidden() for vd in v.views.values()),
+                  '重建模式隐藏阅片控件后标题获得整行宽度')
+            v.tabs.setCurrentIndex(0); v.resize(1024, 768); QTest.qWait(60)
+            check(all(vd['cb_proj'].isVisible() and vd['toolbar']._compact for vd in v.views.values()),
+                  '回到阅片恢复原控件并重新适配窄窗')
         finally:
             v.close(); app.processEvents()
 
@@ -10224,6 +10401,8 @@ def main_run():
     test_document_clear_and_track(app)
     test_ui_task_workflow(app)
     test_ui_empty_and_source_states(app)
+    test_compact_view_controls(app)
+    test_ui_transition_continuity(app)
     test_pixel_transform_boundaries(app)
     test_study_candidate_loading()
     test_patient_plane_sampler()

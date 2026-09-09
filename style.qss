@@ -61,3 +61,6 @@ QPushButton#LanguageBtn { min-height: 20px; max-height: 20px; font-size: 11px; p
 QLabel#ProjectStatus { color: #B0B8C4; font-size: 11px; padding: 2px 0; }
 QLabel#ResultSource { color: #BDE5E7; font-size: 12px; padding: 4px 0; }
 QLabel#EmptyTitle { color: #E2E8F0; font-size: 20px; font-weight: bold; padding: 8px 0; }
+
+QPushButton#PanelToggle { min-height: 30px; max-height: 30px; padding: 0 2px; font-size: 10px; color: #BDE5E7; }
+QPushButton#PanelToggle:checked { background-color: #262B35; border-color: #4B5563; }

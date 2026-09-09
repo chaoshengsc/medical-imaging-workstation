@@ -25,23 +25,86 @@ from constants import RECON_DL_MODEL, RECON_DL_VIEWS
 class ReconLabMixin:
     """重建实验室相关方法集合，混入 MedicalViewer。"""
 
+    def _recon_source_identity(self):
+        # 持有数组引用并按对象身份比较，避免临床翻层误废模体或复用同层号旧病例。
+        if self._phantom_img is not None:
+            return (self._phantom_img, 'phantom')
+        return (self.volume_hu, self.active_series_uid, int(self.current_3d_pos[0]))
+
+    @staticmethod
+    def _same_view_source(left, right):
+        return left is not None and left[0] is right[0] and left[1:] == right[1:]
+
+    def _capture_view_camera(self, view):
+        return (view.transform(), view.mapToScene(view.viewport().rect().center()),
+                view._user_zoomed, view.renderHints())
+
+    @staticmethod
+    def _restore_view_camera(view, camera):
+        transform, center, zoomed, hints = camera
+        view.setRenderHints(hints)
+        view._user_zoomed = zoomed
+        view.setTransform(transform)
+        view.centerOn(center)
+
+    def _restore_mode_cameras(self, cameras, *, clinical=False):
+        # 同步落定布局后恢复，不排队覆盖用户切回后立即执行的新缩放/平移。
+        self.centralWidget().layout().activate()
+        for vid, (plane, camera) in cameras.items():
+            self.views[vid]['container'].layout().activate()
+            if not clinical or self.views[vid]['plane'] == plane:
+                self._restore_view_camera(self.views[vid]['view'], camera)
+
     # =========================================================================
     # 重建模式进出与视图刷新
     # =========================================================================
     def _enter_recon_mode(self):
         """进入重建实验室：记忆原布局、清空视图、切到 2x2、隐藏每视图工具栏控件。"""
         self._cancel_view_interactions()
+        self._recon_camera_epoch = getattr(self, '_recon_camera_epoch', 0) + 1
+        self._clinical_camera_source = (self.volume_hu, self.active_series_uid)
+        self._clinical_cameras = {vid: (vd['plane'], self._capture_view_camera(vd['view']))
+                                  for vid, vd in self.views.items()}
         self._pre_recon_layout = self.combo_layout.currentIndex()
-        self._recon_ref_z = None   # 强制下一次 _render_recon_reference 初始化重建流水线
+        saved = getattr(self, '_recon_view_snapshot', None)
+        if saved is not None and not self._same_view_source(saved['source'], self._recon_source_identity()):
+            self._invalidate_recon_results()
+            saved = None
         for vid in range(1, 5):
             v = self.views[vid]['view']
             v.image_item.setPixmap(QPixmap())
             v.mask_item.setPixmap(QPixmap())
             v.set_overlay({}, {})  # 清空 DICOM 叠加，避免临床态的患者信息/方位字母残留到重建图上
+            v.clear_annotations(); v.draw_crosshair(0, 0, show=False)
+            v._user_zoomed = False
             v.resetTransform()
         # 切到 2x2，setSizes 在 setUpdatesEnabled(False) 下同步生效
         self._apply_grid_visibility(2)
         self._apply_grid_sizes(2)
+        if saved is not None:
+            self._sync_view_controls(); self._refresh_workspace_state()
+            for vid, state in saved['views'].items():
+                view = self.views[vid]['view']
+                view.set_image(state['pixmap'], pixel_spacing=state['spacing'])
+                title = state['title']
+                # 占位属于当前UI语言；已计算结果的标题保留运行时原文。
+                if '请先生成弦图' in title or 'run projection' in title:
+                    title = f'V{vid} ' + ('[— run projection —]' if self.is_english else '[— 请先生成弦图 —]')
+                elif '请选择算法重建' in title or 'run reconstruction' in title:
+                    title = f'V{vid} ' + ('[— run reconstruction —]' if self.is_english else '[— 请选择算法重建 —]')
+                self.set_view_title(vid, title)
+            for name, enabled in saved['buttons'].items():
+                getattr(self, name).setEnabled(enabled)
+            stamp = saved['time']
+            if '耗时: --' in stamp or 'Time: --' in stamp:
+                stamp = 'Run Time: -- ms' if self.is_english else '运行耗时: -- ms'
+            self.lbl_time.setText(stamp)
+            self.update_display()  # 同源结果仍有效；V1采用用户在阅片页更新的窗宽/窗位。
+            if self._phantom_img is not None:
+                # 空载模体不进入update_display的DICOM路径，V1标题需单独重译。
+                self.set_view_title(1, 'V1 [Phantom · known truth]' if self.is_english else 'V1 [模体 · 真值已知]')
+            self._restore_mode_cameras({vid: (None, state['camera']) for vid, state in saved['views'].items()})
+            return
         # 标题必须看模体状态：空载时 update_display 会因 volume_hu 为 None 直接返回，
         # 走不到 _render_recon_reference 那条修正路径，于是切 Tab 往返一次后 V1 就
         # 挂着「真实切片」显示着模体（实测踩到）。
@@ -58,14 +121,21 @@ class ReconLabMixin:
         self.update_display()
 
     def _exit_recon_mode(self):
-        """退出重建实验室：清空弦图缓存与按钮、恢复每视图工具栏控件、还原原布局。"""
-        self._invalidate_recon_results()
-        for b in [self.btn_dfr, self.btn_bp, self.btn_fbp, self.btn_dl]:
-            b.setEnabled(False)
+        """暂存重建画面并恢复阅片；切页不等于更换计算来源。"""
+        self._recon_camera_epoch = getattr(self, '_recon_camera_epoch', 0) + 1
+        self._recon_view_snapshot = {
+            'source': self._recon_source_identity(), 'time': self.lbl_time.text(),
+            'buttons': {name: getattr(self, name).isEnabled()
+                        for name in ('btn_dfr', 'btn_bp', 'btn_fbp', 'btn_dl')},
+            'views': {vid: {'pixmap': QPixmap(vd['view'].image_item.pixmap()),
+                            'spacing': vd['view'].pixel_spacing, 'title': vd['title_label'].text(),
+                            'camera': self._capture_view_camera(vd['view'])}
+                      for vid, vd in self.views.items()}}
         for vid, v in self.views.items():
             v['view'].image_item.setPixmap(QPixmap())
             v['view'].mask_item.setPixmap(QPixmap())
             v['view'].resetTransform()
+            v['view']._user_zoomed = False
             v['view'].setRenderHint(QPainter.SmoothPixmapTransform, True)
             v['cb_plane'].show(); v['preset'].show(); v['chk_anno'].show()
             self.set_view_title(vid, f"V{vid}")
@@ -74,6 +144,9 @@ class ReconLabMixin:
         self._apply_grid_sizes(prev)
         self._sync_view_controls()
         self.update_display()
+        if self._same_view_source(getattr(self, '_clinical_camera_source', None),
+                                  (self.volume_hu, self.active_series_uid)):
+            self._restore_mode_cameras(self._clinical_cameras, clinical=True)
 
     def _set_recon_pending_titles(self):
         """将 V2/V3/V4 标题统一设置为"请先生成弦图"的等待提示。
@@ -86,8 +159,11 @@ class ReconLabMixin:
     def _invalidate_recon_results(self):
         """数据来源变更时统一作废弦图及派生结果，不能只拿层号判断是否换数据。"""
         self._recon_ref_z = None
+        self._recon_view_snapshot = None
+        self._recon_camera_epoch = getattr(self, '_recon_camera_epoch', 0) + 1
         self.current_sinogram = self.current_theta = self._last_recon_img = None
         self._cached_bp = self._cached_bp_sino = None
+        self.lbl_time.setText('Run Time: -- ms' if self.is_english else '运行耗时: -- ms')
         for b in (self.btn_dfr, self.btn_bp, self.btn_fbp, self.btn_dl):
             b.setEnabled(False)
         if self.recon_mode_active:
@@ -547,10 +623,16 @@ class ReconLabMixin:
           display_numpy_image 中的 set_image 调用 fitInView 时图像可能还未完成布局，
           defer 到下一个事件循环 tick 保证几何计算基于最终尺寸进行。
         """
+        epoch = getattr(self, '_recon_camera_epoch', 0)
+        source = self._recon_source_identity()
+        def fit(view):
+            if (self.recon_mode_active and getattr(self, '_recon_camera_epoch', 0) == epoch
+                    and self._same_view_source(source, self._recon_source_identity())):
+                view.fitInView(view.scene.sceneRect(), Qt.KeepAspectRatio)
         for vid in [1, 2, 3, 4]:
             v = self.views[vid]['view']
             v.setRenderHint(QPainter.SmoothPixmapTransform, smooth)
-            QTimer.singleShot(0, lambda vv=v: vv.fitInView(vv.scene.sceneRect(), Qt.KeepAspectRatio))
+            QTimer.singleShot(0, lambda vv=v: fit(vv))
 
     # =========================================================================
     # 直接矩阵重建法 (Direct Matrix Reconstruction, DMR)

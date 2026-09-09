@@ -237,6 +237,7 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
         含状态/索引逻辑的控件（下拉框、播放/对比/AI 状态等）在表后单列处理。"""
         e = self.is_english
         self.btn_lang.setText("中" if e else "EN")
+        self._refresh_panel_toggle()
 
         # 静态文案表：(控件, 英文, 中文) —— setText 类
         for w, en, cn in (
@@ -488,6 +489,7 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
         """
         try:
             self.views[vid]['title_label'].setText(title)
+            self.views[vid]['title_label'].setToolTip(title)
         except Exception as e:
             print(f"Warning: set_view_title V{vid}: {e}")
 
@@ -732,9 +734,11 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
             projection_available = loaded and independent and self.canonical_orientation
             vd['cb_proj'].setEnabled(projection_available)
             vd['sp_thick'].setEnabled(projection_available and vd['cb_proj'].currentIndex() != 0)
-            if not projection_available:
+            # 临时进入重建/对比只禁用控件；来源本身不支持投影时才重置选择。
+            if not loaded or not self.canonical_orientation:
                 with QSignalBlocker(vd['cb_proj']):
                     vd['cb_proj'].setCurrentIndex(0)
+            vd['toolbar'].refresh_layout()
 
     def explain_annotation_unavailable(self):
         QMessageBox.information(self, "Annotation" if self.is_english else "标注",
@@ -742,19 +746,25 @@ class MedicalViewer(QMainWindow, ReconLabMixin, CompareMixin, AnnotationMixin,
             if self.is_english else "编辑需要可验证的来源身份及受支持的单层视图；身份不足时无法安全保存标注。")
 
     def switch_layout(self, m):
-        self._apply_grid_visibility(m)
-        # 隐藏视图不参与逐帧绘制；展开时同步补画，不能把数据读取留到下一轮事件。
-        self.update_display()
-        # setSizes 和 fitInView 合并到同一帧执行，消除两步之间的闪烁间隙
-        def _settle():
+        # 同一帧完成显隐、尺寸与补画；不留下跨功能区执行的旧布局回调。
+        # 隐藏的MPR图在重建往返后需重新绘制；补图的尺寸变化不能覆盖原观察位置。
+        cameras = {vid: self._capture_view_camera(vd['view']) for vid, vd in self.views.items()
+                   if vd['container'].isHidden() and vd['view']._user_zoomed}
+        self.setUpdatesEnabled(False)
+        try:
+            self._apply_grid_visibility(m)
             self._apply_grid_sizes(m)
+            self.update_display()
+            for vid, camera in cameras.items():
+                if not self.views[vid]['container'].isHidden():
+                    self._restore_view_camera(self.views[vid]['view'], camera)
             for vd in self.views.values():
                 v = vd['view']
                 px = v.image_item.pixmap()
-                # 只在 pixmap 真实存在时才 fitInView，避免对已清空的视图操作导致 m11 被改变
                 if not vd['container'].isHidden() and px and not px.isNull():
-                    v.fitInView(v.scene.sceneRect(), Qt.KeepAspectRatio)
-        QTimer.singleShot(0, _settle)
+                    v.fit_if_idle()
+        finally:
+            self.setUpdatesEnabled(True)
 
     def load_data(self, path):
         """先完整解码独立候选，再接入检查；失败/取消不改主文档。"""

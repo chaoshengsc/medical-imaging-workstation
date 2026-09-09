@@ -209,6 +209,8 @@ class MedicalGraphicsView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setStyleSheet("background-color: #000000; border: none;")
         self.setAlignment(Qt.AlignCenter)
+        # 分窗/侧栏改变视口时仍注视同一场景位置，避免放大后的目标随左上角漂移。
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setMouseTracking(True)  # 必须开启，否则鼠标未按下时不触发 mouseMoveEvent（影响 MPR 十字线）
 
         # --- 绘图状态变量 ---

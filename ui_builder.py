@@ -11,7 +11,7 @@
 
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -38,6 +39,80 @@ from PySide6.QtWidgets import (
 
 from constants import AXIAL, MANUAL_TRACK_LABEL
 from graphics_view import MedicalGraphicsView
+
+
+class AdaptiveViewToolbar(QFrame):
+    """只重排原有控件：窄视图两行、宽视图一行，不改变选项或发业务信号。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName('ViewToolbar')
+        self._controls = ()
+        self._compact = None
+        self._layout_signature = None
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(8, 2, 8, 2)
+        self._grid.setHorizontalSpacing(6); self._grid.setVerticalSpacing(4)
+        # 一行时的布局最小宽度不能阻止窗口缩小，否则永远进不了两行布局。
+        self._grid.setSizeConstraint(QLayout.SetNoConstraint)
+        self.setFixedHeight(36)
+
+    @staticmethod
+    def _control_width(widget):
+        return max(widget.minimumWidth(), min(widget.maximumWidth(), widget.sizeHint().width()))
+
+    def set_controls(self, *controls):
+        self._controls = controls
+        # 先纳入父布局再显示；新建控件的isHidden不是业务模式隐藏，不能据此留下顶级浮窗。
+        for column, widget in enumerate(controls):
+            self._grid.addWidget(widget, 0, column)
+            widget.show()
+        self.refresh_layout()
+
+    def minimumSizeHint(self):
+        if not self._controls:
+            return QSize(280, 36)
+        title, plane, preset, projection, thickness, annotation = self._controls
+        visible = [w for w in (plane, preset, annotation) if not w.isHidden()]
+        width = 24 + sum(self._control_width(w) for w in visible) + 6 * len(visible) + 16
+        return QSize(width, self.height())
+
+    def refresh_layout(self):
+        if not self._controls:
+            return
+        title, plane, preset, projection, thickness, annotation = self._controls
+        visible = [w for w in self._controls[1:] if not w.isHidden()]
+        wide_width = 24 + sum(self._control_width(w) for w in visible) + 6 * len(visible) + 16
+        compact = self.width() < wide_width and not projection.isHidden()
+        # 模式隐藏控件时仍需重算高度，但相同排布不反复remove/add。
+        signature = (compact, tuple(w.isHidden() for w in self._controls))
+        if signature != self._layout_signature:
+            self._layout_signature = signature
+            self._compact = compact
+            for widget in self._controls:
+                self._grid.removeWidget(widget)
+            for column in range(7):
+                self._grid.setColumnStretch(column, 0)
+            self._grid.setColumnMinimumWidth(0, 24)
+            if not visible:
+                self._grid.addWidget(title, 0, 0, 1, 7)
+                self._grid.setColumnStretch(1, 1)
+            elif compact:
+                for column, widget in enumerate((title, plane, preset)):
+                    self._grid.addWidget(widget, 0, column)
+                self._grid.addWidget(annotation, 0, 4); self._grid.setColumnStretch(3, 1)
+                self._grid.addWidget(projection, 1, 1); self._grid.addWidget(thickness, 1, 2)
+            else:
+                for column, widget in enumerate(self._controls[:5]):
+                    self._grid.addWidget(widget, 0, column)
+                self._grid.setColumnStretch(5, 1); self._grid.addWidget(annotation, 0, 6)
+        row_height = max([24, title.sizeHint().height()] + [w.sizeHint().height() for w in visible])
+        self.setFixedHeight(row_height * (2 if compact else 1) + (8 if compact else 4))
+        self.updateGeometry()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.refresh_layout()
 
 
 class UiBuilderMixin:
@@ -73,7 +148,7 @@ class UiBuilderMixin:
         self.left_toolbar = QFrame()
         self.left_toolbar.setObjectName("LeftToolbar")
         self.left_toolbar.setFixedWidth(70)
-        ll = QVBoxLayout(self.left_toolbar); ll.setContentsMargins(5, 20, 5, 20); ll.setSpacing(15)
+        ll = QVBoxLayout(self.left_toolbar); ll.setContentsMargins(5, 20, 5, 20); ll.setSpacing(10)
         self.tool_btn_group = QButtonGroup(self)
         self.tool_btns = {}
         tool_data = [(0, 'btn_ptr'), (1, 'btn_rul'), (2, 'btn_drw'),
@@ -85,6 +160,23 @@ class UiBuilderMixin:
             self.tool_btn_group.addButton(b, tid); ll.addWidget(b); self.tool_btns[key] = b
         self.tool_btn_group.idClicked.connect(self.change_active_tool)
         ll.addStretch()
+        self.btn_panel_toggle = QPushButton('收起面板')
+        self.btn_panel_toggle.setObjectName('PanelToggle')
+        self.btn_panel_toggle.setCheckable(True); self.btn_panel_toggle.setChecked(True)
+        self.btn_panel_toggle.toggled.connect(self._toggle_control_panel)
+        ll.addWidget(self.btn_panel_toggle)
+
+    def _toggle_control_panel(self, visible):
+        self.right_panel.setVisible(visible)
+        self._refresh_panel_toggle()
+
+    def _refresh_panel_toggle(self):
+        visible = self.btn_panel_toggle.isChecked()
+        self.btn_panel_toggle.setText(('Hide' if visible else 'Panel') if self.is_english
+                                      else ('收起面板' if visible else '展开面板'))
+        self.btn_panel_toggle.setToolTip('Show / hide controls' if self.is_english
+                                          else '展开 / 收起控制面板')
+        self.btn_panel_toggle.setAccessibleName(self.btn_panel_toggle.toolTip())
 
     def _build_view_grid(self):
         """中央 4 视图栅格：QSplitter 嵌套结构（main_splitter 含 top/bottom 两个横向 splitter）。"""
@@ -610,8 +702,7 @@ class UiBuilderMixin:
 
     def create_independent_view(self, vid, plane=AXIAL):
         c = QFrame(); c.setObjectName("ViewContainer"); lay = QVBoxLayout(c); lay.setContentsMargins(0,0,0,0); lay.setSpacing(0)
-        t = QFrame(); t.setObjectName("ViewToolbar"); t.setFixedHeight(32)
-        tl = QHBoxLayout(t); tl.setContentsMargins(8,2,8,2); tl.setSpacing(6)
+        t = AdaptiveViewToolbar()
         lt = QLabel(f"V{vid}"); lt.setStyleSheet("color: #C9D1D9; font-weight: bold; min-width: 20px;")
         cb_plane = QComboBox(); cb_plane.setFixedWidth(80)
         ps = QComboBox(); ps.setFixedWidth(85); ps.currentIndexChanged.connect(self.update_display)
@@ -627,8 +718,8 @@ class UiBuilderMixin:
         # 全仓库【没有一处读它的 isChecked()】——它连着 update_display，点一下会重绘
         # 一帧，看着像有反应，实际什么也没锁。阅片软件里「锁定」有明确的语义预期，
         # 摆一个不生效的开关比不摆更糟，故删除而非留着待实现。
-        tl.addWidget(lt); tl.addWidget(cb_plane); tl.addWidget(ps); tl.addWidget(cb_proj); tl.addWidget(sp_thick)
-        tl.addStretch(); tl.addWidget(an)
+        lt.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        t.set_controls(lt, cb_plane, ps, cb_proj, sp_thick, an)
         v = MedicalGraphicsView(vid)
         v.clicked_pos.connect(lambda p, id=vid: self.measure_hu(p, id))
         v.wheel_scrolled.connect(lambda d, id=vid: self.on_wheel_mpr(d, id))
@@ -662,5 +753,5 @@ class UiBuilderMixin:
             lay.addWidget(v)
         t.raise_()
         self.views[vid] = {'container':c, 'cb_plane': cb_plane, 'preset':ps, 'chk_anno':an, 'view':v, 'plane': plane, 'title_label': lt,
-                           'cb_proj': cb_proj, 'sp_thick': sp_thick}
+                           'cb_proj': cb_proj, 'sp_thick': sp_thick, 'toolbar': t}
         cb_plane.currentIndexChanged.connect(lambda idx, v_id=vid: self.change_view_plane(v_id, idx))
