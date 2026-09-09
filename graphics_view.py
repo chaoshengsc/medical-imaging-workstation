@@ -5,6 +5,7 @@
 
 import math
 import uuid
+from copy import deepcopy
 
 from PySide6.QtCore import QLineF, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -54,13 +55,15 @@ class ROIGraphicsItem(QGraphicsEllipseItem):
     """
     HANDLE = 12  # 右下角缩放手柄边长（像素）
 
-    def __init__(self, anno, on_changed):
+    def __init__(self, anno, on_changed, *, on_geometry_change=None):
         x, y, w, h = anno['rect']
         super().__init__(0.0, 0.0, w, h)   # rect 以 (0,0) 为基准，位置用 setPos 表示
         self.setPos(x, y)
         self._anno = anno
         self._on_changed = on_changed
+        self._on_geometry_change = on_geometry_change
         self._resizing = False
+        self._cancelled = False
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         # 右下角缩放手柄：纯视觉子图元，不接收鼠标（命中由父项按角点位置判定）
@@ -76,14 +79,30 @@ class ROIGraphicsItem(QGraphicsEllipseItem):
         r = self.rect()
         self._handle.setRect(r.width() - self.HANDLE, r.height() - self.HANDLE, self.HANDLE, self.HANDLE)
 
+    def shape(self):
+        # 手柄部分位于椭圆外：父项也必须包含该命中区，否则 Qt 跳过不收事件的子手柄。
+        shape = super().shape()
+        if hasattr(self, '_handle'):
+            handle = QPainterPath(); handle.addRect(self._handle.rect())
+            shape = shape.united(handle)
+        return shape
+
     def _commit(self):
         """把当前几何写回 annotation，并延迟触发重算（避免在事件中销毁自身）。"""
         p, r = self.pos(), self.rect()
-        self._anno['rect'] = (p.x(), p.y(), r.width(), r.height())
+        geometry = (p.x(), p.y(), r.width(), r.height())
+        if self._on_geometry_change is not None:
+            if tuple(self._anno['rect']) != geometry:
+                updated = deepcopy(self._anno); updated['rect'] = geometry
+                callback = self._on_geometry_change
+                QTimer.singleShot(0, lambda: callback(updated))
+            return
+        self._anno['rect'] = geometry
         if self._on_changed:
             QTimer.singleShot(0, self._on_changed)
 
     def mousePressEvent(self, ev):
+        self._cancelled = False
         r = self.rect()
         # 命中右下角手柄区域 → 进入缩放；否则交给基类做整体移动
         if ev.pos().x() >= r.width() - self.HANDLE and ev.pos().y() >= r.height() - self.HANDLE:
@@ -104,11 +123,21 @@ class ROIGraphicsItem(QGraphicsEllipseItem):
             super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
+        if self._cancelled:
+            ev.accept()
+            return
         was_resizing = self._resizing
         self._resizing = False
         if not was_resizing:
             super().mouseReleaseEvent(ev)   # 完成移动
         self._commit()
+
+    def cancel_drag(self):
+        self._cancelled = True
+        self._resizing = False
+        x, y, width, height = self._anno['rect']
+        self.setPos(x, y); self.setRect(0, 0, width, height)
+        self._sync_handle()
 
 
 # =========================================================================
@@ -130,15 +159,19 @@ class MedicalGraphicsView(QGraphicsView):
     crop_requested = Signal(list)      # 截取/套索完成，携带多边形顶点列表
     track_requested = Signal(QRectF)   # 3D 追踪框选完成，携带矩形区域
     annotation_deleted = Signal(str)   # Delete 键删除选中标注，携带标注 id
+    annotations_deleted = Signal(list) # 同一次 Delete 的多选 ID，一次事务
     window_changed = Signal(int, int)  # 右键拖拽调节窗宽窗位的增量 (dWW, dWL)
     mouse_hovered = Signal(QPoint)     # 鼠标移动，携带场景坐标（整数像素），用于 MPR 联动十字线
     seg_paint_requested = Signal(list, bool)  # 分割手动修正：(轨迹点列表, 是否橡皮擦除)
+    editing_started = Signal()       # 主窗口冻结文档/图层/平面，预览本身不入事务
 
     def __init__(self, view_id):
         super().__init__()
         self.view_id = view_id         # 视图编号 1~4，用于日志和信号路由
         self.current_tool = TOOL_POINTER
         self.annotation_enabled = True
+        self.edit_context = None
+        self.measurement_unit = 'mm'
         self.pixel_spacing = (1.0, 1.0)  # (行间距mm, 列间距mm)，从 DICOM PixelSpacing 读取
 
         # --- 场景与图层堆叠 ---
@@ -247,6 +280,9 @@ class MedicalGraphicsView(QGraphicsView):
           一旦用户通过 Ctrl+滚轮放大，m11 != 1.0，后续切片更新不会重置缩放，
           保留医生的放大查看状态——这是医学影像工作站的基本用户体验要求。
         """
+        if self.is_drawing:
+            self.cancel_interaction()
+        old_size, old_spacing = self.image_item.pixmap().size(), self.pixel_spacing
         self.image_item.setPixmap(pixmap)
         # None = 保持现有间距。缺省曾是 (1.0, 1.0) 并【无条件覆盖】，于是任何
         # 不传该参数的调用（compare_lab 刷新蒙版、显示单张图）都会把真实间距抹成
@@ -269,7 +305,8 @@ class MedicalGraphicsView(QGraphicsView):
         if abs(self.pixel_spacing[0] - self.pixel_spacing[1]) > 1e-9:
             # 各向异性（冠/矢状面：层厚≠面内像素间距）：按物理尺寸做非均匀适配，
             # 使显示比例符合解剖。每次都重适配（MPR 面不保留 Ctrl 缩放，可接受）。
-            self._apply_aniso_fit()
+            if not self._user_zoomed or old_size != pixmap.size() or old_spacing != self.pixel_spacing:
+                self._apply_aniso_fit()
         else:
             # 各向同性（横断面/重建/对比）：
             #   - m11≈1（identity/未缩放）→ 适配；
@@ -280,8 +317,16 @@ class MedicalGraphicsView(QGraphicsView):
             if abs(t.m11() - 1.0) < 1e-6 or abs(t.m11() - t.m22()) > 1e-9:
                 self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
 
+    def fit_if_idle(self):
+        """延迟适配仅作用于空闲视图，不能取消调度之后才开始的新笔画。"""
+        if self.is_drawing or self.is_windowing or self._user_zoomed:
+            return
+        self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+
     def fitInView(self, rect, aspect_mode=Qt.KeepAspectRatio):
         """加载、切平面、布局和 resize 的适配入口都保留物理像素比例。"""
+        if getattr(self, 'is_drawing', False):
+            self.cancel_interaction()
         if (not self.image_item.pixmap().isNull()
                 and abs(self.pixel_spacing[0] - self.pixel_spacing[1]) > 1e-9):
             self._apply_aniso_fit()
@@ -330,6 +375,10 @@ class MedicalGraphicsView(QGraphicsView):
 
     def cancel_interaction(self):
         """上下文变更时丢弃未提交笔划，防止旧坐标被写入新切片 / 新工具。"""
+        grabber = self.scene.mouseGrabberItem()
+        if isinstance(grabber, ROIGraphicsItem):
+            grabber.cancel_drag()
+            grabber.ungrabMouse()
         for item in (self.temp_item, self.temp_text, self.temp_rect_item):
             if item is not None and item.scene() is self.scene:
                 self.scene.removeItem(item)
@@ -337,6 +386,7 @@ class MedicalGraphicsView(QGraphicsView):
         self.start_pos = self.last_mouse_pos = self.current_path = None
         self.polygon_points = []
         self.is_drawing = self.is_windowing = False
+        self.edit_context = None
         self.brush_cursor.setVisible(False)
         self.setDragMode(QGraphicsView.NoDrag)
         self.setCursor(Qt.ArrowCursor)
@@ -357,6 +407,8 @@ class MedicalGraphicsView(QGraphicsView):
         这是 resizeEvent 的核心用途：当父容器尺寸改变后，视图需要重新计算
         fitInView 以填满新空间。仅在有实际影像时触发，避免对空视图操作。
         """
+        if getattr(self, 'is_drawing', False):
+            self.cancel_interaction()
         super().resizeEvent(event)
         px = self.image_item.pixmap()
         # 用户手动缩放过则保持其缩放，不因 resize 强制回到适配（与 set_image 的保留缩放一致）
@@ -371,6 +423,7 @@ class MedicalGraphicsView(QGraphicsView):
         - Ctrl + 滚轮：以鼠标位置为锚点缩放（每档 ×1.15 或 ÷1.15）
         - 普通滚轮：发射 wheel_scrolled 信号，由父窗口决定切换哪个方向的切片
         """
+        self.cancel_interaction()
         if event.modifiers() == Qt.ControlModifier:
             # AnchorUnderMouse 使缩放中心固定在光标下方，符合影像阅片习惯
             self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
@@ -387,9 +440,13 @@ class MedicalGraphicsView(QGraphicsView):
     def mousePressEvent(self, event):
         """鼠标按下：根据当前工具初始化对应的绘制状态，或开始平移/调窗操作。"""
 
+        if event.button() != Qt.LeftButton:
+            self.cancel_interaction()
+
         # 中键按下：将拖拽模式切换为 ScrollHandDrag（手型游标），实现图像平移
         # 技巧：Qt 的 ScrollHandDrag 需要左键触发，这里构造一个假的左键事件欺骗基类
         if event.button() == Qt.MiddleButton:
+            self._user_zoomed = True
             self.setDragMode(QGraphicsView.ScrollHandDrag)
             fake = QMouseEvent(event.type(), event.position(), event.globalPosition(),
                                Qt.LeftButton, Qt.LeftButton, event.modifiers())
@@ -411,17 +468,21 @@ class MedicalGraphicsView(QGraphicsView):
                 self.annotation_blocked.emit()
                 return
             self.is_drawing = True
+            if self.current_tool != TOOL_POINTER:
+                self.editing_started.emit()
 
             if self.current_tool == TOOL_POINTER:
                 # 先命中测试：点在 ROI（或其缩放手柄）上 → 交给该 item 自行移动/缩放，
                 # 视图设 NoDrag（否则 ScrollHandDrag 会拦截拖拽去平移视图），且不测 HU
                 hit = self.itemAt(event.position().toPoint())
                 if isinstance(hit, ROIGraphicsItem) or (hit is not None and isinstance(hit.parentItem(), ROIGraphicsItem)):
+                    self.editing_started.emit()
                     self.setDragMode(QGraphicsView.NoDrag)
                     super().mousePressEvent(event)
                     return
                 # 指针工具：点击发射 HU 测量信号，同时允许拖拽平移（ScrollHandDrag）
                 self.clicked_pos.emit(event.position().toPoint())
+                self._user_zoomed = True
                 self.setDragMode(QGraphicsView.ScrollHandDrag)
                 super().mousePressEvent(event)
 
@@ -472,7 +533,7 @@ class MedicalGraphicsView(QGraphicsView):
                 self.temp_item = QGraphicsPathItem(self.current_path)
                 is_erase = self.current_tool == TOOL_SEG_ERASE
                 c = QColor(231, 76, 60, 150) if is_erase else QColor(46, 204, 113, 150)
-                pen = QPen(c, self.brush_radius * 2)  # 笔宽=直径，预览与实际写入范围一致
+                pen = QPen(c, max(1, self.brush_radius * 2))
                 pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
                 self.temp_item.setPen(pen)
                 self.scene.addItem(self.temp_item)
@@ -491,7 +552,7 @@ class MedicalGraphicsView(QGraphicsView):
 
         # 分割工具：光标预览圈跟随鼠标显示笔刷范围（画笔绿/橡皮红）
         if self.current_tool in [TOOL_SEG_BRUSH, TOOL_SEG_ERASE]:
-            r = self.brush_radius
+            r = max(.5, self.brush_radius)
             self.brush_cursor.setRect(sp.x() - r, sp.y() - r, 2 * r, 2 * r)
             erase = self.current_tool == TOOL_SEG_ERASE
             self.brush_cursor.setPen(QPen(QColor(231, 76, 60, 180) if erase else QColor(46, 204, 113, 180), 1, Qt.DashLine))
@@ -521,11 +582,10 @@ class MedicalGraphicsView(QGraphicsView):
                 # 实时更新直线终点，并换算为毫米距离显示
                 # pixel_spacing[0]=行间距(mm/像素)，[1]=列间距，分别对应 Y 轴和 X 轴
                 self.temp_item.setLine(QLineF(self.start_pos, sp))
-                d = math.sqrt(
-                    ((sp.x() - self.start_pos.x()) * self.pixel_spacing[1]) ** 2 +
-                    ((sp.y() - self.start_pos.y()) * self.pixel_spacing[0]) ** 2
-                )
-                self.temp_text.setPlainText(f"{d:.1f} mm")
+                spacing = self.pixel_spacing if self.measurement_unit == 'mm' else (1., 1.)
+                d = math.hypot((sp.x() - self.start_pos.x()) * spacing[1],
+                               (sp.y() - self.start_pos.y()) * spacing[0])
+                self.temp_text.setPlainText(f"{d:.1f} {self.measurement_unit}")
                 self.temp_text.setPos(sp.x() + 10, sp.y() + 10)  # 标签跟随终点偏移显示
 
             elif self.current_tool == TOOL_DRAW and self.temp_item:
@@ -641,22 +701,24 @@ class MedicalGraphicsView(QGraphicsView):
 
             # 清理临时图元引用，防止悬空指针
             self.temp_item = self.temp_rect_item = self.temp_text = None
+            self.edit_context = None
 
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
         """Delete/Backspace 键删除当前选中的标注图元（需图元设置了 toolTip 作为 ID）。"""
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
-            for item in self.scene.selectedItems():
-                # toolTip 存储标注的 UUID，通过信号通知父窗口从数据层删除
-                if item.toolTip():
-                    self.annotation_deleted.emit(item.toolTip())
+            identities = list(dict.fromkeys(item.toolTip() for item in self.scene.selectedItems() if item.toolTip()))
+            if len(identities) == 1:
+                self.annotation_deleted.emit(identities[0])
+            elif identities:
+                self.annotations_deleted.emit(identities)
         super().keyPressEvent(event)
 
     def get_real_coordinates(self, pos):
         """将视图坐标转换为影像像素坐标，越界则返回 None。"""
         sp = self.mapToScene(pos)
-        x, y = int(sp.x()), int(sp.y())
+        x, y = math.floor(sp.x()), math.floor(sp.y())
         if (self.image_item.pixmap() and
                 0 <= x < self.image_item.pixmap().width() and
                 0 <= y < self.image_item.pixmap().height()):

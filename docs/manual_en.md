@@ -1,5 +1,7 @@
 # Medical Imaging Workstation — User Manual
 
+> Development update (2026-09-07): this Markdown documents multi-series annotation, unified Undo, `.miwproj` persistence and 3-D registration. MR loading, editing and registration have synthetic-data evidence; real multi-series MRI acceptance is still pending. Automatic tumour localisation, segmentation and type prediction remain under model research. These instructions are not a release or a claim of complete acceptance; see the [implementation plan](annotation_tumor_plan.md). The frozen V1.0 PDF is unchanged.
+
 **English** · [简体中文](manual_zh.md)
 
 > This manual is written for software version V1.0. All screenshots are demonstrated using the **public dataset TotalSegmentator-CT-Lite (CC-BY-4.0)** — **public, de-identified human CT**. These are images of real patients: what the dataset removes is *identifiability*, not the clinical origin, so no identifiable personal health information (PHI) is present, but "not patient data" would be the wrong claim. The patient-information panel is explicitly labelled as public data.
@@ -51,13 +53,14 @@ The top tabs switch between the two working modes, **Clinical reading** and **Re
 
 ## 4. Loading DICOM Data
 
-Click the **"Load DICOM directory"** button at the top of the right panel and choose a directory containing DICOM slices. The current loader supports **classic single-frame CT Image Storage**; non-CT, Enhanced CT, and multi-frame inputs are rejected before pixel decoding. For supported input, the software will:
+Click **"Load DICOM directory"** and choose a directory of slices. The loader accepts **Classic single-frame CT Image Storage / MR Image Storage** and rejects Enhanced, multi-frame and other modalities. Series in the same Study remain separate; use the Study/series selectors to switch. Different Studies are never combined into one volume. The MR target is static structural imaging; dynamic, diffusion and multi-echo inputs remain unvalidated. For readable input, the software will:
 
 - **Parallel disk reading**: read all DICOM files in the directory with multiple threads, speeding up loading of large series;
 - **Multi-series handling**: multi-file input is grouped only when every slice has a `SeriesInstanceUID`; otherwise it fails closed rather than merging unknown series. The selected group is then filtered to the majority matrix shape;
 - **Spatial sorting**: when every slice has finite, consistent `ImageOrientationPatient` and `ImagePositionPatient`, sort by the patient-space projection `dot(IPP, normal)`. If that geometry cannot be proved, fall back for the whole series to `InstanceNumber`, without claiming that this establishes anatomical order;
 - **Intensity and unit proof**: every retained slice must have finite non-zero `RescaleSlope` plus finite `RescaleIntercept`, and must either declare `RescaleType=HU` or satisfy the classic CT standard guarantee (`ImageType` is `ORIGINAL`, not `LOCALIZER`, and not multi-energy). Otherwise the underlying volume stays raw and HU quantification, AI and HU follow-up remain disabled. A supported CT missing only its unit declaration can use all six window presets directly when its slices share a positive finite linear transform. The interface labels this as a display preview; no copied directory or DICOM editing is needed. Explicit non-HU units, inconsistent or missing transforms, localizers, multi-energy data and unsupported LUTs retain raw-value window sliders. Multi-energy CT remains unsupported even when some such images may intrinsically represent HU;
-- **Capability gating**: valid PixelSpacing, canonical orientation, and uniform projected-z geometry are tracked independently. mm/mm², MPR, mL/physical STL, AI, and follow-up are enabled only when their contracts are proved. Non-canonical or incomplete geometry remains viewer-only where safe, with no invented anatomical labels or physical units.
+- **Separate source and spatial checks**: verifiable frame identities and decoded pixels determine whether annotations can safely persist. Patient geometry determines anatomical MPR and millimetre measurements; valid oblique acquisitions can use anatomical planes. A source-bound series without sufficient geometry permits original-slice editing without invented physical units. Editing is disabled when source identity cannot be established.
+- **Separate CT and MR capabilities**: MR uses stored intensity values and WW/WL controls, never HU, the CT organ model, HU quantification, CT follow-up or image-based CT reconstruction. CT-specific consumers retain their full geometry/intensity requirements. The built-in phantom remains available independently for reconstruction teaching.
 
 ---
 
@@ -106,7 +109,7 @@ The projection dropdown at the top of each view switches between four modes, wit
 | **MinIP** | Minimum intensity projection | **Low-density** structures: airways, emphysematous regions |
 | **AIP** | Average intensity projection | Noise reduction, overall density distribution |
 
-Projection runs along the normal of the current plane and is **supported on all three planes**. Selecting "Slice" disables the thickness box; in that state the displayed result is **pixel-for-pixel identical** to not using the projection feature at all.
+For canonical source acquisitions, projection runs along the current plane normal and is **supported on all three planes**. Oblique acquisitions currently allow single-plane viewing/editing with slab projection disabled. Selecting "Slice" disables the thickness box; in that state the displayed result is **pixel-for-pixel identical** to not using the projection feature at all.
 
 > Why slab rather than whole-volume projection: clinical practice uses slab MIP (typically 5–20 mm). Collapsing the entire volume into one image superimposes unrelated anatomy and obscures the target instead of revealing it. Thickness is converted to millimetres per plane — axial uses slice thickness along z, coronal/sagittal use pixel spacing along the in-plane axis, since the two carry different physical scales.
 
@@ -126,7 +129,7 @@ The nine tools in the left toolbar operate on the axial image after selection:
 8. **Segmentation eraser**: erase the mask where it was painted (can remove AI mis-segmentations).
 9. **ROI densitometry**: drag out an elliptical ROI and read the interior mean ± SD / min-max HU / area; the ellipse can be dragged, resized, and deleted.
 
-Annotations support two ownership modes, **slice-specific** and **global (all-slices)**, and can be persistently saved together with the segmentation masks as a project JSON via "Save annotation project." Segmentation editing supports `Ctrl+Z` undo.
+Rulers, freehand paths and ROIs retain their creation location. With patient-space geometry, other planes show the actual contour or intersection. The legacy global option repeats a 2-D reference on standard axial source slices; it does not define a 3-D lesion. Annotation creation, pixel editing, ROI movement/resizing, deletion and registration adoption share chronological `Ctrl+Z` Undo. The latest 20 operations persist with the project.
 
 ---
 
@@ -134,7 +137,7 @@ Annotations support two ownership modes, **slice-specific** and **global (all-sl
 
 ### 7.1 Automatic Inference
 
-After DICOM data is loaded, the software automatically calls the segmentation model (`models/organs.onnx`, 25 thoracoabdominal organ classes including 5 lung lobes) in a background thread to perform whole-volume sliding-window inference; the "Automated AI engine" area on the right displays the inference progress in real time; inference does not block interface operations. When there is no model file or inference fails, it falls back to a purely mathematical connected-component lung-segmentation algorithm.
+A CT series meeting the model's input requirements, without a recoverable working result, starts background sliding-window inference (`models/organs.onnx`, 25 thoracoabdominal organ classes including 5 lung lobes). MR never enters this model. Restored manual results and valid empty results do not trigger automatic recomputation. The existing engine can attempt connected-component lung segmentation if the model is missing or fails; this limited classical fallback does not identify tumour types. Failure is reported distinctly from no detection. Valid AI results enter read-only versions; a new version does not overwrite existing manual working results or clear edit history.
 
 > **Spacing resampling before inference.** The model (nnU-Net v2) requires the volume to be resampled to its training voxel spacing (1.5 mm isotropic) first; the software does this automatically and says so in the status line. Skipping it has a measured cost: at twice the training spacing, mean Dice falls from 0.922 to 0.799, with small organs failing first. That measurement was made on the model's own RAS in-plane convention rather than through the product's DICOM (LPS) path, so it characterises the model rather than the product end to end. The step is not free either — mask boundaries are quantised to the 1.5 mm grid and appear stair-stepped when mapped back to a finer original resolution: **structural accuracy up, pixel-level boundary precision down**. Resampling is skipped when the series is already near 1.5 mm, or when the scan range is so large that resampling would exceed the memory limit.
 
@@ -176,7 +179,13 @@ The pipeline is **isosurface extraction (marching cubes) → Taubin smoothing �
 
 ### 7.6 Segmentation Editing
 
-Using the "Segmentation brush / Segmentation eraser" tools, you can manually add to or erase the AI segmentation result; when painting in, a target organ can be specified (its quantification updates accordingly). All edits support `Ctrl+Z` undo.
+Select an editable working layer before using the segmentation brush or eraser. Organ and lesion layers are independent and can overlap. "New lesion layer" creates a separate lesion identifier; its type stays unknown without a type-prediction model.
+
+To annotate the same lesion in another series of this Study, select its working lesion layer in the reference series, switch to the target series, select the reference series, and click "Link reference lesion". This creates an empty layer with the same identifier; draw its extent independently in the target series. Statistics remain per series. Linking is undoable and persists in the project. The control is disabled when correspondence is unavailable, the reference is an organ layer, or that lesion already has a layer in the target series.
+
+Set the brush radius to its minimum, `1 voxel`, to add or remove one source voxel per click. Zooming, panning or changing anatomical planes does not turn this into a screen-pixel edit. Press–drag–release forms one operation; `Ctrl+Z` reverses it. Erasing changes labels, while Undo restores a previous operation. Changing tool, slice or series cancels an unfinished stroke.
+
+Select an original AI version for read-only comparison. "Use this AI version as working result" is undoable. Manual edits do not create model confidence or rerun classification. "Clear current plane" and "Clear Mask & Annotations" are separate: the latter clears all slices of the active working layer and the current series' ordinary annotations, with the scope stated in its confirmation. Both are undoable. Reset restores display/layout while retaining annotations and history.
 
 ---
 
@@ -255,8 +264,8 @@ The "Algorithm performance monitoring" area displays in real time the running ti
 
 ## 10. Compliance and De-identification
 
-- **De-identification switch**: after "De-ID" is enabled, on-screen identity is shown as `ANON`; explicit export filenames use a random `ANON-…` alias generated for the current load and add a suffix on collision, so repeated exports do not silently overwrite one another. This is not a DICOM anonymizer: it does not rewrite source DICOM tags or remove burned-in pixel text. Internal project JSON and mask caches retain patient/series identifiers and a geometry fingerprint for matching, and the UI warns again when saving them.
-- **Project-state persistence**: an AI-pending all-zero mask is only a placeholder and does not create a cache hit. Confirming the global clear action records an explicit provenance-bound empty mask on the next successful save, so an older non-zero cache cannot reappear after reopening; Ctrl+Z before saving restores the non-zero mask. Voxel-by-voxel erasing to zero is not treated as this global-clear action.
+- **De-identification switch**: after "De-ID" is enabled, on-screen identity is shown as `ANON`; explicit export filenames use a random `ANON-…` alias generated for the current load and add a suffix on collision, so repeated exports do not silently overwrite one another. This is not a DICOM anonymizer: it does not rewrite source DICOM tags or remove burned-in pixel text. Internal .miwproj projects and legacy mask caches retain patient/series identifiers and a geometry fingerprint for matching, and the UI warns again when saving them.
+- **Project-state persistence**: an AI-pending placeholder does not count as a completed AI result. Fully erased or explicitly cleared working layers persist as empty; original AI layers and old caches cannot fill them back in on reopening. The latest 20 Undo operations survive reopening.
 - **AI disclaimer**: the AI panel permanently displays a disclaimer, and the exported quantification CSV also embeds that disclaimer.
 
 ---
@@ -273,7 +282,29 @@ The language button in the top-right corner of the interface toggles between **C
 
 ## 12. Annotation Project Persistence
 
-Click **"Save annotation project"** on the right to save the current annotations and segmentation masks as a project JSON file; when the same patient's data is loaded again, the last-saved annotations and segmentation are automatically restored, with no need to re-run inference.
+### 12.1 Save All Series and Annotated Slices
+
+"Save Project" saves all series retained in the current Study, every annotated slice and the latest 20 Undo operations. The default directory is `Annotation_Projects/` under the application directory. "Choose Save Directory" changes it and remembers the choice. The status reports pending, saving, the last successful save time or failure; its tooltip shows the full path and formats. "Open Save Directory" locates the file.
+
+Completed changes save automatically after 2 seconds of inactivity, with a save scheduled every 30 seconds during continuous editing. AI and registration versions also trigger saving. An unfinished stroke is excluded. Edits made during saving remain pending until the newer revision is written. Closing or changing Study handles the latest save first; failures offer retry, another directory, staying in the project or explicitly discarding changes.
+
+The `.miwproj` file is one ZIP package. `manifest.json` records source identities, layers, timestamps and registration; per-series NPZ members hold labels and available confidence; `history.json` and compressed differences hold Undo. `summary.csv` records lesion identifiers, source-grid extent, voxel count, type/unknown and revision status. Volume/HU are recorded only with proven geometry/units; unavailable values are not reported as zero. The package commits as one unit, leaving the previous complete file intact if saving fails.
+
+### 12.2 Open, Reconnect and Migrate
+
+Loading the same Study first attempts its matching project. "Open Project" selects an explicit `.miwproj`. Source DICOM images are not bundled: retain them or reconnect their directory. Matching checks Study/Series/SOP identities, decoded pixels and spatial bindings, not just patient name or array shape.
+
+Loading only one series preserves the other series' offline annotations, results, transforms and history on resave. Load the missing source directory to reconnect and edit it. If the top Undo operation needs an offline source, Undo stops and explains the missing input instead of skipping back to an earlier operation.
+
+Legacy JSON/NPZ in `Exported_Lesions/` are read for migration only; new saves use the new project format. A legacy cache is a historical working result, without invented original AI, confidence or pre-migration Undo. A damaged project does not silently fall back to older caches. If only history is damaged while the final state is intact, an explicit recovery option creates a separate copy without the damaged history and preserves the original file. Damaged final layers or source metadata cannot use that recovery path.
+
+### 12.3 Correspondence Within an MRI Study
+
+"Keep patient location across series" attempts to navigate to the corresponding position when switching series. Shared FrameOfReference and overlapping geometry provide metadata location only, labelled as motion-unverified. An unavailable or out-of-coverage position is not clamped to a target boundary.
+
+Choose a reference series and click "3-D rigid registration" to calculate a candidate. Browse the Axial, Coronal and Sagittal sliders in the review dialog, comparing the current, aligned reference and overlay images. "Keep candidate" does not adopt it. "Reviewed all planes — adopt" records visual review and creates an undoable adoption. A better metric does not prove anatomical alignment; visual review is distinct from landmark or clinical validation.
+
+"Show reference annotations (read-only)" displays transformed masks and patient-space annotations without overwriting either source layer. Two-dimensional global references are not projected to another series. Real multi-series MRI acceptance remains pending; missing geometry, no overlap or failed registration must not force annotations onto another image.
 
 ---
 

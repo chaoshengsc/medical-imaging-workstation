@@ -10,7 +10,7 @@
 #       Mixin，若放到 Mixin 会被遮蔽，故留在 MedicalViewer 本体。
 # =============================================================================
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer
 
 import mpr_geometry
 from constants import AXIAL, CORONAL, SAGITTAL, TOOL_POINTER
@@ -39,12 +39,11 @@ class InteractionMixin:
             self.views[vid]['view'].cancel_interaction()
         self.views[vid]['plane'] = plane_idx
         view = self.views[vid]['view']
-        view.annotation_enabled = (self.volume_hu is not None and plane_idx == AXIAL
-                                   and not self.recon_mode_active and not self.compare_mode_active)
+        view.annotation_enabled = self._view_editable(self.views[vid])
         if not self.recon_mode_active:
             self.update_display()
         v = self.views[vid]['view']
-        QTimer.singleShot(20, lambda: v.fitInView(v.scene.sceneRect(), Qt.KeepAspectRatio))
+        QTimer.singleShot(20, v.fit_if_idle)
 
     def sync_crosshair(self, scene_pos, vid):
         """MPR 联动：当用户在任意视图中移动鼠标时，同步更新所有视图的十字准线位置。
@@ -59,9 +58,18 @@ class InteractionMixin:
         source_plane = self.views[vid]['plane']
         pos_x, pos_y = int(scene_pos.x()), int(scene_pos.y())
         # 悬停像素 → 完整 3D 体素（非 source 平面轴沿用当前光标），并裁剪到体积范围
-        z, y, x = mpr_geometry.hover_to_voxel(source_plane, pos_x, pos_y,
-                                              tuple(self.current_3d_pos), self.volume_hu.shape)
+        mapping = self.views[vid].get('patient_plane')
+        if mapping is not None:
+            voxel = mapping.scene_to_voxel(scene_pos.x(), scene_pos.y())
+            if voxel is None:
+                return
+            z, y, x = voxel
+        else:
+            z, y, x = mpr_geometry.hover_to_voxel(source_plane, pos_x, pos_y,
+                                                  tuple(self.current_3d_pos), self.volume_hu.shape)
         self._update_hud(z, y, x)  # HUD 实时更新，不依赖 MPR 联动开关
+        if any(vd['view'].is_drawing for vd in self.views.values()):
+            return  # 预览期间 hover 只更新提示，不换面或触发清除预览的重绘。
         if not self.btn_mpr.isChecked():
             return
         if self.current_3d_pos[0] != z:
@@ -79,8 +87,9 @@ class InteractionMixin:
         for vdata in self.views.values():
             if vdata['container'].isHidden():
                 continue
-            cx, cy = mpr_geometry.voxel_to_crosshair(
-                vdata['plane'], z, y, x, self.volume_hu.shape)
+            target = vdata.get('patient_plane')
+            cx, cy = (target.voxel_to_scene((z, y, x))[:2] if target is not None else
+                      mpr_geometry.voxel_to_crosshair(vdata['plane'], z, y, x, self.volume_hu.shape))
             vdata['view'].draw_crosshair(cx, cy)
 
     def _update_hud(self, z, y, x):
@@ -140,6 +149,14 @@ class InteractionMixin:
             self.slider_slice.setValue(max(0, min(z + increment, Z_MAX - 1)))
             return
         plane = self.views[vid]['plane']
+        mapping = self.views[vid].get('patient_plane')
+        if mapping is not None and not self.canonical_orientation:
+            self.current_3d_pos = mapping.step_normal(self.current_3d_pos, increment)
+            self.slider_slice.blockSignals(True)
+            self.slider_slice.setValue(self.current_3d_pos[0])
+            self.slider_slice.blockSignals(False)
+            self.on_slice_changed(self.current_3d_pos[0])
+            return
         if plane == AXIAL: self.slider_slice.setValue(max(0, min(z + increment, Z_MAX - 1)))
         elif plane == CORONAL: self.current_3d_pos[1] = max(0, min(y + increment, Y_MAX - 1)); self.update_display()
         elif plane == SAGITTAL: self.current_3d_pos[2] = max(0, min(x + increment, X_MAX - 1)); self.update_display()
@@ -163,20 +180,25 @@ class InteractionMixin:
             self.lbl_hu_value.setText("")   # 读不出就清空，绝不留旧值冒充当前读数
             return
         px, py = int(c[0]), int(c[1])
-        Z, Y, X = self.volume_hu.shape
-        screen_shape = {AXIAL: (X, Y), CORONAL: (X, Z), SAGITTAL: (Y, Z)}[plane]
-        if not (0 <= px < screen_shape[0] and 0 <= py < screen_shape[1]):
-            self.lbl_hu_value.setText("")
-            return
-        # 与 render/hover/crosshair 共用同一坐标约定：Coronal/Sagittal 上 S / 下 I，
-        # 因而 screen py 必须映射为 volume z=Z-1-py，不能直接把 py 当 z。
-        idx = mpr_geometry.hover_to_voxel(
-            plane, px, py, tuple(self.current_3d_pos), self.volume_hu.shape)
+        mapping = vd.get('patient_plane')
+        if mapping is not None:
+            idx = mapping.scene_to_voxel(px, py)
+            if idx is None:
+                self.lbl_hu_value.setText('')
+                return
+        else:
+            Z, Y, X = self.volume_hu.shape
+            screen_shape = {AXIAL: (X, Y), CORONAL: (X, Z), SAGITTAL: (Y, Z)}[plane]
+            if not (0 <= px < screen_shape[0] and 0 <= py < screen_shape[1]):
+                self.lbl_hu_value.setText("")
+                return
+            idx = mpr_geometry.hover_to_voxel(
+                plane, px, py, tuple(self.current_3d_pos), self.volume_hu.shape)
         names = ({AXIAL: "Axial", CORONAL: "Coronal", SAGITTAL: "Sagittal"} if self.is_english
                  else {AXIAL: "横断面", CORONAL: "冠状面", SAGITTAL: "矢状面"})
         unit = "HU" if getattr(self, 'hu_calibrated', False) else (
             "stored value" if self.is_english else "原始值")
-        plane_name = names[plane] if getattr(self, 'canonical_orientation', False) else (
+        plane_name = names[plane] if mapping is not None or getattr(self, 'canonical_orientation', False) else (
             "Source plane" if self.is_english else "原始体素平面")
         self.lbl_hu_value.setText(
             f"V{vid} [{plane_name}] ({c[0]}, {c[1]}) : {float(self.volume_hu[idx]):.1f} {unit}")

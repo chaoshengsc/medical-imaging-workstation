@@ -4,7 +4,7 @@ Technical reference for the module layout, the segmentation-model reverse-engine
 
 ## Module layout
 
-The main window is a `MedicalViewer` **God object** decomposed into five UI mixins plus eleven Qt-free compute modules that are unit-tested in isolation. The packaging inventory is the 20 top-level modules declared by `pyproject.toml`; `constants.py` is Qt-free but is a data table rather than a compute module.
+The main window is a `MedicalViewer` **God object** decomposed into five UI mixins plus 15 Qt-free compute modules that are unit-tested in isolation. The packaging inventory is the 24 top-level modules declared by `pyproject.toml`; `constants.py` is Qt-free but is a data table rather than a compute module.
 
 ```
 main.py            MedicalViewer + entry point (--data load, clinical render, W/L, tools, layout, AI scheduling, i18n, keyboard nav)
@@ -22,6 +22,10 @@ quantify.py        organ quantification (volume mL + seven HU statistics per org
 segmentation.py    classical fallback segmentation (lung connected-components)
 mpr_geometry.py    MPR coordinate mapping + dual-series z-registration
 dicom_geometry.py  classic CT HU-unit proof + separate preview affine + geometry/order/fingerprint contracts
+study_data.py      decoded CT/MR source identity and independent patient-space affine; no UI mutation or AI
+annotation_state.py  committed mask/object transactions, compressed voxel deltas and study-wide ordered Undo
+project_store.py   single-revision ZIP/JSON/NPZ/CSV project persistence and offline source-bound restoration
+series_registration.py  source-bound LPS correspondence and independent 3-D rigid registration adapter
 windowing.py       raw-value display window and slider limits, excluding DICOM padding; no HU inference
 followup.py        follow-up comparison metrics (HU difference map + per-slice statistics)
 projection.py      slab projection (MIP / MinIP / AIP) across the three planes
@@ -36,7 +40,27 @@ models/organs.onnx segmentation model graph (external weights not committed — 
 
 ### Design: why the compute modules are Qt-free
 
-Anything numerically testable is factored out of the Qt widgets into a pure module (`recon` / `quantify` / `segmentation` / `mpr_geometry` / `dicom_geometry` / `windowing` / `followup` / `projection` / `mesh3d` / `registration` / `model_card`), so it can be exercised with synthetic data in the data-independent test subset — no display, no real DICOM, no 119 MB weights. New testable logic follows the same pattern rather than being buried in a Qt- or data-dependent path.
+Anything numerically testable is factored out of the Qt widgets into the compute modules listed above, so it can be exercised with synthetic data in the data-independent test subset — no display, no real DICOM, no 119 MB weights. New testable logic follows the same pattern rather than being buried in a Qt- or data-dependent path.
+
+### Study documents, editing and persistence
+
+`SeriesVolume` decodes Classic single-frame CT/MR into independent candidates. `StudyDocument` owns per-series source bindings, optional LPS geometry bindings, organ and lesion layers, ordinary annotations and the latest 20 committed operations. Patient-space MPR uses the source affine; missing spatial proof permits source-plane editing only when stable source identity exists. Unbound images remain read-only transient views. Original AI layers are immutable; adopting a result and subsequent working-layer edits use ordered Undo.
+
+Creating a linked lesion reuses the reference working layer's lesion ID in another series of the same Study. Each layer retains its own mask, confidence and provenance. The normal layer-creation transaction supplies Undo and persistence; the UI requires a usable spatial correspondence and rejects duplicate links. Linking does not carry a type prediction from another series or resample a reference mask.
+
+`project_store` captures committed state without copying every volume. Its shared arrays are read-only; the next edit copies only the affected working layer when necessary. `ProjectSaveWorker` in `annotation_lab` performs validation, statistics, compression and file I/O. Main-thread document revision changes trigger a 2-second idle timer with a 30-second continuous-edit ceiling. One worker and one coalesced latest request prevent queued whole-volume snapshots. Receipts must match document identity and save generation; an old revision cannot clear newer changes. Saving leaves uncommitted mouse previews intact.
+
+One `.miwproj` ZIP atomically holds JSON metadata/history, per-series NPZ layers, compressed Undo deltas and a CSV summary for the same revision. Output defaults to `Annotation_Projects/`, with a configurable directory persisted in QSettings. Temporary writes are flushed and fsynced before replacement. Save and restore validate resource bounds and replay history against final state. Failed saves retain the previous complete file; close/study-switch waits for current changes and offers explicit failure handling. The UI reports the actual path, formats and last successful save time.
+
+Opening first restores every saved series offline, then connects matching DICOM sources. Loading a subset never drops absent series or their history/statistics. A top Undo that needs offline sources stays in place until they are reconnected. If final annotations validate but history fails, explicit recovery creates an independent document and protected new path; it cannot overwrite the original. Legacy `Exported_Lesions` files are read-only migration inputs under the existing four cache guards. Imported masks are historical working results with unknown model provenance, never fabricated original AI versions; rejected annotation entries are reported with the retained file location. No source DICOM is bundled in the project.
+
+Quantification reuses each label's samples for mean, population SD and percentiles, and counts labels in bounded chunks. It avoids full-volume widened label/float intermediates when refining a sparse mask. Numerical checks retain the HU, confidence-sentinel and high-label contracts.
+
+`series_registration` distinguishes shared-FrameOfReference metadata location from image-based registration. It bounds the input grid, uses SimpleITK Euler3D/Mattes mutual information with a fixed sampling seed and an iteration/time budget, and converts the library's fixed-to-moving transform into the stored moving-to-fixed LPS direction. Overlap, finite metrics and motion checks produce a candidate, not an automatic anatomical verification. Non-collinear landmarks can validate physical errors; the product also provides three-plane current/reference/overlay review and records explicit visual acceptance separately from landmark validation.
+
+`SeriesRegistrationWorker` returns through Qt signals, guarded by document identity, generation and input revision. Cancellation, source switching, intervening edits and close cannot attach stale results. Every accepted candidate/review result advances persistence state; adopting correspondence is a separate undoable operation requiring both endpoints. Transform versions, direction, parameters and quality evidence are part of the project manifest and are validated independently of history. Series switching maps the cursor through a validated direct correspondence; out-of-bounds points do not clamp to a target border. Reference masks use nearest-neighbor display sampling and reference objects use transformed patient-space points, with read-only amber overlays. Source arrays and annotation objects are never overwritten by these display transforms. The existing two-dimensional follow-up registration remains separate.
+
+Synthetic 3-D and product-path gates are recorded in the [implementation plan](annotation_tumor_plan.md). Real MRI validation, remaining delivery regression and tumor model research are unfinished; these adapters do not establish clinical generality.
 
 ## Segmentation model
 

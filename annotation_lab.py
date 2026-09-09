@@ -13,19 +13,33 @@
 # =============================================================================
 
 import csv
+import hashlib
 import json
 import math
 import os
-import tempfile
+import uuid
+from copy import deepcopy
 from datetime import datetime
+from threading import Event
 
 import numpy as np
 import scipy.ndimage as ndimage
-from PySide6.QtCore import QLineF, QPointF, Qt, Signal
+from PySide6.QtCore import (
+    QEventLoop,
+    QLineF,
+    QPointF,
+    QSettings,
+    QSignalBlocker,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
+    QDesktopServices,
     QFont,
-    QFontMetricsF,
     QImage,
     QPainter,
     QPainterPath,
@@ -40,22 +54,121 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsLineItem,
     QGraphicsPathItem,
+    QGraphicsPixmapItem,
     QGraphicsTextItem,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QProgressDialog,
     QPushButton,
     QScrollArea,
+    QSlider,
     QVBoxLayout,
 )
 
 import mesh3d
 import model_card
+import mpr_geometry
 import quantify
-from constants import AXIAL, LABEL_LUT, MANUAL_TRACK_LABEL
+import series_registration
+from constants import AXIAL, CORONAL, LABEL_LUT, MANUAL_TRACK_LABEL, SAGITTAL, TOOL_SEG_BRUSH
 from dicom_geometry import series_fingerprint
 from graphics_view import ROIGraphicsItem
+from project_store import (
+    HistoryRecoveryRequired,
+    ProjectError,
+    capture_project_snapshot,
+    load_project_snapshot,
+    save_project_snapshot,
+)
+
+
+class ProjectSaveWorker(QThread):
+    """只压缩不可变快照并写盘；结果由 finished 信号交回主线程。"""
+
+    def __init__(self, snapshot, path, generation, parent=None):
+        super().__init__(parent)
+        self.snapshot, self.path, self.generation = snapshot, path, generation
+        self.receipt, self.error = None, None
+
+    def run(self):
+        try:
+            self.receipt = save_project_snapshot(self.snapshot, self.path)
+        except Exception as exc:
+            self.error = str(exc)
+
+
+class SeriesRegistrationWorker(QThread):
+    """只计算冻结的影像来源；主线程负责接入结果和复核。"""
+
+    def __init__(self, moving, fixed, document_id, revision, generation, parent=None):
+        super().__init__(parent)
+        self.moving, self.fixed = moving, fixed
+        self.document_id, self.revision, self.generation = document_id, revision, generation
+        self.cancelled = Event(); self.result = None; self.error = None
+
+    def run(self):
+        try:
+            self.result = series_registration.register_rigid_3d(self.moving, self.fixed, cancelled=self.cancelled.is_set)
+        except Exception as exc:
+            self.error = str(exc)
+
+
+class RegistrationReviewDialog(QDialog):
+    """三个患者平面的当前/变换后参考/叠加预览；采用仅表示用户完成视觉复核。"""
+
+    def __init__(self, moving, fixed, result, english=False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Review 3-D alignment' if english else '检查三维配准对应')
+        self.resize(940, 720)
+        layout = QVBoxLayout(self)
+        note = QLabel('Inspect anatomy through the three planes before accepting. Metric improvement alone does not prove alignment.'
+                      if english else '请逐层检查三个方向的解剖对应。分数改善不能单独证明对齐；采用后记录为人工复核。')
+        note.setWordWrap(True); layout.addWidget(note)
+        grid = QGridLayout(); layout.addLayout(grid)
+        for column, name in enumerate(('Current series', 'Aligned reference', 'Overlay') if english else ('当前序列', '变换后的参考序列', '叠加检查')):
+            grid.addWidget(QLabel(name), 0, column + 1)
+        self.sliders = []; self.previews = []
+        plane_cursors = [mpr_geometry.patient_plane_cursors(fixed.affine, fixed.volume.shape, plane)
+                         for plane in (AXIAL, CORONAL, SAGITTAL)]
+
+        def gray(values):
+            lo, hi = np.percentile(values, [1, 99])
+            return np.clip((values - lo) / max(float(hi-lo), 1e-6) * 255, 0, 255).astype(np.uint8)
+
+        def render(plane_index, index):
+            cursor = plane_cursors[plane_index][index]
+            plane = mpr_geometry.patient_plane(fixed.affine, fixed.volume.shape, plane_index, cursor)
+            base = gray(plane.sample(fixed.volume))
+            reference = gray(series_registration.sample_corresponding_plane(moving, fixed, moving.volume,
+                                    plane, result, allow_candidate=True))
+            mixed = np.stack((base, reference, base), axis=-1)
+            # 预览与主视图一样按物理宽高比显示，不能把异方性像素当成正方形。
+            aspect = plane.shape[1] * plane.spacing[1] / (plane.shape[0] * plane.spacing[0])
+            width = max(1, min(240, round(150 * aspect)))
+            height = max(1, min(150, round(240 / aspect)))
+            for label, array in zip(self.previews[plane_index], (np.repeat(base[...,None],3,axis=2),
+                                    np.repeat(reference[...,None],3,axis=2), mixed), strict=True):
+                array = np.ascontiguousarray(array)
+                image = QImage(array.data, array.shape[1], array.shape[0], array.strides[0], QImage.Format_RGB888).copy()
+                label.setPixmap(QPixmap.fromImage(image).scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+
+        for plane_index, name in enumerate(('Axial', 'Coronal', 'Sagittal')):
+            grid.addWidget(QLabel(name), plane_index * 2 + 1, 0)
+            labels = [QLabel() for _ in range(3)]; self.previews.append(labels)
+            for column, label in enumerate(labels):
+                label.setAlignment(Qt.AlignCenter); label.setMinimumSize(180, 120)
+                grid.addWidget(label, plane_index * 2 + 1, column + 1)
+            slider = QSlider(Qt.Horizontal); slider.setRange(0, len(plane_cursors[plane_index]) - 1)
+            slider.setValue(slider.maximum() // 2)
+            slider.valueChanged.connect(lambda value, p=plane_index: render(p, value))
+            self.sliders.append(slider); grid.addWidget(slider, plane_index * 2 + 2, 1, 1, 3)
+            render(plane_index, slider.value())
+        buttons = QHBoxLayout(); layout.addLayout(buttons)
+        keep = QPushButton('Keep candidate' if english else '仅保留候选'); keep.clicked.connect(self.reject)
+        accept = QPushButton('Reviewed all planes — adopt' if english else '已检查三面，采用'); accept.clicked.connect(self.accept)
+        buttons.addWidget(keep); buttons.addWidget(accept)
 
 
 class MeshView(QLabel):
@@ -174,16 +287,204 @@ def _pin_text_to_screen(txt, view):
     必须先按当前缩放折算回去——写死一个场景单位常量在任何别的缩放下都是错的。
     """
     txt.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-    scale = abs(view.transform().m11()) or 1.0
-    fm = QFontMetricsF(txt.font())
-    lines = txt.toPlainText().split("\n") or [""]
-    w_px = max((fm.horizontalAdvance(ln) for ln in lines), default=0.0)
-    h_px = fm.height() * len(lines)
-    return w_px / scale, h_px / scale
+    bounds = txt.boundingRect()  # 包括 QTextDocument 的真实边距，不能只量字体字宽。
+    transform = view.transform()
+    return (bounds.width() / (abs(transform.m11()) or 1.0),
+            bounds.height() / (abs(transform.m22()) or 1.0))
 
 
 class AnnotationMixin:
     """标注 / 分割蒙版编辑 / 器官定量相关方法集合，混入 MedicalViewer。"""
+
+    def _capture_edit_context(self, vid):
+        self._stop_cine()
+        self._last_edit_vid = vid
+        doc = self.study_document
+        vd = self.views[vid]
+        if doc is None or self.active_series_uid not in doc.series or not self._view_editable(vd):
+            vd['view'].edit_context = None
+            return
+        record = doc.series[self.active_series_uid]
+        layer_id = record.active_layer_id
+        if (vd['view'].current_tool == TOOL_SEG_BRUSH
+                and int(self.cb_paint_target.currentData() or MANUAL_TRACK_LABEL) == MANUAL_TRACK_LABEL
+                and record.layers[layer_id].kind == 'organ'):
+            layer_id = 'working-manual'
+        vd['view'].edit_context = {
+            'document_id': doc.document_id, 'series_uid': self.active_series_uid,
+            'layer_id': layer_id, 'cursor': tuple(self.current_3d_pos),
+            'mapping': vd.get('patient_plane'), 'shape': self.volume_hu.shape,
+            'plane': vd['plane'], 'radius': vd['view'].brush_radius,
+        }
+
+    def _sync_committed_edit(self):
+        record = self.study_document.series[self.active_series_uid]
+        self.volume_mask, self.volume_conf = record.working_mask, record.confidence
+        self.global_annotations = record.annotations
+        self._update_organ_stats()
+        self._refresh_layer_controls()
+        self._refresh_series_link_status()
+        self._sync_view_controls()
+        if not self.recon_mode_active:
+            self.update_display()
+
+    def _paint_document(self, vid, points, is_erase):
+        view = self.views[vid]['view']
+        context = view.edit_context
+        if context is None:  # 脚本/菜单直接调用也走相同已验证上下文。
+            self._capture_edit_context(vid)
+            context = view.edit_context
+        if (context is None or context['document_id'] != self.study_document.document_id
+                or context['series_uid'] != self.active_series_uid
+                or context['plane'] != self.views[vid]['plane'] or not self._view_editable(self.views[vid])):
+            return
+        indices = mpr_geometry.stroke_voxels(points, context['radius'], context['mapping'],
+                                             context['shape'], context['cursor'])
+        if not len(indices):
+            return
+        self._remember_active_series()
+        label = 0 if is_erase else int(self.cb_paint_target.currentData() or MANUAL_TRACK_LABEL)
+        command = self.study_document.edit_mask(self.active_series_uid, indices, label,
+                     layer_id=context['layer_id'], cursor=context['cursor'],
+                     view_plane=context['plane'],
+                     description='Erase' if is_erase else 'Paint')
+        if command is not None:
+            self.study_document.series[self.active_series_uid].active_layer_id = context['layer_id']
+            self._stop_ai_for_manual_edit()
+            self._sync_committed_edit()
+
+    def _refresh_layer_controls(self):
+        e = self.is_english
+        doc = self.study_document
+        self.cb_layers.blockSignals(True)
+        self.cb_layers.clear()
+        record = doc.series.get(self.active_series_uid) if doc is not None else None
+        if record is not None:
+            count = 0
+            for layer in record.layers.values():
+                if layer.readonly:
+                    count += 1
+                    name = f'Original AI {count}' if e else f'原始 AI {count}'
+                elif layer.kind == 'lesion':
+                    name = f'Lesion {layer.lesion_id[:8]}' if e else f'病灶 {layer.lesion_id[:8]}'
+                else:
+                    name = 'Working organs' if e else '器官工作结果'
+                self.cb_layers.addItem(name, layer.layer_id)
+            selected = self._display_layer_id or record.active_layer_id
+            self.cb_layers.setCurrentIndex(self.cb_layers.findData(selected))
+            layer = record.layers[selected]
+            if layer.readonly:
+                status = ('Read-only AI; statistics below describe the working result.' if e else
+                          '只读原始 AI；下方统计对应当前工作结果。')
+            elif layer.provenance.get('modified'):
+                status = 'Manually revised' if e else '已人工修订'
+            elif layer.provenance.get('origin') == 'legacy-unknown':
+                status = ('Imported working result; original AI unavailable.' if e else
+                          '历史工作结果；原始 AI 不可用。')
+            else:
+                status = 'Working result' if e else '当前工作结果'
+            self.lbl_layer_status.setText(status)
+            self.btn_adopt_ai.setEnabled(layer.readonly)
+        else:
+            self.lbl_layer_status.setText(''); self.btn_adopt_ai.setEnabled(False)
+        self.cb_layers.blockSignals(False)
+        self.btn_adopt_ai.setText('Use this AI version as working result' if e else '采用此 AI 版本为工作结果')
+        self.btn_new_lesion.setText('New lesion layer' if e else '新建病灶图层')
+        self.btn_new_lesion.setEnabled(record is not None and record.source_binding is not None)
+        self.btn_undo.setText('Undo last operation (Ctrl+Z)' if e else '撤销上一步 (Ctrl+Z)')
+        self.btn_undo.setEnabled(doc is not None and bool(len(doc.history)))
+        self._refresh_linked_lesion_controls()
+
+    def _linked_lesion_reference(self):
+        doc = self.study_document
+        sid = self.cb_reference_series.currentData()
+        if (doc is None or self.recon_mode_active or self.compare_mode_active
+                or self._display_layer_id is not None or sid not in doc.series
+                or self.active_series_uid not in doc.series or sid == self.active_series_uid):
+            raise ValueError('Choose another series and its working lesion layer')
+        reference, target = doc.series[sid], doc.series[self.active_series_uid]
+        layer = reference.layers[reference.active_layer_id]
+        if (reference.source is None or target.source is None or not target.source_binding
+                or layer.kind != 'lesion' or layer.readonly or not layer.lesion_id):
+            raise ValueError('Reference series must have a connected working lesion')
+        self._series_link_result(sid, self.active_series_uid)
+        if any(other.lesion_id == layer.lesion_id for other in target.layers.values()):
+            raise ValueError('This lesion already has a layer in the current series')
+        return sid, layer
+
+    def _refresh_linked_lesion_controls(self):
+        if not hasattr(self, 'btn_link_lesion'):
+            return
+        e = self.is_english
+        self.btn_link_lesion.setText('Link reference lesion' if e else '关联参考病灶')
+        try:
+            _, layer = self._linked_lesion_reference()
+            tooltip = (f'Create an empty layer here for lesion {layer.lesion_id[:8]}; edit its range in this series.' if e
+                       else f'为参考病灶 {layer.lesion_id[:8]} 在当前序列建立同编号空图层，范围在本序列独立标注。')
+            enabled = True
+        except (ValueError, KeyError, TypeError, AttributeError):
+            tooltip = ('Select a working lesion in the reference series, then return here. Requires spatial correspondence and no existing layer for that lesion.' if e
+                       else '先在参考序列选择病灶工作图层，再切回当前序列；需有可靠空间对应，且当前序列尚无该病灶图层。')
+            enabled = False
+        self.btn_link_lesion.setToolTip(tooltip)
+        self.btn_link_lesion.setEnabled(enabled)
+
+    def _link_reference_lesion(self):
+        try:
+            sid, reference = self._linked_lesion_reference()
+            self._cancel_view_interactions()
+            self._remember_active_series()
+            layer_id = self.study_document.create_lesion_layer(self.active_series_uid,
+                reference_series_uid=sid, reference_layer_id=reference.layer_id,
+                cursor=tuple(self.current_3d_pos))
+            self.study_document.series[self.active_series_uid].active_layer_id = layer_id
+            self._display_layer_id = None
+            self._sync_committed_edit()
+        except (ValueError, KeyError) as exc:
+            QMessageBox.information(self, 'Lesion not linked' if self.is_english else '未关联病灶', str(exc))
+
+    def _new_lesion_layer(self):
+        if self.study_document is None or self.recon_mode_active or self.compare_mode_active:
+            return
+        self._cancel_view_interactions()
+        self._remember_active_series()
+        record = self.study_document.series[self.active_series_uid]
+        layer_id = self.study_document.create_lesion_layer(self.active_series_uid, cursor=tuple(self.current_3d_pos))
+        record.active_layer_id = layer_id
+        self._display_layer_id = None
+        self._sync_committed_edit()
+
+    def _on_layer_selected(self, index):
+        if self.study_document is None or index < 0:
+            return
+        layer_id = self.cb_layers.itemData(index)
+        record = self.study_document.series[self.active_series_uid]
+        layer = record.layers.get(layer_id)
+        if layer is None:
+            return
+        self._cancel_view_interactions()
+        self._remember_active_series()
+        if layer.readonly:
+            self._display_layer_id = layer_id
+        else:
+            self._display_layer_id = None
+            record.active_layer_id = layer_id
+        self._sync_committed_edit()
+
+    def _adopt_selected_ai(self):
+        if self.study_document is None or self._display_layer_id is None:
+            return
+        self._cancel_view_interactions()
+        self._remember_active_series()
+        record = self.study_document.series[self.active_series_uid]
+        original = record.layers[self._display_layer_id]
+        target = 'working-organs' if original.kind == 'organ' else 'working-manual'
+        self.study_document.adopt_ai_result(self.active_series_uid, self._display_layer_id,
+                                             layer_id=target, cursor=tuple(self.current_3d_pos))
+        record.active_layer_id = target
+        self._display_layer_id = None
+        self._stop_ai_for_manual_edit()
+        self._sync_committed_edit()
 
     # =========================================================================
     # 分割蒙版编辑：3D 追踪 / 画笔 / 橡皮 / 撤销
@@ -199,6 +500,7 @@ class AnnotationMixin:
           4. 选取在 ROI 框内体素最多的连通域标签，即为目标结构
         """
         if (self.volume_hu is None or self.recon_mode_active or self.compare_mode_active
+                or getattr(self, '_display_layer_id', None) is not None
                 or not all((getattr(self, 'hu_calibrated', False),
                             getattr(self, 'canonical_orientation', False),
                             getattr(self, 'inplane_spacing_valid', False),
@@ -253,6 +555,18 @@ class AnnotationMixin:
         if fail_msg is not None:
             QMessageBox.warning(self, "3D Tracking" if e else "智能追踪", fail_msg)
             return                                    # 未写蒙版，不必刷新定量与显示
+        if self.study_document is not None:
+            self._remember_active_series()
+            record = self.study_document.series[self.active_series_uid]
+            layer_id = record.active_layer_id if record.layers[record.active_layer_id].kind == 'lesion' else 'working-manual'
+            command = self.study_document.replace_mask(self.active_series_uid,
+                np.where(tracked, MANUAL_TRACK_LABEL, 0).astype(np.uint8), None, layer_id=layer_id,
+                cursor=tuple(self.current_3d_pos), view_plane=AXIAL, description='HU connected-component tracking')
+            if command is not None:
+                record.active_layer_id = layer_id
+                self._stop_ai_for_manual_edit()
+                self._sync_committed_edit()
+            return
         # —— 以下为成功路径，此前不曾改动任何状态 ——
         self._stop_ai_for_manual_edit()
         if self.volume_mask is None:
@@ -278,6 +592,11 @@ class AnnotationMixin:
         用 QPainter 圆头粗线栅格化轨迹，与 handle_crop 的多边形栅格化同一套做法。
         """
         if self.volume_hu is None or self.recon_mode_active or self.compare_mode_active:
+            return
+        if getattr(self, 'study_document', None) is not None:
+            self._paint_document(vid, points, is_erase)
+            if not self.views[vid]['view'].is_drawing:
+                self.views[vid]['view'].edit_context = None
             return
         if self.views[vid]['plane'] != AXIAL or not points:
             return
@@ -359,6 +678,32 @@ class AnnotationMixin:
 
     def _undo_mask_edit(self):
         """撤销最近一次分割编辑：整卷快照整卷还原，切片快照只还原该切片。"""
+        if getattr(self, 'study_document', None) is not None:
+            self._cancel_view_interactions()
+            self._remember_active_series()
+            try:
+                command = self.study_document.undo()
+            except ValueError as exc:
+                QMessageBox.warning(self, 'Undo' if self.is_english else '撤销', str(exc))
+                return
+            if command is None:
+                return
+            self._stop_ai_for_manual_edit()
+            self._mask_cache_clear_requested = False
+            self._display_layer_id = None
+            if command.series_uid != self.active_series_uid:
+                self._activate_series(command.series_uid)
+            record = self.study_document.series[command.series_uid]
+            if command.layer_id is not None:
+                record.active_layer_id = command.layer_id
+            self.current_3d_pos = list(command.cursor)
+            self.slider_slice.blockSignals(True)
+            self.slider_slice.setValue(command.cursor[0])
+            self.slider_slice.blockSignals(False)
+            self._sync_committed_edit()
+            if command.view_plane is not None:
+                self.views[1]['cb_plane'].setCurrentIndex(command.view_plane)
+            return
         if not self._mask_undo or self.volume_mask is None:
             return
         z, snap, conf_snap = self._mask_undo.pop()
@@ -464,7 +809,27 @@ class AnnotationMixin:
           - 勾选"穿透所有切片"→ 存入 global_annotations['all']，所有切片可见
           - 未勾选 → 存入 global_annotations[当前切片索引]，仅该切片可见
         """
-        if self.recon_mode_active or self.compare_mode_active:
+        if self.recon_mode_active or self.compare_mode_active or self._display_layer_id is not None:
+            return
+        if self.study_document is not None:
+            src = self.sender()
+            vid = next((key for key, vd in self.views.items() if vd['view'] is src), 1)
+            vd = self.views[vid]
+            if not self._view_editable(vd) or not self._valid_anno(data):
+                return
+            context = vd['view'].edit_context
+            mapping = context['mapping'] if context else vd.get('patient_plane')
+            cursor = context['cursor'] if context else tuple(self.current_3d_pos)
+            reference = (self.chk_global_scope.isChecked() and vd['plane'] == AXIAL
+                         and (self.canonical_orientation or mapping is None))
+            data = mpr_geometry.bind_annotation(data, mapping, cursor, vd['plane'], reference_all=reference)
+            tk = ('all' if reference else cursor[0]) if data['space']['kind'] == 'source' else 'objects'
+            self._remember_active_series()
+            annotations = deepcopy(self.global_annotations)
+            annotations.setdefault(tk, []).append(data)
+            self.study_document.edit_annotations(self.active_series_uid, annotations,
+                    cursor=cursor, view_plane=vd['plane'], description='Add annotation')
+            self._sync_committed_edit()
             return
         # 标注体系是【按 axial 层号】存、且 _render_annotations 只在 AXIAL 平面调用。
         # 在冠/矢状面画出来的标注会被存到当前 axial 层号下、按 axial 的 spacing 换算
@@ -502,11 +867,52 @@ class AnnotationMixin:
         """按 UUID 从所有切片的标注列表中删除指定标注。
         遍历所有键是因为用户可能在不知情的情况下删除了一个全局标注。
         """
-        if self.recon_mode_active or self.compare_mode_active:
+        if self.recon_mode_active or self.compare_mode_active or self._display_layer_id is not None:
+            return
+        identities = {str(value) for value in aid} if isinstance(aid, list) else {str(aid)}
+        self._cancel_view_interactions()
+        if self.study_document is not None:
+            self._remember_active_series()
+            annotations = {key: [a for a in values if a['id'] not in identities]
+                           for key, values in self.global_annotations.items()}
+            self.study_document.edit_annotations(self.active_series_uid, annotations,
+                    cursor=tuple(self.current_3d_pos), description='Delete annotations')
+            self._sync_committed_edit()
             return
         for k in self.global_annotations:
-            self.global_annotations[k] = [a for a in self.global_annotations[k] if a['id'] != aid]
+            self.global_annotations[k] = [a for a in self.global_annotations[k] if a['id'] not in identities]
         self.update_display()
+
+    def _roi_change_callback(self, vdata, annotation):
+        if self.study_document is None:
+            return None
+        document_id, series_uid = self.study_document.document_id, self.active_series_uid
+        vid, plane = vdata['view'].view_id, vdata['plane']
+        before = deepcopy(annotation)
+
+        def changed(updated):
+            if (self.study_document is None or self.study_document.document_id != document_id
+                    or self.active_series_uid != series_uid or self.views[vid]['plane'] != plane
+                    or not self._view_editable(vdata)):
+                return
+            self._remember_active_series()
+            annotations = deepcopy(self.global_annotations)
+            for objects in annotations.values():
+                for index, original in enumerate(objects):
+                    if original['id'] == before['id']:
+                        if original != before:
+                            return  # 晚到的释放事件不能覆盖后续编辑或 Undo。
+                        if 'space' in original:
+                            space = original['space']
+                            updated = mpr_geometry.bind_annotation(updated,
+                                vdata.get('patient_plane') if space['kind'] == 'patient' else None,
+                                space['cursor'], plane, reference_all=space.get('reference_all', False))
+                        objects[index] = updated
+                        self.study_document.edit_annotations(series_uid, annotations,
+                            cursor=tuple(self.current_3d_pos), view_plane=plane, description='Move/resize ROI')
+                        self._sync_committed_edit()
+                        return
+        return changed
 
     def clear_mask_and_annotations(self):
         """清空【当前切片】的标注，并把【整卷】分割蒙版重置为全零。
@@ -516,6 +922,25 @@ class AnnotationMixin:
         作废且不可逆。故此处：先算清代价并要求确认，再压入整卷快照（Ctrl+Z 可还原）。
         无可清时直接返回，不弹框骚扰、也不改动任何状态。
         """
+        if self.study_document is not None:
+            if self.recon_mode_active or self.compare_mode_active or self._display_layer_id is not None:
+                return
+            if not self.volume_mask.any() and not any(self.global_annotations.values()):
+                return
+            answer = QMessageBox.question(self, 'Clear working result' if self.is_english else '清空工作结果',
+                'Clear the active working mask on all slices and this series\' annotations? Ctrl+Z restores both.'
+                if self.is_english else '清空当前工作图层的全部切片及本序列普通标注？Ctrl+Z 可一起恢复。',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+            self._cancel_view_interactions()
+            self._remember_active_series()
+            self.study_document.replace_mask(self.active_series_uid, np.zeros_like(self.volume_mask), None,
+                annotations={'all': []}, cursor=tuple(self.current_3d_pos), description='Clear working result')
+            self._invalidate_running_ai()
+            self._mask_cache_clear_requested = True
+            self._sync_committed_edit()
+            return
         idx = self.current_3d_pos[0]
         n_anno = len(self.global_annotations.get(idx, []))
         has_mask = self.volume_mask is not None and bool(self.volume_mask.any())
@@ -554,6 +979,40 @@ class AnnotationMixin:
         if not self.recon_mode_active:
             self.update_display()
 
+    def clear_current_slice(self, vid=None):
+        vid = vid or getattr(self, '_last_edit_vid', 1)
+        vd = self.views[vid]
+        if self.study_document is None or not self._view_editable(vd):
+            return
+        self._cancel_view_interactions()
+        mapping = vd.get('patient_plane')
+        mask = self.volume_mask.copy()
+        confidence = None if self.volume_conf is None else self.volume_conf.copy()
+        if mapping is not None:
+            coordinates = mapping.source_coordinates().reshape(3, -1).T
+            valid = np.all((coordinates >= -.5) & (coordinates < np.asarray(mask.shape) - .5), axis=1)
+            indices = tuple(np.floor(coordinates[valid] + .5).astype(int).T)
+        else:
+            indices = (int(self.current_3d_pos[0]), slice(None), slice(None))
+        mask[indices] = 0
+        if confidence is not None:
+            confidence[indices] = 0
+        annotations = deepcopy(self.global_annotations)
+        if vd['plane'] == AXIAL and (mapping is None or self.canonical_orientation):
+            annotations.pop(self.current_3d_pos[0], None)
+        for key, objects in annotations.items():
+            annotations[key] = [annotation for annotation in objects
+                if not (annotation.get('space', {}).get('kind') == 'patient'
+                        and annotation['space']['plane'] == vd['plane']
+                        and mpr_geometry.project_annotation(annotation, mapping)['coplanar'])]
+        if np.array_equal(mask, self.volume_mask) and annotations == self.global_annotations:
+            return
+        self._remember_active_series()
+        self.study_document.replace_mask(self.active_series_uid, mask, confidence, annotations=annotations,
+            cursor=tuple(self.current_3d_pos), view_plane=vd['plane'], description='Clear current plane')
+        self._stop_ai_for_manual_edit()
+        self._sync_committed_edit()
+
     # =========================================================================
     # 标注 / 蒙版持久化
     # =========================================================================
@@ -566,7 +1025,7 @@ class AnnotationMixin:
             return False
         def _pair(p):
             return isinstance(p, (list, tuple)) and len(p) >= 2 \
-                and all(isinstance(c, (int, float)) for c in p[:2])
+                and all(isinstance(c, (int, float)) and math.isfinite(c) for c in p[:2])
         t = a.get('type')
         if t == 'ruler':
             return _pair(a.get('p1')) and _pair(a.get('p2'))
@@ -576,12 +1035,12 @@ class AnnotationMixin:
         if t == 'roi':
             r = a.get('rect')
             return isinstance(r, (list, tuple)) and len(r) == 4 \
-                and all(isinstance(c, (int, float)) for c in r)
+                and all(isinstance(c, (int, float)) and math.isfinite(c) for c in r)
         return False
 
     def _load_annotations_json(self, pid):
         """尝试加载同 PatientID 命名的注解 JSON 文件，恢复历史标注。
-        文件不存在/损坏静默跳过；结构畸形的单条标注被过滤（不带崩后续渲染）。"""
+        不存在时跳过；无法转换的条目明确报告，原文件仅供读取。"""
         ed = getattr(self, 'persistence_dir',
                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "Exported_Lesions"))
         af = os.path.join(ed, f"{self._safe_name(pid)}_annotations.json")
@@ -591,7 +1050,7 @@ class AnnotationMixin:
             with open(af, encoding='utf-8') as f:
                 raw = json.load(f)
             if not isinstance(raw, dict):
-                return
+                raise ValueError('Expected an annotation object')
             meta = raw.pop('__meta__', None)
             saved_uid = (meta or {}).get('series_uid', '') if isinstance(meta, dict) else ''
             saved_fingerprint = ((meta or {}).get('geometry_fingerprint', '')
@@ -613,18 +1072,29 @@ class AnnotationMixin:
                     ("已保存标注缺少匹配的 geometry/order fingerprint，无法证明切片号对应"
                      "关系，故未加载；原文件保留在磁盘上，未改动。"))
                 return
+            skipped = 0; seen = set()
             for k, v in raw.items():
                 # JSON 键只能是字符串，数字键需要转回 int
                 key = int(k) if isinstance(k, str) and k.isdigit() else k
+                if key != 'all' and (type(key) is not int or not 0 <= key < len(self.dicom_datasets)):
+                    skipped += len(v) if isinstance(v, list) else 1
+                    continue
                 annos = v if isinstance(v, list) else []
-                valid = [a for a in annos if self._valid_anno(a)]
-                for a in valid:
-                    a['id'] = str(a['id'])   # 同上：外部编辑过的 JSON 常见数字 id
-                if len(valid) != len(annos):
-                    print(f"标注键 {k!r}: 跳过 {len(annos) - len(valid)} 条畸形/旧版本条目")
+                skipped += int(not isinstance(v, list))
+                valid = []
+                for a in annos:
+                    if not self._valid_anno(a) or str(a['id']) in seen:
+                        skipped += 1; continue
+                    a['id'] = str(a['id']); seen.add(a['id']); valid.append(a)
                 self.global_annotations[key] = valid
+            if skipped:
+                QMessageBox.information(self, 'Partial annotation import' if self.is_english else '部分旧标注未迁移',
+                    (f'{skipped} invalid or unsupported entries were not imported. Original file retained:\n{af}'
+                     if self.is_english else f'{skipped} 条畸形或不支持的条目未能迁移；有效条目已读取，原文件保留：\n{af}'))
         except Exception as e:
             print(f"Warning: failed to load annotations from {af}: {e}")
+            QMessageBox.information(self, 'Annotations not loaded' if self.is_english else '旧标注未加载',
+                f'{e}\n' + ('Original file retained: ' if self.is_english else '原文件保留：') + af)
 
     def _current_series_uid(self):
         """当前序列的 SeriesInstanceUID；无数据或畸形 DICOM 缺该标签时返回 ''。"""
@@ -650,13 +1120,14 @@ class AnnotationMixin:
         if not os.path.exists(fp):
             return False
         try:
-            z = np.load(fp)
-            m = z['mask']
-            saved_uid = str(z['series_uid'].item()) if 'series_uid' in z.files else ''
-            saved_fingerprint = (str(z['geometry_fingerprint'].item())
-                                 if 'geometry_fingerprint' in z.files else '')
-            saved_contract = (str(z['axis_contract'].item())
-                              if 'axis_contract' in z.files else '')
+            with np.load(fp, allow_pickle=False) as z:
+                m = z['mask']
+                saved_uid = str(z['series_uid'].item()) if 'series_uid' in z.files else ''
+                saved_fingerprint = (str(z['geometry_fingerprint'].item())
+                                     if 'geometry_fingerprint' in z.files else '')
+                saved_contract = (str(z['axis_contract'].item()) if 'axis_contract' in z.files else '')
+            if m.dtype != np.uint8:
+                raise ValueError('Legacy labels must be uint8; refusing a lossy conversion')
             ok, why = mask_axis_contract_ok(saved_contract)
             if ok:
                 ok, why = mask_cache_matches(saved_uid, m.shape, saved_fingerprint,
@@ -665,136 +1136,372 @@ class AnnotationMixin:
             if not ok:
                 print(f"跳过磁盘缓存的分割蒙版：{why}；将重新运行 AI 分割。")
                 return False
-            self.volume_mask = m.astype(np.uint8)
+            self.volume_mask = m
+            if self.study_document is not None:
+                record = self.study_document.series[self.active_series_uid]
+                digest = hashlib.sha256()
+                with open(fp, 'rb') as stream:
+                    while block := stream.read(1024**2):
+                        digest.update(block)
+                record.layers[record.active_layer_id].provenance = {
+                    'origin': 'legacy-unknown', 'modified': False,
+                    'import_sha256': digest.hexdigest(), 'imported_at': datetime.now().astimezone().isoformat(),
+                }
             self._mask_cache_clear_requested = False
             return True
         except Exception as e:
             print(f"Warning: failed to load saved mask: {e}")
         return False
 
-    def save_project(self):
-        """将当前所有标注保存为 JSON 文件（以 PatientID 命名），方便下次加载时自动恢复。
-        JSON 键必须为字符串（JSON 规范），整数切片索引在此序列化为字符串，加载时再转回 int。
+    def _init_project_storage(self, project_dir, autosave):
+        self.project_dir = os.path.abspath(project_dir) if project_dir else None
+        self._project_settings = QSettings('MedicalImagingWorkstation', 'AnnotationProjects')
+        self._autosave_enabled = bool(autosave)
+        self._last_save_error = ''
+        self._last_saved_at = ''
+        self._save_worker = None
+        self._save_pending = False
+        self._save_generation = 0
+        self._save_sync_wait = False
+        self._leaving_document = False
+        self._registration_worker = None
+        self._registration_generation = 0
+        self._autosave_idle = QTimer(self); self._autosave_idle.setSingleShot(True)
+        self._autosave_idle.setInterval(2000)
+        self._autosave_max = QTimer(self); self._autosave_max.setSingleShot(True)
+        self._autosave_max.setInterval(30000)
+        self._autosave_idle.timeout.connect(self._start_project_save)
+        self._autosave_max.timeout.connect(self._start_project_save)
 
-        单个目标文件通过同目录临时文件 + ``os.replace`` 原子替换；JSON 与 NPZ 是两个
-        独立目标，因此不声称跨文件事务原子性。任何前置条件、序列化或替换失败均返回
-        False，且不会显示成功提示。
-        """
-        if not self.dicom_datasets:
-            QMessageBox.warning(self, "Save Failed" if self.is_english else "保存失败",
-                                ("No DICOM series is loaded."
-                                 if self.is_english else "尚未加载 DICOM 序列。"))
+    def _bind_project_document(self, document):
+        if self.study_document is not document:
+            if self.study_document is not None:
+                self.study_document.on_change = None
+            self._save_generation += 1
+        self.study_document = document
+        document.on_change = self._on_document_changed
+        self._last_save_error = ''
+        self._last_saved_at = document.saved_at
+        self._refresh_registration_controls()
+
+    def _on_document_changed(self, document):
+        if document is not self.study_document:
+            return
+        self._refresh_project_status()
+        if (not self._autosave_enabled or self._leaving_document
+                or document.revision == document.saved_revision
+                or not document.study_uid or not any(r.source_binding for r in document.series.values())):
+            return
+        self._autosave_idle.start()
+        if not self._autosave_max.isActive():
+            self._autosave_max.start()
+
+    def _start_project_save(self):
+        self._autosave_idle.stop(); self._autosave_max.stop()
+        doc = self.study_document
+        if doc is None:
             return False
-
-        series_uid = self._current_series_uid().strip()
-        geometry_fingerprint = self._current_geometry_fingerprint().strip()
-        if not series_uid or not geometry_fingerprint:
-            missing = []
-            if not series_uid:
-                missing.append("SeriesInstanceUID")
-            if not geometry_fingerprint:
-                missing.append("geometry fingerprint")
-            QMessageBox.warning(
-                self, "Save Failed" if self.is_english else "保存失败",
-                (("Project persistence requires verified " + " and ".join(missing) + ".")
-                 if self.is_english else
-                 ("工程持久化缺少可验证的 " + " 和 ".join(missing) + "，未写入任何文件。")))
-            return False
-
-        mask_present = self.volume_mask is not None
-        # 任何 ndarray（包括全零）都先验 shape；不能因为 np.any=False 就绕过 payload 校验，
-        # 让 wrong-shape zero 先覆盖 JSON、再留下无法安全恢复的旧 NPZ。
-        if mask_present and (self.volume_hu is None
-                             or tuple(self.volume_mask.shape) != tuple(self.volume_hu.shape)):
-            QMessageBox.warning(
-                self, "Save Failed" if self.is_english else "保存失败",
-                ("The segmentation mask shape does not match the current volume."
-                 if self.is_english else "分割蒙版 shape 与当前 volume 不一致，未写入任何文件。"))
-            return False
-        has_nonzero_mask = mask_present and bool(np.any(self.volume_mask))
-        explicit_empty = (mask_present and not has_nonzero_mask
-                          and getattr(self, '_mask_cache_clear_requested', False))
-        # fresh/AI-pending placeholder zero 不写 NPZ；用户明确清空则写带 provenance 的零 NPZ，
-        # 使重开后仍为空且跳过 AI，防止旧非零 cache 复活。
-        write_mask = bool(has_nonzero_mask or explicit_empty)
-
-        pid = self._safe_name(str(getattr(self.dicom_datasets[0], 'PatientID', 'Unknown')))
-        ed = getattr(self, 'persistence_dir',
-                     os.path.join(os.path.dirname(os.path.abspath(__file__)), "Exported_Lesions"))
-        json_target = os.path.join(ed, f"{pid}_annotations.json")
-        npz_target = os.path.join(ed, f"{pid}_mask.npz")
-        payload = {'__meta__': {
-                       'series_uid': series_uid,
-                       'geometry_fingerprint': geometry_fingerprint,
-                   },
-                   **{str(k): v for k, v in self.global_annotations.items()}}
-        temp_paths = []
-        replaced = []
-        replacement_target = None
-        try:
-            os.makedirs(ed, exist_ok=True)
-
-            # 先完整序列化所有临时文件；任一写入失败时，既有目标文件均保持不变。
-            json_fd, json_temp = tempfile.mkstemp(
-                prefix=f".{pid}_annotations.", suffix=".tmp", dir=ed)
-            temp_paths.append(json_temp)
-            with os.fdopen(json_fd, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, indent=4)
-                f.flush(); os.fsync(f.fileno())
-
-            if write_mask:
-                npz_fd, npz_temp = tempfile.mkstemp(
-                    prefix=f".{pid}_mask.", suffix=".tmp", dir=ed)
-                temp_paths.append(npz_temp)
-                with os.fdopen(npz_fd, 'wb') as f:
-                    np.savez_compressed(f, mask=self.volume_mask,
-                                        series_uid=np.array(series_uid),
-                                        geometry_fingerprint=np.array(geometry_fingerprint),
-                                        axis_contract=np.array(MASK_AXIS_CONTRACT))
-                    f.flush(); os.fsync(f.fileno())
-
-            replacement_target = os.path.basename(json_target)
-            os.replace(json_temp, json_target); replaced.append(replacement_target)
-            if write_mask:
-                replacement_target = os.path.basename(npz_target)
-                os.replace(npz_temp, npz_target); replaced.append(replacement_target)
-
-            if write_mask:
-                # 只有所有目标替换均成功才消费 intent；失败路径保留 True，允许用户重试。
-                self._mask_cache_clear_requested = False
-
-            if self.anonymize:
-                QMessageBox.warning(
-                    self, "Internal project identifiers" if self.is_english else "内部工程仍含标识",
-                    ("De-ID does not anonymize internal project persistence. The JSON/NPZ cache "
-                     "retains PatientID/SeriesInstanceUID and geometry provenance for safe reload."
-                     if self.is_english else
-                     "脱敏开关不会匿名化内部工程持久化。为安全恢复与 provenance，JSON/NPZ 缓存"
-                     "仍保留 PatientID/SeriesInstanceUID 和几何标识。"))
-            QMessageBox.information(self, "Success" if self.is_english else "成功",
-                                    "Project saved." if self.is_english else "标注工程已保存。")
+        if self._save_worker is not None:
+            self._save_pending = True
             return True
-        except Exception as e:
-            partial = ""
-            if replacement_target is not None:
-                joined = ", ".join(replaced)
-                completed = joined or "none"
-                partial = ((f"\nReplacement failed for {replacement_target}; already replaced: "
-                            f"{completed}. Cross-file atomicity is not provided.")
-                           if self.is_english else
-                           (f"\n替换失败目标：{replacement_target}；已替换目标："
-                            f"{joined or '无'}。本操作不提供跨文件原子性。"))
-            QMessageBox.warning(self, "Save Failed" if self.is_english else "保存失败",
-                                ((f"Failed to save project:\n{e}{partial}") if self.is_english
-                                 else f"标注工程保存失败：\n{e}{partial}"))
+        try:
+            self._remember_active_series()
+            snapshot = capture_project_snapshot(doc)
+            path = doc.project_path or self._project_path_for_study(doc.study_uid)
+            worker = ProjectSaveWorker(snapshot, path, self._save_generation, self)
+            self._save_worker = worker; self._save_pending = False
+            self._last_save_error = ''
+            worker.finished.connect(self._on_save_worker_finished)
+            worker.start()
+            self._refresh_project_status()
+            return True
+        except (OSError, ValueError, TypeError, AttributeError, MemoryError) as exc:
+            self._last_save_error = str(exc); self._save_pending = False
+            self._refresh_project_status()
             return False
+
+    def _on_save_worker_finished(self):
+        worker = self.sender()
+        if worker is not self._save_worker:
+            return
+        self._save_worker = None
+        doc = self.study_document
+        current = (doc is not None and worker.generation == self._save_generation
+                   and worker.snapshot.manifest['document_id'] == doc.document_id)
+        pending = self._save_pending; self._save_pending = False
+        if current:
+            if worker.error is not None:
+                self._last_save_error = worker.error
+            elif worker.receipt is not None:
+                receipt = worker.receipt
+                doc.project_path = receipt.path
+                doc.saved_revision = receipt.revision
+                doc.saved_at = receipt.saved_at
+                self._last_saved_at = receipt.saved_at; self._last_save_error = ''
+                if doc.revision == receipt.revision:
+                    self._mask_cache_clear_requested = False
+                    self._autosave_idle.stop(); self._autosave_max.stop()
+        self._refresh_project_status()
+        worker.deleteLater()
+        if pending and doc is not None and (not current or not worker.error) and not self._save_sync_wait:
+            self._start_project_save()
+
+    def _wait_project_worker(self):
+        worker = self._save_worker
+        if worker is not None:
+            loop = QEventLoop(self)
+            worker.finished.connect(loop.quit)
+            loop.exec()
+
+    def _save_project_sync(self):
+        doc = self.study_document
+        if doc is None:
+            self._last_save_error = 'No bound project is loaded'
+            return False
+        self._save_sync_wait = True
+        central = self.centralWidget(); was_enabled = central.isEnabled()
+        central.setEnabled(False)
+        try:
+            self._wait_project_worker()
+            self._save_pending = False
+            if not self._start_project_save():
+                return False
+            self._wait_project_worker()
+            return not self._last_save_error and doc.saved_revision == doc.revision
         finally:
-            for temp_path in temp_paths:
+            self._save_sync_wait = False
+            central.setEnabled(was_enabled)
+
+    def _choose_save_failure(self):
+        e = self.is_english
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle('Unsaved project' if e else '工程尚未保存')
+        box.setText(('Saving failed. Your current work is retained.\n' if e else '保存失败，当前工作仍保留。\n')
+                    + self._last_save_error)
+        actions = {}
+        for key, label in (('retry', 'Retry' if e else '重试'),
+                           ('directory', 'Change location' if e else '更换保存位置'),
+                           ('cancel', 'Stay here' if e else '取消离开'),
+                           ('discard', 'Discard unsaved changes' if e else '放弃未保存修改')):
+            role = QMessageBox.RejectRole if key == 'cancel' else QMessageBox.DestructiveRole if key == 'discard' else QMessageBox.ActionRole
+            actions[box.addButton(label, role)] = key
+        box.exec()
+        return actions.get(box.clickedButton(), 'cancel')
+
+    def _prepare_document_leave(self):
+        if self._leaving_document or self._save_sync_wait:
+            return False
+        self._leaving_document = True
+        self._autosave_idle.stop(); self._autosave_max.stop()
+        self._stop_cine(); self._cancel_view_interactions(); self._invalidate_running_ai()
+        self._cancel_series_registration()
+        try:
+            worker = self._registration_worker
+            if worker is not None:
+                central = self.centralWidget(); enabled = central.isEnabled(); central.setEnabled(False)
                 try:
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
-                except OSError:
-                    pass
+                    loop = QEventLoop(self); worker.finished.connect(loop.quit); loop.exec()
+                finally:
+                    central.setEnabled(enabled)
+            self._remember_active_series()
+            doc = self.study_document
+            if not self._autosave_enabled or doc is None:
+                self._save_sync_wait = True
+                try:
+                    self._wait_project_worker()
+                finally:
+                    self._save_sync_wait = False
+                self._save_pending = False
+                return True
+            # 纯阅片、所有来源都无法绑定时没有可编辑内容，不强求一个无法验证的工程。
+            if not doc.study_uid or not any(r.source_binding for r in doc.series.values()):
+                return True
+            while doc.revision != doc.saved_revision or self._save_worker is not None:
+                if self._save_project_sync():
+                    break
+                action = self._choose_save_failure()
+                if action == 'discard':
+                    return True
+                if action == 'cancel':
+                    return False
+                if action == 'directory' and not self.choose_project_directory():
+                    return False
+            return True
+        finally:
+            self._leaving_document = False
+
+    def _project_root(self):
+        if self.project_dir:
+            return self.project_dir
+        legacy_default = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Exported_Lesions')
+        if self.persistence_dir != legacy_default:
+            # 嵌入/测试重定向旧读取目录时，新工程也留在该隔离目录内。
+            return os.path.join(self.persistence_dir, 'projects')
+        return str(self._project_settings.value('directory',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Annotation_Projects')))
+
+    def _project_path_for_study(self, study_uid):
+        return os.path.join(self._project_root(), hashlib.sha256(study_uid.encode()).hexdigest() + '.miwproj')
+
+    def _refresh_project_status(self):
+        if not hasattr(self, 'lbl_project_status'):
+            return
+        doc = self.study_document
+        e = self.is_english
+        path = doc.project_path if doc and doc.project_path else self._project_path_for_study(doc.study_uid) if doc else self._project_root()
+        if self._last_save_error:
+            status = ('Save failed: ' if e else '保存失败：') + self._last_save_error
+        elif doc is None:
+            status = 'No project loaded' if e else '尚未载入工程'
+        elif not any(record.source_binding for record in doc.series.values()):
+            status = 'Read-only: source identity unavailable' if e else '仅阅片：缺少来源身份，无法保存工程'
+        elif self._save_worker is not None:
+            status = 'Saving...' if e else '保存中…'
+        elif doc.revision != doc.saved_revision:
+            status = 'Unsaved changes' if e else '有未保存修改'
+        else:
+            stamp = datetime.fromisoformat(self._last_saved_at).astimezone().strftime('%H:%M:%S') if self._last_saved_at else ''
+            status = ('Saved ' if e else '已保存 ') + stamp
+        self.lbl_project_status.setText(status)
+        unbound = sum(not record.source_binding for record in doc.series.values()) if doc else 0
+        note = (f'\n{unbound} unbound read-only series are excluded from the project.' if e
+                else f'\n{unbound} 个无稳定来源身份的序列仅供阅片，不纳入工程。') if unbound else ''
+        if self._last_saved_at:
+            note += ('\nLast successful save: ' if e else '\n最后成功保存：') + self._last_saved_at
+        self.lbl_project_status.setToolTip(
+            path + ('\n.miwproj: ZIP with JSON metadata/history, NPZ labels and CSV summary; source DICOM required for editing.'
+                    if e else '\n.miwproj 工程包：JSON 元数据与历史、NPZ 标注、CSV 摘要；编辑仍需匹配的原始 DICOM。') + note)
+
+    def _read_project_candidate(self, path):
+        try:
+            return load_project_snapshot(path)
+        except HistoryRecoveryRequired as exc:
+            answer = QMessageBox.question(self, 'Recover annotations' if self.is_english else '恢复标注副本',
+                (f'{exc}\nRestore verified annotations into a new project with no old Undo history? The original stays protected.'
+                 if self.is_english else f'{exc}\n是否将已验证标注恢复为独立工程副本？旧撤销历史不可用，原件保持保护。'),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer == QMessageBox.Yes:
+                try:
+                    return load_project_snapshot(path, recover_history=True)
+                except ProjectError as failure:
+                    exc = failure
+            else:
+                return None
+            QMessageBox.warning(self, 'Open failed' if self.is_english else '打开失败', str(exc))
+        except ProjectError as exc:
+            QMessageBox.warning(self, 'Open failed' if self.is_english else '打开失败', str(exc))
+        return None
+
+    def choose_project_directory(self):
+        path = QFileDialog.getExistingDirectory(self, 'Save directory' if self.is_english else '保存目录',
+                                                 self._project_root())
+        if not path:
+            return False
+        self.project_dir = os.path.abspath(path)
+        self._project_settings.setValue('directory', self.project_dir)
+        if self.study_document:
+            doc = self.study_document
+            # 恢复副本保留独立文件名，不能因更换目录退回默认 Study 文件名。
+            name = os.path.basename(doc.project_path) if doc.project_path else os.path.basename(self._project_path_for_study(doc.study_uid))
+            target = os.path.join(self.project_dir, name)
+            # 选目录只授权保存到该目录，不意味着覆盖那里另一份同名工程。
+            if os.path.exists(target) and os.path.realpath(target) != os.path.realpath(doc.project_path or ''):
+                stem = os.path.splitext(name)[0]
+                while os.path.exists(target):
+                    target = os.path.join(self.project_dir, f'{stem}_{uuid.uuid4().hex}.miwproj')
+            doc.project_path = target
+            doc.saved_revision = -1
+            # 旧 worker 仍可完成旧路径，但其回执不得将用户新选路径改回去。
+            self._save_generation += 1
+            self._save_pending = self._save_worker is not None
+            self._on_document_changed(doc)
+        self._refresh_project_status()
+        return True
+
+    def show_project_directory(self):
+        doc = self.study_document
+        path = os.path.dirname(doc.project_path) if doc and doc.project_path else self._project_root()
+        os.makedirs(path, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def open_project(self, path=None):
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, 'Open project' if self.is_english else '打开工程',
+                                                 self._project_root(), 'MIW Project (*.miwproj)')
+        if not path:
+            return False
+        candidate = self._read_project_candidate(path)
+        if candidate is None:
+            return False
+        current = self.study_document
+        if current and current.study_uid == candidate.study_uid:
+            try:
+                candidate.attach_sources([record.source for record in current.series.values() if record.source])
+            except ValueError as exc:
+                QMessageBox.warning(self, 'Source mismatch' if self.is_english else '来源不匹配', str(exc))
+                return False
+        if not self._prepare_document_leave():
+            return False
+        # 关闭旧工程的保存可能刚更新了本次要打开的同一路径；不能装回保存前的旧候选。
+        if (current is not None and current.project_path
+                and os.path.abspath(path) == os.path.abspath(current.project_path)
+                and current.saved_revision == current.revision):
+            candidate = self._read_project_candidate(path)
+            if candidate is None:
+                return False
+            try:
+                candidate.attach_sources([record.source for record in current.series.values() if record.source])
+            except ValueError as exc:
+                QMessageBox.warning(self, 'Source mismatch' if self.is_english else '来源不匹配', str(exc))
+                return False
+        self._remember_active_series()
+        self._cancel_view_interactions(); self._invalidate_running_ai(); self._stop_cine()
+        if self.compare_mode_active:
+            self._exit_compare_mode()
+        self._invalidate_recon_results()
+        self._bind_project_document(candidate); self.active_series_uid = None
+        self._refresh_series_selector()
+        connected = [sid for sid, record in candidate.series.items() if record.source]
+        if connected:
+            self._activate_series(connected[0])
+        else:
+            self._active_source = None; self.dicom_datasets = []
+            self.volume_hu = self.volume_mask = self.volume_conf = None
+            self.global_annotations = {'all': []}; self._display_layer_id = None
+            self._organ_stats = []; self.lbl_ai_stats.setText('')
+            self._refresh_patient_info(); self.lbl_hud.setText(''); self.lbl_hu_value.setText('')
+            self._refresh_layer_controls()
+            for vd in self.views.values():
+                view = vd['view']; view.cancel_interaction()
+                view.image_item.setPixmap(QPixmap()); view.mask_item.setPixmap(QPixmap())
+                view.clear_annotations()
+                view.vline.hide(); view.hline.hide()
+                view.overlay_lines = {}; view.orient_labels = {}; view.viewport().update()
+            self._sync_view_controls(); self._sync_matrix_buttons()
+        self._last_save_error = ''; self._last_saved_at = candidate.saved_at
+        self._refresh_project_status()
+        self._on_document_changed(candidate)
+        return True
+
+    def save_project(self):
+        """保存整个检查的单个工程包；旧 Exported_Lesions 仅供兼容读取。"""
+        try:
+            doc = self.study_document
+            if doc is None:
+                raise ProjectError('No bound project is loaded')
+            if not self._save_project_sync():
+                raise ProjectError(self._last_save_error or 'New changes are still pending')
+            if self.anonymize:
+                QMessageBox.warning(self, 'Internal project identifiers' if self.is_english else '内部工程仍含标识',
+                    'The project retains source series identifiers; display De-ID does not remove them.'
+                    if self.is_english else '工程保留来源序列标识；屏幕脱敏开关不会移除这些内部标识。')
+            self._refresh_project_status()
+            return True
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            self._last_save_error = str(exc); self._refresh_project_status()
+            QMessageBox.warning(self, 'Save failed' if self.is_english else '保存失败', str(exc))
+            return False
 
     # =========================================================================
     # 器官定量 / 图例
@@ -1114,7 +1821,239 @@ class AnnotationMixin:
     # =========================================================================
     # 标注渲染（仅 Axial，供 _render_clinical_plane 调用）
     # =========================================================================
+    def _series_link_result(self, source_uid, target_uid):
+        doc = self.study_document
+        pair = series_registration.registration_pair(source_uid, target_uid)
+        rid = doc.registration_links.get(pair)
+        if rid is not None:
+            result = series_registration.RegistrationResult.from_dict(doc.registrations[rid])
+            series_registration.result_matrix(result, doc.series[source_uid].source, doc.series[target_uid].source)
+            return result
+        return series_registration.metadata_link(doc.series[source_uid].source, doc.series[target_uid].source)
+
+    def _refresh_registration_controls(self):
+        if not hasattr(self, 'cb_reference_series'):
+            return
+        e = self.is_english
+        self.chk_series_location.setText('Keep patient location across series' if e else '切换序列时定位同一点')
+        self.chk_reference_annotations.setText('Show reference annotations (read-only)' if e else '显示参考序列标注（只读）')
+        self.cb_reference_series.setToolTip('Source series for corresponding annotations' if e else '对应标注的来源序列')
+        previous = self.cb_reference_series.currentData()
+        with QSignalBlocker(self.cb_reference_series):
+            self.cb_reference_series.clear()
+            if self.study_document:
+                for sid, record in self.study_document.series.items():
+                    if sid != self.active_series_uid and record.source is not None:
+                        description = str(getattr(record.source.datasets[0], 'SeriesDescription', '') or sid[-12:])
+                        self.cb_reference_series.addItem(f'{record.source.modality} · {description}', sid)
+            index = self.cb_reference_series.findData(previous)
+            if index >= 0:
+                self.cb_reference_series.setCurrentIndex(index)
+        self.cb_reference_series.setEnabled(self.cb_reference_series.count() > 0)
+        self._refresh_series_link_status()
+        self.btn_series_registration.setText('3-D rigid registration' if e else '三维刚性配准')
+        self.btn_cancel_registration.setText('Cancel' if e else '取消配准')
+        running = self._registration_worker is not None
+        self.btn_series_registration.setEnabled(not running and self.cb_reference_series.count() > 0)
+        self.btn_cancel_registration.setEnabled(running)
+
+    def start_series_registration(self):
+        if self._registration_worker is not None or self.study_document is None or self._leaving_document:
+            return False
+        sid = self.cb_reference_series.currentData(); doc = self.study_document
+        try:
+            moving, fixed = doc.series[sid].source, doc.series[self.active_series_uid].source
+            if moving is None or fixed is None or moving.affine is None or fixed.affine is None:
+                raise ValueError('Two connected series with valid patient-space geometry are required')
+            self._stop_cine(); self._cancel_view_interactions()
+            worker = SeriesRegistrationWorker(moving, fixed, doc.document_id, doc.revision,
+                                                self._registration_generation, self)
+            self._registration_worker = worker
+            worker.finished.connect(self._on_series_registration_finished)
+            self._refresh_registration_controls()
+            self.lbl_series_link.setText('Computing 3-D candidate…' if self.is_english else '正在计算三维配准候选…')
+            worker.start(); return True
+        except (ValueError, KeyError, AttributeError) as exc:
+            QMessageBox.information(self, 'Registration unavailable' if self.is_english else '无法配准', str(exc))
+            return False
+
+    def _cancel_series_registration(self):
+        self._registration_generation += 1
+        if self._registration_worker is not None:
+            self._registration_worker.cancelled.set()
+
+    def _review_registration(self, worker):
+        dialog = RegistrationReviewDialog(worker.moving, worker.fixed, worker.result, self.is_english, self)
+        return dialog.exec() == QDialog.Accepted
+
+    def _on_series_registration_finished(self):
+        worker = self.sender()
+        if worker is not self._registration_worker:
+            return
+        self._registration_worker = None
+        doc = self.study_document
+        current = (doc is not None and worker.document_id == doc.document_id
+                   and worker.generation == self._registration_generation and not self._leaving_document
+                   and worker.revision == doc.revision)
+        try:
+            if not current or worker.cancelled.is_set():
+                return
+            if worker.error or worker.result is None:
+                QMessageBox.information(self, 'Registration failed' if self.is_english else '配准未通过', worker.error or '')
+                return
+            doc.add_registration(worker.result, expected_revision=worker.revision)
+            if self._review_registration(worker) and doc is self.study_document and worker.generation == self._registration_generation:
+                reviewed = series_registration.mark_visually_reviewed(worker.result)
+                doc.add_registration(reviewed); doc.adopt_registration(reviewed.result_id)
+                self.chk_reference_annotations.setChecked(True)
+            self._sync_committed_edit()
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            QMessageBox.information(self, 'Registration not adopted' if self.is_english else '未采用配准', str(exc))
+        finally:
+            worker.deleteLater(); self._refresh_registration_controls()
+
+    def _refresh_series_link_status(self):
+        sid = self.cb_reference_series.currentData(); e = self.is_english
+        try:
+            if sid is None or self.active_series_uid is None:
+                raise ValueError('A second connected spatial series is required')
+            result = self._series_link_result(sid, self.active_series_uid)
+            status = {'metadata': ('Metadata location; motion unverified', '元数据定位；未验证扫描间运动'),
+                      'reviewed': ('Rigid correspondence; visually reviewed', '刚性配准对应；已人工复核'),
+                      'landmarks': ('Rigid correspondence; landmarks verified', '刚性配准对应；标志点验证通过')}
+            self.lbl_series_link.setText(status[result.status][0 if e else 1]); self.lbl_series_link.setToolTip('')
+            self.chk_reference_annotations.setEnabled(True)
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            self.lbl_series_link.setText('No reliable correspondence' if e else '暂无可靠空间对应')
+            self.lbl_series_link.setToolTip(str(exc)); self.chk_reference_annotations.setEnabled(False)
+        self._refresh_linked_lesion_controls()
+
+    def _on_reference_series_changed(self, *_):
+        if not hasattr(self, 'lbl_series_link'):
+            return
+        self._refresh_series_link_status()
+        if self.volume_hu is not None and not self.recon_mode_active and not self.compare_mode_active:
+            self.update_display()
+
+    def _render_reference_annotations(self, vdata):
+        if not self.chk_reference_annotations.isChecked() or not self.chk_reference_annotations.isEnabled():
+            return
+        plane = vdata.get('patient_plane'); sid = self.cb_reference_series.currentData()
+        if plane is None or sid is None or vdata['cb_proj'].currentIndex() != 0:
+            return
+        try:
+            result = self._series_link_result(sid, self.active_series_uid)
+            record = self.study_document.series[sid]; source = record.source
+            mask = series_registration.sample_corresponding_plane(source, self._active_source, record.working_mask,
+                                                                   plane, result, labels=True)
+            rgba = np.zeros((*mask.shape, 4), np.uint8); rgba[mask != 0] = [255, 190, 60, 90]
+            if np.any(mask):
+                image = QImage(rgba.data, mask.shape[1], mask.shape[0], rgba.strides[0], QImage.Format_RGBA8888).copy()
+                item = QGraphicsPixmapItem(QPixmap.fromImage(image)); item.setZValue(2.5)
+                item.setData(11, 'series-reference'); item.setToolTip(f'Reference: {sid}')
+                vdata['view'].scene.addItem(item)
+            for annotations in record.annotations.values():
+                for annotation in annotations:
+                    projected = series_registration.project_corresponding_annotation(annotation, source, self._active_source, plane, result)
+                    if not projected or not projected['points']:
+                        continue
+                    points = projected['points']; path = QPainterPath()
+                    if projected['coplanar'] or (annotation['type'] == 'roi' and len(points) == 2):
+                        path.moveTo(QPointF(*points[0]))
+                        for point in points[1:]: path.lineTo(QPointF(*point))
+                    else:
+                        for x, y in points:
+                            path.moveTo(x-.6,y); path.lineTo(x+.6,y); path.moveTo(x,y-.6); path.lineTo(x,y+.6)
+                    item = QGraphicsPathItem(path); pen = QPen(QColor('#FFBE3C'), 2); pen.setStyle(Qt.DashLine)
+                    item.setPen(pen); item.setZValue(3.5); item.setData(11, 'series-reference')
+                    item.setToolTip(f'Reference: {sid} / {annotation["id"]}')
+                    vdata['view'].scene.addItem(item)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return  # 显示热路径重复验证失败时不投影不可靠标注。
+
     def _render_annotations(self, vdata, z, sp):
+        mapping = vdata.get('patient_plane')
+        if vdata['plane'] == AXIAL and (mapping is None or self.canonical_orientation):
+            self._render_source_annotations(vdata, z, sp)
+        if mapping is None or self.study_document is None:
+            return
+        view = vdata['view']
+        color = QColor('#00ADB5')
+        for values in self.global_annotations.values():
+            if not isinstance(values, list):
+                continue
+            for annotation in values:
+                if not self._valid_anno(annotation) or not isinstance(annotation['id'], str):
+                    continue
+                space = annotation.get('space')
+                if (not isinstance(space, dict) or space.get('kind') != 'patient'
+                        or space.get('plane') not in (AXIAL, CORONAL, SAGITTAL)):
+                    continue
+                # 与旧来源切片渲染保持同一容错边界：坏对象不能阻断后续有效对象。
+                try:
+                    projected = mpr_geometry.project_annotation(annotation, mapping)
+                except (ValueError, TypeError, KeyError, IndexError):
+                    continue
+                points = projected['points']
+                if not points:
+                    continue
+                kind = annotation['type']
+                native = projected['coplanar'] and annotation['space']['plane'] == vdata['plane']
+                text = None
+                if native and kind == 'roi' and self._display_layer_id is None:
+                    # 创建平面的真实轮廓重投影，ROI 移动只经事务回调提交。
+                    coords = np.asarray(points)
+                    low, high = coords.min(axis=0), coords.max(axis=0)
+                    if np.any(high <= low):
+                        continue
+                    shown = deepcopy(annotation)
+                    shown['rect'] = (*low.tolist(), *(high - low).tolist())
+                    item = ROIGraphicsItem(shown, None,
+                               on_geometry_change=self._roi_change_callback(vdata, annotation))
+                    item.set_appearance(color)
+                    image = vdata.get('annotation_intensity')
+                    if image is not None:
+                        yy, xx = np.indices(image.shape)
+                        center, radii = (low + high) / 2, (high - low) / 2
+                        inside = (((xx + .5 - center[0]) / radii[0]) ** 2
+                                  + ((yy + .5 - center[1]) / radii[1]) ** 2 <= 1)
+                        samples = image[inside]
+                        if samples.size:
+                            unit = 'HU' if self.hu_calibrated else ('stored' if self.is_english else '原始值')
+                            area = np.pi * radii[0] * radii[1] * sp[0] * sp[1]
+                            text = f'{samples.mean():.1f}±{samples.std():.1f} {unit}\n{area:.1f} mm²'
+                elif projected['coplanar'] or (kind == 'roi' and len(points) == 2):
+                    path = QPainterPath(QPointF(*points[0]))
+                    for point in points[1:]:
+                        path.lineTo(QPointF(*point))
+                    item = QGraphicsPathItem(path)
+                    item.setPen(QPen(color, 2))
+                    if kind == 'ruler' and projected['coplanar']:
+                        lps = np.asarray(annotation['space']['points_lps'])
+                        text = f'{np.linalg.norm(lps[-1] - lps[0]):.1f} mm'
+                else:
+                    # 非创建平面只标出实际交点，不画一份无空间含义的完整二维对象。
+                    path = QPainterPath()
+                    for x, y in points:
+                        path.moveTo(x - .6, y); path.lineTo(x + .6, y)
+                        path.moveTo(x, y - .6); path.lineTo(x, y + .6)
+                    item = QGraphicsPathItem(path)
+                    item.setPen(QPen(color, 2))
+                item.setToolTip(annotation['id']); item.setZValue(3)
+                item.setFlag(QGraphicsItem.ItemIsSelectable, True)
+                view.scene.addItem(item)
+                if text:
+                    label = QGraphicsTextItem(text); label.setDefaultTextColor(color)
+                    label.setFont(QFont('Arial', 10, QFont.Bold)); label.setZValue(4)
+                    width, height = _pin_text_to_screen(label, view)
+                    h, w = mapping.shape
+                    label.setPos(max(0., min(points[-1][0] + 2, w - width)),
+                                 max(0., min(points[-1][1] + 2, h - height)))
+                    view.scene.addItem(label)
+
+        self._render_reference_annotations(vdata)
+
+    def _render_source_annotations(self, vdata, z, sp):
         """在视图场景中渲染当前切片的标注图元（仅 Axial 平面调用）。
         颜色区分：切片专属标注用青色，全局穿透标注用黄色；分组遍历避免 O(n²) 成员检查。
         """
@@ -1123,6 +2062,8 @@ class AnnotationMixin:
         slice_annos = self.global_annotations.get(z, [])
         global_annos = self.global_annotations.get('all', [])
         for annos, col in ((slice_annos, col_slice), (global_annos, col_global)):
+            if not isinstance(annos, list):
+                continue
             for anno in annos:
               # 逐条兜底：万一有畸形标注漏过加载期过滤，也只跳过这一条，绝不拖垮整次刷新
               try:
@@ -1166,7 +2107,9 @@ class AnnotationMixin:
                 elif anno['type'] == 'roi':
                     rx0, ry0, rw, rh = anno['rect']
                     # 可拖动+可缩放的 ROI；改动后经 update_display 回调重算统计并重绘
-                    ell = ROIGraphicsItem(anno, self.update_display)
+                    ell = ROIGraphicsItem(anno, self.update_display,
+                              on_geometry_change=self._roi_change_callback(vdata, anno))
+                    ell.setEnabled(self._display_layer_id is None)
                     ell.set_appearance(col)
                     ell.setToolTip(anno['id'])
                     vdata['view'].scene.addItem(ell)

@@ -40,7 +40,7 @@
 | **研究** | 四条量化主线，覆盖 reconstruction、segmentation provenance、learned reconstruction 与 3-D student compression |
 | **验证** | `v1.1.0` exact-SHA CI：**878 PASS / 0 FAIL**、coverage **87%**、Ruff PASS；2026-08-30 本机：full **1013/0**、数据无关层 **902/0** |
 | **证据边界** | measured、inferred、historical、unmeasured 分开表达；未分发权重和未归档单机数字均明确点名 |
-| **状态** | 工程/作品集版本已冻结；软著登记仍在等待；不作临床或论文完成声明 |
+| **状态** | 标注/MR 功能持续开发；登记 PDF 保持冻结，软著登记仍在等待；不作临床或论文完成声明 |
 
 | AI 多器官分割 | 三平面 MPR + 十字线联动 |
 |:---:|:---:|
@@ -108,8 +108,9 @@ Python 3.10 · PySide6/Qt6 · **CPU-only，无需 GPU** · 合成模体与公开
 
 | 模块 | 能力 |
 |---|---|
-| **临床阅片** | classic single-frame CT；仅在 patient-space geometry 可证明时按解剖方向排序；anatomical MPR 只要求 canonical orientation、有效 in-plane spacing 与 uniform z geometry，HU preset / ROI / AI 等 intensity consumer 则独立要求有效 CT calibration；slab projection · 9 种带能力门控的测量与标注工具 · 椭圆 ROI 统计 · PACS 四角信息 · Cine 播放 · follow-up comparison 要求完整 geometry/intensity contract。Enhanced/multi-frame 与 non-CT 输入拒绝；non-canonical 或 geometry 不完整时只保留安全的 viewer 功能 |
+| **临床阅片** | Classic single-frame CT/MR 读取、按检查管理多个序列；空间可证明时按患者坐标排序并显示 anatomical MPR，包含有效斜采集；空间不足但来源可靠时可原位编辑；HU、CT 器官模型、物理定量与 CT 随访各自门控；标准轴向序列的 slab MIP / MinIP / AIP、测量/ROI、PACS 信息及 Cine。Enhanced、多帧和其他模态拒绝；MR 真实病例验收待完成 |
 | **AI 分割** | 25 类后台滑窗 ONNX 推理（含 5 个肺叶）· 三平面彩色叠加与可点图例 · 光标 HUD · 器官统计与 CSV 导出 · marching cubes 三维表面预览、形状特征与 STL 导出 · 画笔/橡皮编辑和撤销 · 逐体素置信度 |
+| **标注工程（开发中）** | 独立器官/病灶工作层、只读原始 AI、单来源体素精修、跨次最近 20 步统一 Undo；全部保留序列与切片统一 `.miwproj` 保存、自动记录 JSON/NPZ/CSV；同检查元数据联动与人工复核后三维刚性对应。操作见[当前说明书](docs/manual_zh.md#十二标注工程持久化)，验收范围见[计划记录](docs/annotation_tumor_plan.md)，不代表 MRI 或肿瘤模型全部验证完成 |
 | **重建实验室** | 内置解析 Shepp-Logan 模体 · Radon 投影 · BP / 含 5 种滤波器的 FBP / DFR · 从零实现的 DMR、ART、SIRT、ASD-POCS（TV 正则化）· 误差图与 RMSE · 学习式 CNN 后处理，并在界面展示训练视角和输入滤波器限制 |
 | **安全与审阅** | 屏幕身份固定替换为 `ANON`；显式导出文件名使用每次加载随机 `ANON-…` 别名并以 suffix 防覆盖 · 明示 DICOM tags、内部 project/cache identifiers 与 burned-in pixel text 不会被自动匿名化 · 常驻 AI 免责声明 · 模型说明卡（实测出处及未测边界）· 中英双语界面 |
 
@@ -172,7 +173,7 @@ python main.py --data /path/to/dicom_dir # 或启动时加载 DICOM 目录
 
 ## 工程与测试
 
-- 原 God-object 已拆分为 **5 个 UI mixin + 10 个无 Qt 计算模块**；完整的 19-module packaging inventory 以 `pyproject.toml` 为准。
+- 应用分为 **5 个 UI mixin 与 15 个无 Qt 计算模块**；完整的 24-module packaging inventory 以 `pyproject.toml` 为准，并与[架构清单](docs/ARCHITECTURE.md)持续核对。
 - **2026-08-30 的一次本机实测**，全套（本地 RIDER 在场）为 **1013 PASS / 0 FAIL**，`SKIP_REAL_DATA=1` 子集为 **902 PASS / 0 FAIL**。这些只是本地结果，不是 fresh-clone 或 coverage evidence。已固化的那个版本**确有**远端 CI 覆盖：[run `33156906344`](https://github.com/sunce764/medical-imaging-workstation/actions/runs/33156906344) 的 `headSha` 为 `5c5e80741e7290ca8eee430e82f29ee179d85fa0`，与打了 **`v1.1.0`** 标签的 commit 逐字符相同，报告 **878 PASS / 0 FAIL**、**coverage 87%**、**Ruff PASS**，`event=workflow_dispatch`。它比**当时那个 commit 的**本地子集（897）少 19 项，是**构造使然、不是有测试被跳过**：8 项权重摘要核验与 11 项学习式重建检查需要本仓库不分发的产物。其它远端结果只有在 `headSha` 精确匹配被审阅 commit 时才具证据力——这一个覆盖 `v1.1.0`，不覆盖其后任何 commit，**包括记录它的这个文档 commit 本身**。此前的做法是把 run 记在仓库外以回避该递归；此处改为写进来，因为标签不可变，且该递归被明写而非隐去。自定义 runner 会把 Qt signal/slot 未捕获异常计为失败，不能出现“打印 traceback 但 exit 0”的假绿。
 - 重建算法测试断言数值正确性，而非只检查输出“有限”；DICOM 读取对畸形元数据作防御处理。
 
@@ -208,7 +209,8 @@ coverage 现由上面那个 exact-SHA run 直接发布，不再沿用旧数字�
 - **非临床器械**：无监管认证、临床验证档案、审计追踪或访问控制。
 - **仅做显示层脱敏**：屏幕与导出文件名会隐藏 PHI，但不会清洗底层 DICOM 标签和烧录文字。
 - **显示预览与 HU 分析分别判定**：每一保留层都必须有 explicit `RescaleType=HU`，或满足 classic CT 的 `ORIGINAL`、非 `LOCALIZER`、非 multi-energy 标准保证，才开放 AI、HU 定量与随访。仅缺单位声明、且全卷有一致正向有限 slope/intercept 的受支持 CT，可以直接使用六种窗预设。本地 RIDER 原目录也适用，无需复制目录、修改标签或反复确认。渲染器只变换显示切片并标为预览，底层未知单位数组仍保持 raw，HU 分析保持关闭。明确非 HU、LOCALIZER、multi-energy、不支持的 LUT 或不一致变换仍使用原始灰度滑条。单位与显示变换的区别依据 [DICOM C.8.2](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.8.2.html) 和 [VOI 显示流程](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.11.2.html)。可选工具 `tools/declare_rider_hu.py` 仍可生成另行声明的副本；其直方图检查只能评价数值合理性，不能独立证明单位，调窗预览已不再需要它。
-- **换序列与 mask 状态 fail-safe**：新序列成功接管后才清旧 HU probe，并用新单位重建 HUD；加载失败则保留旧 readout。AI-pending 全零 placeholder 不会被保存成假 cache hit；只有经确认的全局清空才持久化带 provenance 的 empty mask、作废旧 AI callback，并可在保存前 Ctrl+Z。逐体素 eraser 最终擦成全零尚不归类为 explicit global clear。
+- **换序列与 mask 状态**：新序列成功接管后才清旧 HU probe，并用新单位重建 HUD；加载失败保留旧 readout。AI-pending placeholder 不冒充完成的 AI 结果。逐体素擦空或明确清空的工作层都会在 `.miwproj` 中保留为空，最近 20 步 Undo 可跨次恢复，原始 AI 与旧缓存不会补回人工结果。
+- **MR 与肿瘤边界**：MR 标注和三维对应目前有合成测试，真实多序列 MRI 验收仍未完成。MR 不进入 CT 专用 HU/器官模型路径；尚未集成验证通过的自动肿瘤定位、分割与类型预测组合，人工病灶编号不等于肿瘤诊断。
 - **AI 泛化仍有未测部分**：肺叶验证 57 例、21 器官验证 20 例，样本量仍小，且全部来自同一个公开数据集（1.5mm 各向同性）、**全部以模型的 RAS 面内约定而非产品 DICOM 的 LPS 喂入**，故度量的是模型而非产品路径；其他扫描协议与设备未经测试，器官间可靠性的差异远大于总体数字（肝 0.98 vs 前列腺 0.55）。spacing 重采样已接入（见证据表），但更细一侧仍属推断而非实测，且扫描范围过大时会被跳过。
 - **重建限于教学范围**：DMR / ART / ASD-POCS 矩阵重建受最小二乘成本限制，实用上限约 64×64。研究 III 使用无噪声合成投影，不能证明低剂量临床表现。
 - **随访为刚性而非形变配准**：平面内配准在测试中将整体平移造成的 MAE 从 321 HU 降至 13 HU，但不会校正呼吸引起的器官形变；差异结果只能作定性参考，不能视为临床变化量。

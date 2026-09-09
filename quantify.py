@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import numpy as np
-import scipy.ndimage as ndimage
 
 
 def compute_organ_stats(volume_hu: np.ndarray, volume_mask: np.ndarray,
@@ -37,37 +36,25 @@ def compute_organ_stats(volume_hu: np.ndarray, volume_mask: np.ndarray,
     """
     ps0, ps1, st = spacing
     vox_ml = ps0 * ps1 * st / 1000.0  # 单体素体积，mm³ → mL
-    counts = np.bincount(volume_mask.ravel(), minlength=256)
+    # bincount 会把 uint8 输入加宽为平台整数；分块避免为整卷临时分配数百 MB。
+    counts = np.zeros(256, np.int64)
+    flat = volume_mask.ravel()
+    for start in range(0, flat.size, 262144):
+        counts += np.bincount(flat[start:start + 262144], minlength=256)
     present = [i for i in range(1, 256) if counts[i] > 0]
     if not present:
         return []
-    # ndimage 一次性算出所有标签区域的统计量，避免逐类布尔索引。
-    # errstate：scipy 的 _sum_centered 内部对不连续的 label 索引会建出空 bin 并做
-    # counts=0 的除法，抛 invalid-value 警告——传进去的 present 全都有体素，是 scipy
-    # 的实现细节而非本函数的问题（结果已由单测对手算值验证）。局部抑制，避免每次
-    # 器官定量都刷警告；不用全局 seterr，以免掩盖别处的真实数值异常。
-    # 标签含 254/255 时必须先加宽类型：scipy 的 _select 内部做 np.zeros(labels.max() + 2)，
-    # labels 为 uint8 时 255+2 溢出回绕成 1，于是分配出长度 1 的数组，再按标签值索引就
-    # IndexError。本项目的 MANUAL_TRACK_LABEL 正是 255（3D 追踪工具的专属标签），
-    # 追踪完立刻调本函数 → 必崩。实测：mask 只要出现 255，无论是否同时含其他标签都会崩。
-    # 仅在真的出现高位标签时才拷贝，正常 AI 分割（标签 1–24）零额外开销。
-    lbl = volume_mask.astype(np.int32) if counts[254:].any() else volume_mask
-    with np.errstate(invalid='ignore', divide='ignore'):
-        means = np.atleast_1d(ndimage.mean(volume_hu, labels=lbl, index=present))
-        sds = np.atleast_1d(ndimage.standard_deviation(volume_hu, labels=lbl, index=present))
     rows = []
-    for i, lid in enumerate(present):
+    for lid in present:
         zh, en = organ_names.get(lid, (f"类{lid}", f"cls{lid}"))
-        # 百分位需按标签取值，ndimage 无对应聚合函数；仅对本标签体素取一次。
-        # min/max 也从这份 vals 直接取：原先另调 ndimage.minimum/maximum，
-        # 每个都要再扫一遍完整体积（233×512² ≈ 6100 万体素），而所需数据此处已在手；
-        # 顺带消掉「统计量走 lbl、百分位走 volume_mask」的双索引口径。
+        # 百分位本就需要该标签的样本；均值/总体 SD 复用它，避免为两个手绘体素
+        # 仍在 ndimage 中统计整卷背景、产生整卷 float64/整数临时数组。254/255 无加法溢出。
         sel = volume_mask == lid
         vals = volume_hu[sel]
         p5, med, p95 = np.percentile(vals, (5, 50, 95))
         row = {'id': lid, 'name_zh': zh, 'name_en': en, 'voxels': int(counts[lid]),
                'volume_ml': counts[lid] * vox_ml,
-               'mean_hu': float(means[i]), 'sd_hu': float(sds[i]),
+               'mean_hu': float(vals.mean(dtype=np.float64)), 'sd_hu': float(vals.std(dtype=np.float64)),
                'median_hu': float(med), 'p5_hu': float(p5), 'p95_hu': float(p95),
                'min_hu': float(vals.min()), 'max_hu': float(vals.max())}
         if volume_conf is not None and volume_conf.shape == volume_mask.shape:

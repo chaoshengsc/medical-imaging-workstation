@@ -147,6 +147,23 @@ def test_ai_engine(app):
     check(hasattr(ai_engine, "_SESSION_CACHE"), "InferenceSession 缓存接口存在")
 
 
+def _real_ct_test_viewer(app):
+    """真实 CT 回归只读原图；不接入用户工程、不启动整卷模型。"""
+    import tempfile
+
+    directory = tempfile.TemporaryDirectory()
+    viewer = m.MedicalViewer(project_dir=directory.name, autosave=False)
+    viewer.persistence_dir = directory.name
+    viewer._test_directory = directory
+
+    def forbid_inference():
+        raise AssertionError('Whole-volume organ inference is not authorized by the regression suite')
+
+    viewer._kickoff_ai = forbid_inference
+    viewer.load_data(os.path.join(_ROOT, '肺癌')); app.processEvents()
+    return viewer
+
+
 def test_startup(v):
     print("[启动/工具栏]")
     check(v.volume_hu is not None and v.volume_hu.shape[0] == 233, "自动加载主序列 (233 层)")
@@ -205,12 +222,13 @@ def test_prior_fixes(v, app):
     check(v.current_sinogram is None and v._last_recon_img is None, "换切片重置弦图并清链式源图")
     v.tabs.setCurrentIndex(0); app.processEvents()
     # MPR 悬停联动
-    v.btn_mpr.setChecked(True); v.views[1]['plane'] = CORONAL
+    v.btn_mpr.setChecked(True); v.views[1]['cb_plane'].setCurrentIndex(CORONAL)
+    app.processEvents()
     v.sync_crosshair(QPointF(100, 60), 1)
     expected_z = v.volume_hu.shape[0] - 1 - 60
     check(v.current_3d_pos[0] == expected_z and v.slider_slice.value() == expected_z,
           "MPR 上 S / 下 I 悬停同步翻转后的光标与滑条")
-    v.btn_mpr.setChecked(False); v.views[1]['plane'] = AXIAL
+    v.btn_mpr.setChecked(False); v.views[1]['cb_plane'].setCurrentIndex(AXIAL)
     # reset 清 HUD / _user_zoomed；load 清 hidden
     v.lbl_hud.setText("x"); v.views[1]['view']._user_zoomed = True
     v.reset_all_states(); app.processEvents()
@@ -299,18 +317,22 @@ def test_multiorgan_and_edit(v, app):
 
 def test_roi(v, app):
     print("[椭圆 ROI 密度测量 / 拖动缩放]")
-    z = v.current_3d_pos[0]
-    v.views[1]['plane'] = AXIAL; v.views[1]['chk_anno'].setChecked(True)
-    anno = {'id': 'roi1', 'type': 'roi', 'rect': (100.0, 100.0, 60.0, 40.0)}
-    v.global_annotations[z] = [anno]
+    v.views[1]['cb_plane'].setCurrentIndex(AXIAL); v.views[1]['chk_anno'].setChecked(True)
+    v.chk_global_scope.setChecked(False)
     v.update_display(); app.processEvents()
+    anno = {'id': 'roi1', 'type': 'roi', 'rect': (100.0, 100.0, 60.0, 40.0)}
+    v.views[1]['view'].annotation_added.emit(anno); app.processEvents()
     view = v.views[1]['view']
+    def current_roi():
+        return next(a for values in v.global_annotations.values() for a in values if a['id'] == 'roi1')
+    steps = len(v.study_document.history)
     rois = [it for it in view.scene.items() if isinstance(it, ROIGraphicsItem)]
     txts = [it for it in view.scene.items() if isinstance(it, QGraphicsTextItem)]
     check(len(rois) == 1 and len(txts) >= 1, "ROI 渲染为可编辑椭圆 + 统计文字")
     item = rois[0]
     item.setPos(200, 150); item._commit(); app.processEvents()
-    check(abs(anno['rect'][0] - 200) < 1, "拖动 ROI 写回 annotation")
+    check(abs(current_roi()['rect'][0] - 200) < 1
+          and len(v.study_document.history) == min(20, steps + 1), "拖动 ROI 写回 annotation 并提交独立 Undo")
 
     class FE:
         def __init__(s, x, y): s._p = QPointF(x, y)
@@ -321,7 +343,9 @@ def test_roi(v, app):
     item.mousePressEvent(FE(item.rect().width() - 3, item.rect().height() - 3))
     item.mouseMoveEvent(FE(item.rect().width() + 40, item.rect().height() + 30))
     item.mouseReleaseEvent(FE(0, 0)); app.processEvents()
-    check(item.rect().width() > w0 and anno['rect'][2] > 60, "拖手柄缩放 ROI 并写回")
+    check(current_roi()['rect'][2] > w0
+          and len(v.study_document.history) == min(20, steps + 2), "拖手柄缩放 ROI 并写回独立 Undo")
+    item = next(it for it in view.scene.items() if isinstance(it, ROIGraphicsItem))
     # 命中判定避免与平移冲突
     view.current_tool = TOOL_POINTER
     view.itemAt = lambda p: item
@@ -330,7 +354,12 @@ def test_roi(v, app):
     view.itemAt = lambda p: None
     view.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(400, 400), Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
     check(view.dragMode() == QGraphicsView.ScrollHandDrag, "指针点在空白 -> ScrollHandDrag (平移)")
-    v.global_annotations[z] = []
+    del view.itemAt
+    v.btn_undo.click(); app.processEvents()
+    check(np.allclose(current_roi()['rect'], [200, 150, 60, 40]), 'Undo 缩放仅还原尺寸，保留先前移动')
+    v.btn_undo.click(); app.processEvents()
+    check(np.allclose(current_roi()['rect'], [100, 100, 60, 40]), '再 Undo 移动还原创建位置')
+    v.handle_annotation_deleted('roi1'); app.processEvents()
 
 
 def test_mpr_ruler_spacing(v, app):
@@ -553,9 +582,7 @@ def test_edge_cases(v, app):
           f"本序列按当前 spec 为原始存储值而非标定 HU（hu_calibrated={v.hu_calibrated}, "
           f"min={float(v.volume_hu.min()):.0f} = PixelPaddingValue）")
     # 脱敏隐去对比既往日期（PHI）
-    vv = m.MedicalViewer(data_dir=os.path.join(_ROOT, "肺癌")); app.processEvents()
-    if vv.ai_thread:
-        vv.ai_thread.cancel()
+    vv = _real_ct_test_viewer(app)
     vv.anonymize = True
     vv.compare_volume = np.zeros((10, 64, 64), np.float32)
     vv.compare_datasets = [type('D', (), {'StudyDate': '20200115'})()]
@@ -565,6 +592,7 @@ def test_edge_cases(v, app):
     vv.current_3d_pos[0] = 5
     vv._render_compare(); app.processEvents()
     check("2020" not in vv.views[2]['title_label'].text(), "脱敏模式隐去对比既往检查日期")
+    vv.close(); vv._test_directory.cleanup()
 
 
 def _write_min_dcm(path, shape, series_uid, ipp_z, inst, pid='RID_TEST', empty_numeric=False,
@@ -572,7 +600,7 @@ def _write_min_dcm(path, shape, series_uid, ipp_z, inst, pid='RID_TEST', empty_n
                    ipp=None, iop=(1, 0, 0, 0, 1, 0), modality='CT', sop_class_uid=None,
                    pixel_spacing=(1.0, 1.0), pixels=None,
                    image_type=('ORIGINAL', 'PRIMARY', 'AXIAL'), rescale_type=None,
-                   multi_energy=None):
+                   multi_energy=None, study_uid=None):
     """写一张最小合规的 CT DICOM，供混合形状加载测试使用。ipp_z=None 则不写 ImagePositionPatient。
     empty_numeric=True 时把 RescaleSlope/Intercept/PixelSpacing/SliceThickness 写成空值（None）。
     n_frames>1 写多帧 DICOM；truncate=True 写截断的 PixelData（pixel_array 解码会抛）。
@@ -588,6 +616,7 @@ def _write_min_dcm(path, shape, series_uid, ipp_z, inst, pid='RID_TEST', empty_n
     meta.TransferSyntaxUID = ExplicitVRLittleEndian
     ds = FileDataset(path, {}, file_meta=meta, preamble=b"\0" * 128)
     ds.PatientID = pid
+    ds.StudyInstanceUID = study_uid or series_uid  # 默认独立检查，可显式构造同检查多序列
     ds.SeriesInstanceUID = series_uid
     ds.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
     ds.SOPClassUID = sop_class_uid
@@ -660,7 +689,7 @@ def test_load_clears_stale_hu_probe(app):
                                ipp_z=i, inst=i + 1, pid="STALE_PROBE", pix=pix,
                                image_type=image_type)
 
-        v = m.MedicalViewer(); app.processEvents()
+        v = m.MedicalViewer(autosave=False); app.processEvents()
         if v.ai_thread: v.ai_thread.cancel()
         v.persistence_dir = persistence_dir
         v._kickoff_ai = lambda: None
@@ -729,7 +758,7 @@ def test_noncanonical_dicom_gating(app):
             _write_min_dcm(os.path.join(d, f"s{i}.dcm"), (8, 10), sid, ipp_z=None,
                            inst=i, pid=f"SAG_{sid[-8:]}", ipp=(x, 0, 0), iop=iop,
                            pixel_spacing=(2.0, 3.0), pix=500, slope=2, intercept=-1000)
-        v = m.MedicalViewer(); app.processEvents()
+        v = m.MedicalViewer(autosave=False); app.processEvents()
         kicked = {'n': 0}
         v._kickoff_ai = lambda: kicked.__setitem__('n', kicked['n'] + 1)
         v.load_data(d); app.processEvents()
@@ -741,14 +770,14 @@ def test_noncanonical_dicom_gating(app):
         check(flags == (True, False, True, True),
               f"能力 flags 分轴保存为 HU=True/canonical=False/inplane=True/z=True（得 {flags}）")
         check(kicked['n'] == 0, "non-canonical orientation 不启动器官 AI")
-        check(not v.btn_mpr.isEnabled(), "non-canonical orientation 禁用 anatomical MPR")
+        check(v.btn_mpr.isEnabled(), "有效非 canonical 来源开放患者空间 anatomical MPR")
         first_view = v.views[min(v.views)]
-        check(first_view['view'].orient_labels == {}
-              and any("原始体素平面" in line
+        check(first_view['view'].orient_labels == {'top': 'A', 'bottom': 'P', 'left': 'R', 'right': 'L'}
+              and any("横断面" in line
                       for line in first_view['view'].overlay_lines.get('tr', [])),
-              "viewer-only 不显示伪 A/P/L/R/S/I 或 Axial/Coronal/Sagittal 声明")
-        check(all(not vd['cb_plane'].isEnabled() for vd in v.views.values()),
-              "viewer-only 禁用 anatomical plane 切换")
+              "有效 sagittal 来源通过患者空间重采样显示 Axial，不直接重命名数组轴")
+        check(all(vd['cb_plane'].isEnabled() for vd in v.views.values()),
+              "有效来源支持 anatomical plane 切换，CT AI 资格仍独立拒绝")
         check(not v.btn_export_stats.isEnabled() and not v.btn_mesh3d.isEnabled(),
               "non-canonical orientation 禁用器官定量与 physical 3-D")
     finally:
@@ -759,18 +788,24 @@ def test_noncanonical_dicom_gating(app):
 
 
 def test_unsupported_dicom_contract(app):
-    """非 CT、Enhanced CT 与 multi-frame classic CT 必须在 pixel decode 前拒绝。"""
+    """CT/MR 之外及 Enhanced/multiframe 输入在 pixel decode 前拒绝。"""
     print("[DICOM contract：unsupported modality/SOP/multiframe fail closed]")
     import shutil
     import tempfile
 
-    from pydicom.uid import EnhancedCTImageStorage, MRImageStorage, generate_uid
+    from pydicom.uid import (
+        EnhancedCTImageStorage,
+        EnhancedMRImageStorage,
+        MRImageStorage,
+        generate_uid,
+    )
     root = tempfile.mkdtemp()
-    v = m.MedicalViewer(); app.processEvents()
+    v = m.MedicalViewer(autosave=False); app.processEvents()
     try:
         cases = (
-            ("non_ct", {"modality": "MR", "sop_class_uid": MRImageStorage}),
+            ("modality_sop_mismatch", {"modality": "PT", "sop_class_uid": MRImageStorage}),
             ("enhanced_ct", {"sop_class_uid": EnhancedCTImageStorage, "n_frames": 2}),
+            ("enhanced_mr", {"modality": "MR", "sop_class_uid": EnhancedMRImageStorage, "n_frames": 2}),
             ("multiframe_classic", {"n_frames": 2}),
         )
         for name, kwargs in cases:
@@ -795,7 +830,7 @@ def test_missing_series_uid_contract(app):
     import pydicom
     from pydicom.uid import generate_uid
     root = tempfile.mkdtemp()
-    v = m.MedicalViewer(); app.processEvents()
+    v = m.MedicalViewer(autosave=False); app.processEvents()
     try:
         multi = os.path.join(root, "multi"); os.makedirs(multi)
         for i in range(2):
@@ -951,7 +986,7 @@ def test_invalid_calibration_raw_gating(app):
                            slope=2, intercept=-1000)
             if i == 1:
                 ds = pydicom.dcmread(path); del ds.RescaleSlope; ds.save_as(path)
-        v = m.MedicalViewer(); app.processEvents()
+        v = m.MedicalViewer(autosave=False); app.processEvents()
         kicked = {'n': 0}; v._kickoff_ai = lambda: kicked.__setitem__('n', kicked['n'] + 1)
         v.load_data(valid); app.processEvents()
         for vdata in v.views.values():
@@ -978,9 +1013,9 @@ def test_invalid_calibration_raw_gating(app):
         rendered = first['view'].image_item.pixmap().toImage().pixelColor(0, 0).red()
         check(abs(rendered - 127) <= 1,
               f"raw renderer 忽略 disabled named preset，使用 Global 200/100（pixel={rendered}）")
-        check(not v.tool_btns['btn_rec'].isEnabled() and not v.tool_btns['btn_roi'].isEnabled()
+        check(not v.tool_btns['btn_rec'].isEnabled() and v.tool_btns['btn_roi'].isEnabled()
               and not v.tool_btns['btn_trk'].isEnabled() and not v.btn_compare.isEnabled(),
-              "raw 序列关闭 ROI/HU CSV、HU tracking 与 HU follow-up")
+              "raw 允许原始值 ROI；HU CSV、HU tracking 与 HU follow-up 保持关闭")
         check(v.tool_btns['btn_rul'].isEnabled() and v.btn_mpr.isEnabled(),
               "HU 无效不误伤仍有有效 in-plane/z geometry 的测距与 MPR")
         check(not v.btn_export_stats.isEnabled() and not v.btn_mesh3d.isEnabled(),
@@ -1025,7 +1060,7 @@ def test_window_control_feedback(app):
         for i in range(3):
             _write_min_dcm(os.path.join(directory, f'{i}.dcm'), (8, 8), sid, i, i + 1,
                            pix=1124)  # 已证明的 HU=100
-        v = m.MedicalViewer(); v._kickoff_ai = lambda: None
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
         try:
             v.show(); v.tabs.setCurrentIndex(1); QTest.qWait(80)
             check(not v.views[4]['container'].isHidden(),
@@ -1067,7 +1102,7 @@ def test_ct_window_preview_without_hu(app):
             _write_min_dcm(os.path.join(directory, f'{i}.dcm'), (8, 8), sid,
                            i, i + 1, pix=1024 + 100 * i,
                            image_type=('DERIVED', 'SECONDARY', 'PROCESSED'))
-        v = m.MedicalViewer()
+        v = m.MedicalViewer(autosave=False)
         kickoffs = []
         v._kickoff_ai = lambda: kickoffs.append(True)
         try:
@@ -1120,7 +1155,7 @@ def test_ct_window_preview_without_hu(app):
             check(not v.hu_calibrated and float(v.volume_hu[1, 0, 0]) == 1124,
                   "底层未知单位数组保留原始 1124，不伪称 100 HU")
             check(not kickoffs and not v.btn_compare.isEnabled()
-                  and not v.tool_btns['btn_roi'].isEnabled(), "预览不启动 AI、不开放 HU 定量 / 随访")
+                  and not v.tool_btns['btn_rec'].isEnabled(), "预览不启动 AI、不开放 HU CSV / 随访")
             check(all(not hasattr(ds, 'RescaleType') for ds in v.dicom_datasets),
                   "不在内存篡改 DICOM 单位标签")
             v.load_data(os.path.join(directory, 'missing'))
@@ -1179,7 +1214,7 @@ def test_raw_window_and_mode_feedback(app):
             _write_min_dcm(path, (8, 8), sid, i, i + 1, pixels=pixels,
                            image_type=('DERIVED', 'SECONDARY', 'PROCESSED'), rescale_type='US')
             ds = pydicom.dcmread(path); ds.add_new((0x0028, 0x0120), 'SS', -2000); ds.save_as(path)
-        v = m.MedicalViewer(); v._kickoff_ai = lambda: None
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
         try:
             v.load_data(directory); v.show(); QTest.qWait(120)
             vd = v.views[1]
@@ -1203,7 +1238,9 @@ def test_raw_window_and_mode_feedback(app):
             v.reset_all_states()
             check(v.slider_wl.value() >= 0, "raw 重置使用本序列显示窗口，不回到 -500 HU")
             check('OFF' in v.btn_mpr.text(), "重置后 MPR 文案与关闭状态一致")
-            # 非 canonical 输入在实验室往返后仍不能展示伪解剖平面选择器。
+            # 患者空间不可证的输入在实验室往返后不能展示伪解剖平面选择器。
+            from dataclasses import replace
+            v._active_source = replace(v._active_source, affine=None)
             v.canonical_orientation = False
             for view in v.views.values():
                 view['cb_plane'].hide()
@@ -1212,7 +1249,7 @@ def test_raw_window_and_mode_feedback(app):
                       for view in v.views.values()), "重建模式隐藏无效的临床投影控件")
             v.tabs.setCurrentIndex(0)
             check(all(view['cb_plane'].isHidden() for view in v.views.values()),
-                  "重建返回保留非 canonical 平面限制，不重新显示 Axial/Coronal/Sagittal")
+                  "重建返回保留无效患者空间限制，不重新显示 Axial/Coronal/Sagittal")
         finally:
             v.close(); app.processEvents()
 
@@ -1227,7 +1264,7 @@ def test_scroll_background_rendering(app):
     old = app.palette()
     light = QPalette(old); light.setColor(QPalette.Window, QColor('#efefef'))
     app.setPalette(light)
-    v = m.MedicalViewer()
+    v = m.MedicalViewer(autosave=False)
     try:
         v.resize(1200, 780); v.show(); QTest.qWait(120)
         for index in (0, 1):
@@ -1259,7 +1296,7 @@ def test_series_and_compare_control_transitions(app):
                 _write_min_dcm(os.path.join(directory, f'{i}.dcm'), (8, 8), sid, i, i + 1,
                                image_type=('ORIGINAL', 'PRIMARY', 'AXIAL') if label == 'hu'
                                else ('DERIVED', 'SECONDARY', 'PROCESSED'))
-        v = m.MedicalViewer(); v._kickoff_ai = lambda: None
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
         try:
             v.load_data(paths['hu']); v.show(); QTest.qWait(120)
             v.volume_mask[0:2, 1:4, 1:4] = 5; v._update_organ_stats()
@@ -1314,7 +1351,7 @@ def test_layout_reveals_current_images(app):
         for i in range(3):
             _write_min_dcm(os.path.join(directory, f'{i}.dcm'), (8, 8), sid, i, i + 1,
                            pix=1024 + 100 * i)
-        v = m.MedicalViewer(); v._kickoff_ai = lambda: None
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
         try:
             # 等首次单窗布局完成再加载，等同用户启动后选择目录。
             v.show(); QTest.qWait(120); v.load_data(directory); QTest.qWait(120)
@@ -1355,7 +1392,7 @@ def test_full_ui_state_audit(app):
             for i in range(3):
                 _write_min_dcm(os.path.join(path, f'{i}.dcm'), (16, 16), sid, i, i + 1,
                                pixels=np.arange(256).reshape(16, 16) * (j + 1) + 1024)
-        v = m.MedicalViewer(); v._kickoff_ai = lambda: None
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
         try:
             check(not v.btn_cine.isEnabled() and not v.btn_gen_sino.isEnabled(),
                   "空载时播放和生成弦图入口禁用，不给可点但静默无效的按钮")
@@ -1367,9 +1404,9 @@ def test_full_ui_state_audit(app):
             v.on_auto_ai_finished(np.ones(v.volume_hu.shape, np.uint8), 1, generation)
             v._on_ai_failed('late failure', generation)
             v._on_ai_progress(1, 2, generation)
-            check(pending.cancelled and not v.volume_mask.any() and v._ai_state == 'standby',
-                  "重置取消旧推理，迟到的成功 / 失败 / 进度不得复活蒙版或改状态")
-            check(v._mask_cache_clear_requested, "重置非空蒙版后保存会记录明确清空意图")
+            check(pending.cancelled and np.all(v.volume_mask == 5) and v._ai_state == 'standby',
+                  "显示重置保留蒙版，迟到的成功 / 失败 / 进度不得覆盖内容或改状态")
+            check(not v._mask_cache_clear_requested, "显示重置不产生清空标注的保存意图")
 
             pending = PendingAI(); v.ai_thread = pending; v._ai_state = 'running'
             generation = v._ai_generation
@@ -1399,7 +1436,7 @@ def test_full_ui_state_audit(app):
                   "重建中换同尺寸同层数序列也作废旧弦图 / BP 缓存 / 结果图")
         finally:
             v.close(); app.processEvents()
-        e = m.MedicalViewer()
+        e = m.MedicalViewer(autosave=False)
         try:
             e.tabs.setCurrentIndex(1); e.btn_phantom.click(); e.btn_gen_sino.click(); e.btn_fbp.click()
             check(e.btn_gen_sino.isEnabled() and e.current_sinogram is not None,
@@ -1423,7 +1460,7 @@ def test_drawing_context_audit(app):
         sid = generate_uid()
         for i in range(3):
             _write_min_dcm(os.path.join(root, f'{i}.dcm'), (32, 32), sid, i, i + 1, pix=1100)
-        v = m.MedicalViewer(); v._kickoff_ai = lambda: None
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
         try:
             v.load_data(root); v.show(); QTest.qWait(120)
             view = v.views[1]['view']
@@ -1455,8 +1492,8 @@ def test_drawing_context_audit(app):
             check(not view.is_drawing and view.temp_item is None, "重新加载序列取消未提交笔划")
             v.views[1]['cb_plane'].setCurrentIndex(CORONAL)
             q = begin()
-            check(not view.is_drawing and view.temp_item is None,
-                  "不支持标注的冠状面在落笔前阻止绘制，不画完才丢弃")
+            check(view.is_drawing and view.temp_item is not None,
+                  "有效冠状面可开始标注，坐标由新空间事务保存")
             QTest.mouseRelease(view.viewport(), Qt.LeftButton, pos=q)
         finally:
             v.close(); app.processEvents()
@@ -1475,7 +1512,7 @@ def test_export_failure_and_status_audit(app):
         sid = generate_uid()
         for i in range(3):
             _write_min_dcm(os.path.join(root, f'{i}.dcm'), (32, 32), sid, i, i + 1, pix=1100)
-        v = m.MedicalViewer(); v._kickoff_ai = lambda: None
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
         try:
             v.load_data(root); v.export_dir = root
             warnings = []
@@ -1507,7 +1544,7 @@ def test_hu_unit_semantics_gating(app):
     from pydicom.uid import generate_uid
 
     root = tempfile.mkdtemp()
-    v = m.MedicalViewer(); app.processEvents()
+    v = m.MedicalViewer(autosave=False); app.processEvents()
 
     def make_series(name, *, image_type=('ORIGINAL', 'PRIMARY', 'AXIAL'),
                     rescale_type=None, multi_energy=None, mixed_last_type=None):
@@ -1556,9 +1593,9 @@ def test_hu_unit_semantics_gating(app):
                   f"{label}：整卷 raw，不把 stored values 伪称 HU")
             check(all(vd['preset'].isEnabled() == (directory == derived) for vd in v.views.values())
                   and not v.tool_btns['btn_rec'].isEnabled()
-                  and not v.tool_btns['btn_roi'].isEnabled()
+                  and v.tool_btns['btn_roi'].isEnabled()
                   and not v.btn_compare.isEnabled(),
-                  f"{label}：仅缺单位的 DERIVED 可预览窗位；AI/HU ROI/compare 始终关闭")
+                  f"{label}：允许原始值 ROI；HU 导出/compare 保持关闭，DERIVED 可预览窗位")
 
         compare_volume, compare_datasets = v._read_compare_dir(non_hu['Z_EFF'])
         check(compare_volume is None and compare_datasets == [],
@@ -1578,7 +1615,7 @@ def test_spacing_capability_gating(app):
     import pydicom
     from pydicom.uid import generate_uid
     root = tempfile.mkdtemp()
-    v = m.MedicalViewer(); app.processEvents()
+    v = m.MedicalViewer(autosave=False); app.processEvents()
     try:
         valid = os.path.join(root, "valid"); os.makedirs(valid)
         valid_sid = generate_uid()
@@ -1610,9 +1647,9 @@ def test_spacing_capability_gating(app):
         check(v.hu_calibrated and v.canonical_orientation
               and not v.inplane_spacing_valid and v.uniform_z_geometry_valid,
               "缺 PixelSpacing 只关闭 in-plane capability，不误伤 HU/canonical/z")
-        check(not v.tool_btns['btn_rul'].isEnabled() and not v.tool_btns['btn_roi'].isEnabled()
-              and not v.btn_mpr.isEnabled(),
-              "缺 in-plane spacing 关闭 mm/mm² 与 physical MPR")
+        check(v.tool_btns['btn_rul'].isEnabled() and v.tool_btns['btn_roi'].isEnabled()
+              and v.views[1]['view'].measurement_unit == 'px' and not v.btn_mpr.isEnabled(),
+              "缺 in-plane spacing 允许来源像素标注，但无 mm 预览与 physical MPR")
         check(all(not vd['cb_plane'].isEnabled() for vd in v.views.values()),
               "缺 in-plane spacing 时 plane selector 不能绕过 MPR geometry gate")
         check(v.active_tool == TOOL_POINTER and v.tool_btns['btn_ptr'].isChecked()
@@ -1663,7 +1700,7 @@ def test_compare_dicom_contract(app):
 
     from pydicom.uid import EnhancedCTImageStorage, generate_uid
     root = tempfile.mkdtemp()
-    v = m.MedicalViewer(); app.processEvents()
+    v = m.MedicalViewer(autosave=False); app.processEvents()
     try:
         primary = os.path.join(root, "primary"); os.makedirs(primary)
         sid = generate_uid()
@@ -1728,7 +1765,7 @@ def test_deid_export_and_persistence_contract(app):
     from pydicom.uid import generate_uid
     from PySide6.QtWidgets import QMessageBox
     root = tempfile.mkdtemp(); out = tempfile.mkdtemp(); internal = tempfile.mkdtemp()
-    v = m.MedicalViewer(); app.processEvents()
+    v = m.MedicalViewer(autosave=False); app.processEvents()
     saved_warning = QMessageBox.warning
     warnings = []
     try:
@@ -1788,344 +1825,83 @@ def test_deid_export_and_persistence_contract(app):
 
 
 def test_save_project_atomic_contract(app):
-    """save_project 的 precondition 与 per-target atomicity 只在临时目录验证。"""
-    print("[Project persistence：fingerprint precondition / atomic targets]")
-    import json
-    import shutil
+    """产品级工程保存的来源/数组前置条件、完整事务失败和有效空结果恢复。"""
     import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
 
     from pydicom.uid import generate_uid
-    from PySide6.QtWidgets import QMessageBox
 
-    import annotation_lab
+    from project_store import load_project_snapshot
 
-    dicom_dir = tempfile.mkdtemp()
-    persistence_dir = tempfile.mkdtemp()
-    v = None
-    saved_information = QMessageBox.information
-    saved_warning = QMessageBox.warning
-    saved_question = QMessageBox.question
-    extra_viewers = []
-    infos, warnings = [], []
-    try:
+    print('[产品保存：前置校验 / 整包原子性 / 有效空结果]')
+    with tempfile.TemporaryDirectory() as directory:
+        data = Path(directory) / 'dicom'; data.mkdir()
         sid = generate_uid()
-        for i in range(3):
-            _write_min_dcm(os.path.join(dicom_dir, f"s{i}.dcm"), (8, 8), sid,
-                           ipp_z=i, inst=i + 1, pid="SAVE_ATOMIC")
-        v = m.MedicalViewer(); app.processEvents()
+        for z in range(3):
+            _write_min_dcm(str(data / f'{z}.dcm'), (8, 8), sid, z, z + 1, pid='SAVE_ATOMIC')
+        v = m.MedicalViewer(project_dir=os.path.join(directory, 'projects'), autosave=False)
         v._kickoff_ai = lambda: None
-        v.load_data(dicom_dir); app.processEvents()
-        v.persistence_dir = persistence_dir
-        v.global_annotations = {'all': []}
-        v.volume_mask = np.ones_like(v.volume_hu, dtype=np.uint8)
-
-        json_path = os.path.join(persistence_dir, "SAVE_ATOMIC_annotations.json")
-        npz_path = os.path.join(persistence_dir, "SAVE_ATOMIC_mask.npz")
-        json_sentinel = b"SENTINEL-JSON"
-        npz_sentinel = b"SENTINEL-NPZ"
-        with open(json_path, "wb") as f:
-            f.write(json_sentinel)
-        with open(npz_path, "wb") as f:
-            f.write(npz_sentinel)
-
-        QMessageBox.information = staticmethod(
-            lambda _p, title, msg, *a, **k: infos.append((title, msg)))
-        QMessageBox.warning = staticmethod(
-            lambda _p, title, msg, *a, **k: warnings.append((title, msg)))
-        actual_uid = v._current_series_uid()
-        actual_fingerprint = v._current_geometry_fingerprint()
-
-        v._current_geometry_fingerprint = lambda: ""
-        result = v.save_project()
-        check(result is False
-              and open(json_path, "rb").read() == json_sentinel
-              and open(npz_path, "rb").read() == npz_sentinel,
-              "empty fingerprint fail closed，既有 JSON/NPZ sentinel bytes 不变")
-        check(not infos and bool(warnings),
-              "precondition failure 不显示 Project saved，并给出明确 warning")
-
-        # UID 与 fingerprint 都是恢复缓存所需的身份/几何 provenance；任一为空均不得覆盖。
-        infos.clear(); warnings.clear()
-        v._current_geometry_fingerprint = lambda: actual_fingerprint
-        v._current_series_uid = lambda: ""
-        result = v.save_project()
-        check(result is False
-              and open(json_path, "rb").read() == json_sentinel
-              and open(npz_path, "rb").read() == npz_sentinel
-              and not infos and bool(warnings),
-              "empty SeriesInstanceUID fail closed，既有目标不变且无 success")
-
-        v._current_series_uid = lambda: actual_uid
-
-        # JSON 序列化先写同目录临时文件；失败不得截断既有 JSON，也不得提前替换 NPZ。
-        infos.clear(); warnings.clear()
-        saved_json_dump = annotation_lab.json.dump
-        annotation_lab.json.dump = lambda *a, **k: (_ for _ in ()).throw(
-            OSError("injected JSON serialization failure"))
+        fresh = None
         try:
-            result = v.save_project()
+            v.load_data(str(data)); doc = v.study_document; record = doc.series[sid]
+            doc.edit_mask(sid, [2], 5); v._sync_committed_edit()
+            check(v.save_project(), '有效来源的产品工程首次保存成功')
+            target = Path(doc.project_path); original = target.read_bytes()
+            binding = record.source_binding
+            record.source_binding = None
+            check(not v.save_project() and target.read_bytes() == original,
+                  '来源身份缺失时拒绝保存，旧工程逐字节保持完整')
+            record.source_binding = binding
+            previous = v.volume_mask
+            v.volume_mask = np.zeros((1, 1, 1), np.uint8)
+            check(not v.save_project() and target.read_bytes() == original,
+                  'wrong-shape zero 在任何文件替换前拒绝')
+            v.volume_mask = previous; v._remember_active_series()
+            doc.edit_mask(sid, [7], 7); v._sync_committed_edit()
+            for name in ('_json_bytes', 'np.savez_compressed', 'os.replace'):
+                with patch(f'project_store.{name}', side_effect=OSError('synthetic save failure')):
+                    result = v.save_project()
+                check(not result and target.read_bytes() == original
+                      and doc.saved_revision < doc.revision and bool(v._last_save_error)
+                      and not list(target.parent.glob('.miwproj-*.tmp')),
+                      f'{name} 失败保留整个旧工程、dirty 和失败提示，并清理临时文件')
+            check(v.save_project(), '写入故障排除后可重试保存当前完整 revision')
+            before_clear = v.volume_mask.copy()
+            with patch.object(QMessageBox, 'question', return_value=QMessageBox.Yes):
+                v.clear_mask_and_annotations()
+            generation = v._ai_generation
+            v.on_auto_ai_finished(np.full_like(v.volume_mask, 9), 1., generation - 1)
+            check(not v.volume_mask.any() and doc.saved_revision < doc.revision,
+                  '明确清空为独立 dirty 操作，过期 AI 回调不能使旧标签复活')
+            old = target.read_bytes()
+            with patch('project_store.os.replace', side_effect=OSError('synthetic clear write failure')):
+                result = v.save_project()
+            check(not result and target.read_bytes() == old and not v.volume_mask.any()
+                  and doc.saved_revision < doc.revision,
+                  '有效空结果保存失败保留旧包和当前未保存的空结果')
+            v.load_data(os.path.join(directory, 'missing'))
+            check(v.study_document is doc and not v.volume_mask.any() and doc.saved_revision < doc.revision,
+                  '读取失败不丢弃未保存的明确清空操作')
+            check(v.save_project(), '有效空结果按完整工程保存成功')
+            fresh = m.MedicalViewer(project_dir=str(target.parent), autosave=False)
+            kickoffs = []; fresh._kickoff_ai = lambda: kickoffs.append(True)
+            fresh.load_data(str(data))
+            check(not fresh.volume_mask.any() and not kickoffs,
+                  '重开后有效空结果保留，且不自动重跑 AI')
+            fresh._undo_mask_edit()
+            check(np.array_equal(fresh.volume_mask, before_clear), '重开后一次 Undo 能撤回清空本身')
+            check(fresh.save_project() and np.array_equal(
+                load_project_snapshot(target).series[sid].working_mask, before_clear),
+                '跨次 Undo 后保存的是恢复结果及对应历史')
+            previous = fresh.volume_mask; original = target.read_bytes(); fresh.volume_mask = None
+            check(not fresh.save_project() and target.read_bytes() == original,
+                  '缺失最终工作数组时拒绝整包保存，不能当成无标注覆盖')
+            fresh.volume_mask = previous; fresh._remember_active_series()
         finally:
-            annotation_lab.json.dump = saved_json_dump
-        leftovers = [name for name in os.listdir(persistence_dir)
-                     if name.startswith(".SAVE_ATOMIC_")]
-        check(result is False
-              and open(json_path, "rb").read() == json_sentinel
-              and open(npz_path, "rb").read() == npz_sentinel
-              and not leftovers,
-              "JSON serialization failure 保留两份 sentinel，并清理临时文件")
-        check(not infos and bool(warnings),
-              "JSON failure 返回 False、不给 success、给出 warning")
-
-        # NPZ 写入也发生在任何 replace 之前；故第二目标写失败时 JSON 目标仍不变。
-        infos.clear(); warnings.clear()
-        saved_savez = annotation_lab.np.savez_compressed
-        annotation_lab.np.savez_compressed = lambda *a, **k: (_ for _ in ()).throw(
-            OSError("injected NPZ write failure"))
-        try:
-            result = v.save_project()
-        finally:
-            annotation_lab.np.savez_compressed = saved_savez
-        leftovers = [name for name in os.listdir(persistence_dir)
-                     if name.startswith(".SAVE_ATOMIC_")]
-        check(result is False
-              and open(json_path, "rb").read() == json_sentinel
-              and open(npz_path, "rb").read() == npz_sentinel
-              and not leftovers,
-              "NPZ write failure 发生在 replace 前，两份 sentinel 均不变")
-        check(not infos and bool(warnings),
-              "NPZ failure 返回 False、不给 success、给出 warning")
-
-        infos.clear(); warnings.clear()
-        result = v.save_project()
-        with open(json_path, encoding="utf-8") as f:
-            saved_json = json.load(f)
-        with np.load(npz_path) as saved_npz:
-            saved_mask = saved_npz["mask"]
-            saved_uid = str(saved_npz["series_uid"].item())
-            saved_fingerprint = str(saved_npz["geometry_fingerprint"].item())
-        check(result is True and bool(infos) and not warnings,
-              "成功路径仅在 JSON/NPZ 均替换后返回 True 并显示 success")
-        check(saved_json["__meta__"]["series_uid"] == actual_uid
-              and saved_json["__meta__"]["geometry_fingerprint"] == actual_fingerprint
-              and saved_uid == actual_uid and saved_fingerprint == actual_fingerprint
-              and np.array_equal(saved_mask, v.volume_mask),
-              "成功落盘的 JSON/NPZ 同时绑定当前 UID、fingerprint 与 mask bytes")
-
-        # 两个 os.replace 不是跨文件事务：第二个失败时必须准确报告已替换/未替换目标，
-        # 返回 False 且不显示完整成功；不得把 partial completion 冒充 Project saved。
-        with open(json_path, "wb") as f:
-            f.write(json_sentinel)
-        with open(npz_path, "wb") as f:
-            f.write(npz_sentinel)
-        infos.clear(); warnings.clear()
-        saved_replace = annotation_lab.os.replace
-
-        def fail_npz_replace(src, dst):
-            if dst == npz_path:
-                raise OSError("injected second-target replace failure")
-            return saved_replace(src, dst)
-
-        annotation_lab.os.replace = fail_npz_replace
-        try:
-            result = v.save_project()
-        finally:
-            annotation_lab.os.replace = saved_replace
-        warning_text = "\n".join(msg for _title, msg in warnings)
-        check(result is False and not infos
-              and open(json_path, "rb").read() != json_sentinel
-              and open(npz_path, "rb").read() == npz_sentinel,
-              "第二个 replace 失败：JSON 已替换、NPZ 保持 sentinel、整体返回 False")
-        check(os.path.basename(json_path) in warning_text
-              and os.path.basename(npz_path) in warning_text
-              and ("cross-file" in warning_text or "跨文件" in warning_text),
-              "partial replace warning 明列成功/失败目标并声明无跨文件原子性")
-
-        # fresh placeholder zero 只是 AI pending 的占位，不得落成可命中的全零 cache。
-        for target in (json_path, npz_path):
-            if os.path.exists(target):
-                os.unlink(target)
-        infos.clear(); warnings.clear()
-        v.volume_mask = np.zeros_like(v.volume_hu, dtype=np.uint8)
-        v._ai_state = 'running'
-        result = v.save_project()
-        check(result is True and os.path.exists(json_path) and not os.path.exists(npz_path),
-              "fresh placeholder zero + AI running：只保存 annotations，不制造零 NPZ")
-        placeholder_kickoffs = {'n': 0}
-        vp = m.MedicalViewer(); extra_viewers.append(vp); app.processEvents()
-        if vp.ai_thread: vp.ai_thread.cancel()
-        vp.persistence_dir = persistence_dir
-        vp._kickoff_ai = lambda: placeholder_kickoffs.__setitem__('n',
-                                                                  placeholder_kickoffs['n'] + 1)
-        vp.load_data(dicom_dir); app.processEvents()
-        check(placeholder_kickoffs['n'] == 1 and not getattr(
-                  vp, '_mask_cache_clear_requested', False),
-              "placeholder zero 重开仍 cache miss，不跳过 AI kickoff")
-
-        # 先持久化一份真实非零 cache，再由新 viewer 恢复，并通过真实清空入口确认 empty。
-        v.volume_mask = np.zeros_like(v.volume_hu, dtype=np.uint8)
-        v.volume_mask[0, 1:3, 1:3] = 5
-        infos.clear(); warnings.clear()
-        check(v.save_project() is True, "fixture 保存匹配当前 geometry 的非零 cache")
-        restored_kickoffs = {'n': 0}
-        vc = m.MedicalViewer(); extra_viewers.append(vc); app.processEvents()
-        if vc.ai_thread: vc.ai_thread.cancel()
-        vc.persistence_dir = persistence_dir
-        vc._kickoff_ai = lambda: restored_kickoffs.__setitem__('n', restored_kickoffs['n'] + 1)
-        vc.load_data(dicom_dir); app.processEvents()
-        check(bool(vc.volume_mask.any()) and restored_kickoffs['n'] == 0
-              and not getattr(vc, '_mask_cache_clear_requested', False),
-              "匹配的非零 cache 恢复成功，且恢复状态不是 pending clear")
-
-        class _RunningAI:
-            def __init__(self):
-                self.cancelled = False
-                self.resampled_from = None
-                self.used_fallback = False
-                self.confidence = None
-            def isRunning(self): return True
-            def cancel(self): self.cancelled = True
-
-        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
-        running = _RunningAI()
-        vc.ai_thread = running
-        vc._ai_state = 'running'
-        old_generation = vc._ai_generation
-        vc.clear_mask_and_annotations(); app.processEvents()
-        check(not vc.volume_mask.any()
-              and getattr(vc, '_mask_cache_clear_requested', False),
-              "真实全局清空入口把已有非零 mask 标为 explicit empty")
-        check(running.cancelled and vc._ai_generation > old_generation,
-              "explicit clear 取消并作废仍可能回调的旧 AI generation")
-        stale_mask = np.full_like(vc.volume_mask, 9, dtype=np.uint8)
-        vc.on_auto_ai_finished(stale_mask, 1.0, old_generation); app.processEvents()
-        check(not vc.volume_mask.any(), "explicit clear 后旧 AI callback 不能覆盖 empty mask")
-        vc.volume_mask.fill(0)  # 保持后续断言独立；正确实现上这是 no-op。
-
-        # load 失败不得清掉尚未持久化的 explicit-empty intent。
-        empty_dir = os.path.join(persistence_dir, "empty-load")
-        os.makedirs(empty_dir, exist_ok=True)
-        vc.load_data(empty_dir); app.processEvents()
-        check(getattr(vc, '_mask_cache_clear_requested', False),
-              "explicit clear 后 load 失败：pending clear intent 保留")
-
-        infos.clear(); warnings.clear()
-        result = vc.save_project()
-        with np.load(npz_path) as explicit_npz:
-            explicit_mask = explicit_npz['mask']
-            explicit_uid = str(explicit_npz['series_uid'].item())
-            explicit_fingerprint = str(explicit_npz['geometry_fingerprint'].item())
-        check(result is True and not explicit_mask.any()
-              and explicit_uid == actual_uid and explicit_fingerprint == actual_fingerprint,
-              "explicit empty 保存全零 NPZ，并绑定当前 UID/fingerprint")
-        check(not getattr(vc, '_mask_cache_clear_requested', True),
-              "explicit-empty 成功保存后清除 pending intent")
-
-        zero_kickoffs = {'n': 0}
-        vr = m.MedicalViewer(); extra_viewers.append(vr); app.processEvents()
-        if vr.ai_thread: vr.ai_thread.cancel()
-        vr.persistence_dir = persistence_dir
-        vr._kickoff_ai = lambda: zero_kickoffs.__setitem__('n', zero_kickoffs['n'] + 1)
-        vr.load_data(dicom_dir); app.processEvents()
-        check(not vr.volume_mask.any() and zero_kickoffs['n'] == 0,
-              "重载 explicit-empty cache 仍为全零，旧标签不复活且不重跑 AI")
-
-        # clear → Ctrl+Z 撤销恢复非零时，不能再把本次保存当作 explicit empty。
-        vr.volume_mask[1, 2:4, 2:4] = 7
-        undo_expected = vr.volume_mask.copy()
-        vr.clear_mask_and_annotations(); app.processEvents()
-        check(getattr(vr, '_mask_cache_clear_requested', False),
-              "再次 explicit clear 建立 pending intent")
-        vr._undo_mask_edit(); app.processEvents()
-        check(np.array_equal(vr.volume_mask, undo_expected)
-              and not getattr(vr, '_mask_cache_clear_requested', True),
-              "clear → Ctrl+Z 恢复非零 mask，并撤销 pending clear intent")
-        infos.clear(); warnings.clear()
-        check(vr.save_project() is True, "undo 后非零 mask 正常保存")
-        with np.load(npz_path) as undo_npz:
-            check(np.array_equal(undo_npz['mask'], undo_expected),
-                  "undo 后保存的是恢复的非零 mask，不是 explicit empty")
-
-        # None 与 fresh zero 都不是 explicit clear；wrong-shape zero 也必须先 fail closed。
-        none_dir = os.path.join(persistence_dir, "none-mask")
-        os.makedirs(none_dir, exist_ok=True)
-        v.persistence_dir = none_dir
-        v.volume_mask = None
-        infos.clear(); warnings.clear()
-        check(v.save_project() is True
-              and not os.path.exists(os.path.join(none_dir, "SAVE_ATOMIC_mask.npz")),
-              "volume_mask is None：只保存 annotations，不创建零 NPZ")
-
-        wrong_dir = os.path.join(persistence_dir, "wrong-shape")
-        os.makedirs(wrong_dir, exist_ok=True)
-        wrong_json = os.path.join(wrong_dir, "SAVE_ATOMIC_annotations.json")
-        wrong_npz = os.path.join(wrong_dir, "SAVE_ATOMIC_mask.npz")
-        with open(wrong_json, 'wb') as f: f.write(json_sentinel)
-        with open(wrong_npz, 'wb') as f: f.write(npz_sentinel)
-        v.persistence_dir = wrong_dir
-        v.volume_mask = np.zeros((1, 1, 1), dtype=np.uint8)
-        infos.clear(); warnings.clear()
-        result = v.save_project()
-        check(result is False and not infos and bool(warnings)
-              and open(wrong_json, 'rb').read() == json_sentinel
-              and open(wrong_npz, 'rb').read() == npz_sentinel,
-              "wrong-shape zero fail closed，既有 JSON/NPZ bytes 不变")
-
-        # explicit-empty 的 NPZ 序列化与最终替换失败都必须保留 intent，供用户重试。
-        failure_dir = os.path.join(persistence_dir, "explicit-failure")
-        os.makedirs(failure_dir, exist_ok=True)
-        failure_json = os.path.join(failure_dir, "SAVE_ATOMIC_annotations.json")
-        failure_npz = os.path.join(failure_dir, "SAVE_ATOMIC_mask.npz")
-        vr.persistence_dir = failure_dir
-        vr.volume_mask = undo_expected.copy()
-        vr.clear_mask_and_annotations(); app.processEvents()
-        with open(failure_json, 'wb') as f: f.write(json_sentinel)
-        with open(failure_npz, 'wb') as f: f.write(npz_sentinel)
-        infos.clear(); warnings.clear()
-        saved_savez = annotation_lab.np.savez_compressed
-        annotation_lab.np.savez_compressed = lambda *a, **k: (_ for _ in ()).throw(
-            OSError("injected explicit-empty NPZ serialization failure"))
-        try:
-            result = vr.save_project()
-        finally:
-            annotation_lab.np.savez_compressed = saved_savez
-        check(result is False and not infos and bool(warnings)
-              and open(failure_json, 'rb').read() == json_sentinel
-              and open(failure_npz, 'rb').read() == npz_sentinel
-              and getattr(vr, '_mask_cache_clear_requested', False),
-              "explicit-empty NPZ serialization failure：目标不变、无 success、intent 保留")
-
-        with open(failure_json, 'wb') as f: f.write(json_sentinel)
-        with open(failure_npz, 'wb') as f: f.write(npz_sentinel)
-        infos.clear(); warnings.clear()
-        saved_replace = annotation_lab.os.replace
-
-        def fail_explicit_npz_replace(src, dst):
-            if dst == failure_npz:
-                raise OSError("injected explicit-empty NPZ replace failure")
-            return saved_replace(src, dst)
-
-        annotation_lab.os.replace = fail_explicit_npz_replace
-        try:
-            result = vr.save_project()
-        finally:
-            annotation_lab.os.replace = saved_replace
-        check(result is False and not infos and bool(warnings)
-              and open(failure_json, 'rb').read() != json_sentinel
-              and open(failure_npz, 'rb').read() == npz_sentinel
-              and getattr(vr, '_mask_cache_clear_requested', False),
-              "explicit-empty NPZ replace failure：准确 partial failure、intent 保留")
-    finally:
-        QMessageBox.information = saved_information
-        QMessageBox.warning = saved_warning
-        QMessageBox.question = saved_question
-        for extra in extra_viewers:
-            if extra.ai_thread: extra.ai_thread.cancel()
-            extra.close()
-        if v is not None:
-            if v.ai_thread: v.ai_thread.cancel()
+            if fresh is not None:
+                fresh.close()
             v.close(); app.processEvents()
-        shutil.rmtree(dicom_dir, ignore_errors=True)
-        shutil.rmtree(persistence_dir, ignore_errors=True)
 
 
 def test_mixed_shape_dicom(app):
@@ -2135,7 +1911,7 @@ def test_mixed_shape_dicom(app):
     import tempfile
 
     from pydicom.uid import generate_uid
-    v2 = m.MedicalViewer(); app.processEvents()
+    v2 = m.MedicalViewer(autosave=False); app.processEvents()
     if v2.ai_thread:
         v2.ai_thread.cancel()
     sid = generate_uid()
@@ -3722,6 +3498,44 @@ def test_recon_pipeline_helpers():
     check(R.upscale_recon(same, 256) is same, "n=256 时 scale=1，原数组原样返回（不复制）")
 
 
+def test_patient_annotation_render_recovery(app):
+    """坏条目不拖垮三面刷新，且同组有效患者空间标注仍可显示。"""
+    import tempfile
+    from copy import deepcopy
+
+    import mpr_geometry
+
+    with tempfile.TemporaryDirectory() as directory:
+        _project_document_fixture(directory)
+        v = m.MedicalViewer(project_dir=directory, autosave=False)
+        v.persistence_dir = directory
+        v._kickoff_ai = lambda: None
+        try:
+            v.load_data(directory); app.processEvents()
+            test_malformed_annotations(v, app)
+            mapping = v.views[1]['patient_plane']
+            valid = mpr_geometry.bind_annotation(
+                {'id': 'valid-spatial', 'type': 'ruler', 'p1': [1., 1.], 'p2': [3., 2.]},
+                mapping, v.current_3d_pos, AXIAL)
+            malformed = [None, 'bad', 7, {}, {'space': None}, {'space': []}]
+            for points in ([], [1, 2, 3], [[1, 2]], [[float('nan'), 1, 2]]):
+                bad = deepcopy(valid); bad['space']['points_lps'] = points
+                malformed.append(bad)
+            v.global_annotations = {'all': [], 'bad-container': None,
+                                    'objects': malformed + [valid]}
+            error = None
+            try:
+                v.update_display(); app.processEvents()
+            except Exception as exc:
+                error = repr(exc)
+            check(error is None and any(item.toolTip() == 'valid-spatial'
+                                       for item in v.views[1]['view'].scene.items()),
+                  f'畸形患者空间标注被逐条跳过，后续有效标注仍显示（error={error}）')
+        finally:
+            v.global_annotations = {'all': []}
+            v.close(); app.processEvents()
+
+
 def test_malformed_annotations(v, app):
     """畸形/旧版本标注：渲染时逐条兜底不崩；加载 JSON 时过滤掉不合规条目。"""
     print("[畸形标注容错]")
@@ -3750,6 +3564,7 @@ def test_malformed_annotations(v, app):
 
     # 2) 加载层过滤：临时 JSON 落盘 -> _load_annotations_json 只留合规条目
     import tempfile
+    old_directory = v.persistence_dir
     ED = tempfile.mkdtemp(); v.persistence_dir = ED
     pid = "ANNOFILTER_TEST"
     fp = os.path.join(ED, f"{pid}_annotations.json")
@@ -3766,13 +3581,18 @@ def test_malformed_annotations(v, app):
         with open(fp, 'w', encoding='utf-8') as f:
             json.dump(data, f)
         v.global_annotations = {'all': []}
-        v._load_annotations_json(pid)
+        from unittest.mock import patch
+        with patch.object(QMessageBox, 'information') as report:
+            v._load_annotations_json(pid)
+        check(report.called and fp in str(report.call_args),
+              '旧格式存在无法转换的条目时向用户报告，并给出保留原文件的位置')
         ids = sorted(a.get('id') for a in v.global_annotations.get('all', []))
-        ok = ids == ['g1', 'g2'] and v.global_annotations.get(7) == []
+        ok = ids == ['g1', 'g2'] and v.global_annotations.get(7, []) == []
         check(ok, f"加载期过滤畸形标注 -> 保留 {ids}")
     finally:
         import shutil
         shutil.rmtree(ED, ignore_errors=True)
+        v.persistence_dir = old_directory
         v.global_annotations = saved
 
 
@@ -3807,7 +3627,7 @@ def test_ai_failure_visible(app):
         # 不能改 ai_engine.MODEL_PATH 来绕过 ONNX：它是 __init__ 的默认参数值，
         # 在函数定义时就已绑定，改模块变量对已定义的签名无效（本测试初版即栽在这）。
         ai_engine.AutoAIEngineThread._run_onnx_multiorgan = boom_onnx
-        vf = m.MedicalViewer(); app.processEvents()
+        vf = m.MedicalViewer(autosave=False); app.processEvents()
         if vf.ai_thread: vf.ai_thread.cancel()
         vf.volume_hu = np.random.RandomState(0).randint(-1000, 400, (6, 48, 48)).astype(np.int16)
         vf.dicom_datasets = [None] * 6
@@ -3838,7 +3658,7 @@ def test_close_cancels_ai(app):
     """关窗须取消仍在运行的后台 AI 推理并停止 Cine，避免内存滞留与回调到已拆除窗口。"""
     print("[关窗收尾]")
     from PySide6.QtGui import QCloseEvent
-    vc = m.MedicalViewer(); app.processEvents()
+    vc = m.MedicalViewer(autosave=False); app.processEvents()
     if vc.ai_thread:
         vc.ai_thread.cancel()
 
@@ -3863,7 +3683,7 @@ def test_malformed_pixels(app):
     import tempfile
 
     from pydicom.uid import generate_uid
-    vm = m.MedicalViewer(); app.processEvents()
+    vm = m.MedicalViewer(autosave=False); app.processEvents()
     if vm.ai_thread:
         vm.ai_thread.cancel()
 
@@ -3969,7 +3789,7 @@ def test_nonfinite_dicom_tags(app):
     import tempfile
 
     import recon as R
-    vn = m.MedicalViewer(); app.processEvents()
+    vn = m.MedicalViewer(autosave=False); app.processEvents()
     if vn.ai_thread: vn.ai_thread.cancel()
 
     # 1) _dcm_float 本身：NaN / ±Inf 一律退回 default
@@ -4022,7 +3842,7 @@ def test_empty_dicom_tags(app):
     import tempfile
 
     from pydicom.uid import generate_uid
-    ve = m.MedicalViewer(); app.processEvents()
+    ve = m.MedicalViewer(autosave=False); app.processEvents()
     if ve.ai_thread:
         ve.ai_thread.cancel()
     sid = generate_uid()
@@ -4050,70 +3870,36 @@ def test_empty_dicom_tags(app):
 
 
 def test_export_path_safety(app):
-    """PatientID 含 '/' 或 '..' 时：不得路径穿越写到导出目录之外；净化后存取仍往返一致。"""
-    print("[导出文件名路径安全]")
-    import glob
-    import shutil
+    """显式导出仍净化 PatientID；工程名按 Study 哈希，不将患者文本拼入路径。"""
+    import hashlib
     import tempfile
+    from pathlib import Path
 
-    from PySide6.QtWidgets import QMessageBox
-    ED = tempfile.mkdtemp()
-    # 净化器单元：普通 ID 不变（不破坏既有文件），危险字符被中和
-    su = m.MedicalViewer._safe_name
-    check(su("12345") == "12345" and su("RIDER-1234") == "RIDER-1234", "普通 PatientID 不被改动")
-    check("/" not in su("A/B") and su("..") == "Unknown" and su("") == "Unknown", "斜杠/纯点/空被中和")
+    from pydicom.uid import generate_uid
 
-    vp = m.MedicalViewer(); app.processEvents()
-    vp.persistence_dir = ED; vp.export_dir = ED
-    if vp.ai_thread:
-        vp.ai_thread.cancel()
-
-    class _DS:
-        # SeriesInstanceUID 在真实 DICOM 中是 Type 1 必填；蒙版缓存据它校验序列身份
-        # （防止把同患者另一序列的蒙版张冠李戴），故此桩必须带上才具代表性。
-        def __init__(self, pid, index,
-                     uid="1.2.826.0.1.3680043.2.1125.1.314159"):
-            self.PatientID = pid; self.PatientName = pid; self.SeriesInstanceUID = uid
-            self.SOPInstanceUID = f"{uid}.{index + 1}"
-            self.ImageOrientationPatient = (1, 0, 0, 0, 1, 0)
-            self.ImagePositionPatient = (0, 0, index)
-            self.PixelSpacing = (1, 1)
-
-    def datasets(pid):
-        return [_DS(pid, index) for index in range(3)]
-
-    made = []
-    saved_information = QMessageBox.information
-    saved_warning = QMessageBox.warning
-    try:
-        QMessageBox.information = staticmethod(lambda *a, **k: None)
-        QMessageBox.warning = staticmethod(lambda *a, **k: None)
-        # 1) 路径穿越封堵
-        esc = os.path.abspath(os.path.join(ED, "..", "PWNED_annotations.json"))
-        before = os.path.exists(esc)
-        vp.dicom_datasets = datasets("../PWNED")
-        vp.volume_hu = np.zeros((3, 8, 8), np.float32)
-        vp.global_annotations = {'all': [{'id': 'x', 'type': 'ruler', 'p1': (1, 1), 'p2': (2, 2)}]}
-        vp.volume_mask = np.ones((3, 8, 8), np.uint8)
-        saved = vp.save_project()
-        made += glob.glob(os.path.join(ED, "_PWNED_*"))
-        check(saved and not (os.path.exists(esc) and not before),
-              "路径穿越被封堵，且有效 project 写入安全目录")
-
-        # 2) 斜杠 PatientID 始终映射到安全的同一 basename（往返由专门 cache test 覆盖）
-        vp.dicom_datasets = datasets("PID/WITH/SLASH")
-        vp.volume_hu = np.zeros((3, 8, 8), np.float32)
-        vp.global_annotations = {'all': [{'id': 'rt', 'type': 'ruler', 'p1': (1, 1), 'p2': (5, 5)}]}
-        vp.volume_mask = np.ones((3, 8, 8), np.uint8) * 7
-        saved = vp.save_project()
-        made += glob.glob(os.path.join(ED, "PID_WITH_SLASH_*"))
-        check(saved and any(os.path.basename(f).startswith("PID_WITH_SLASH_") for f in made),
-              "斜杠 PatientID 只在临时目录生成净化后的安全 basename")
-    finally:
-        QMessageBox.information = saved_information
-        QMessageBox.warning = saved_warning
-        shutil.rmtree(ED, ignore_errors=True)
-        vp.close(); app.processEvents()
+    print('[导出与工程文件名路径安全]')
+    safe = m.MedicalViewer._safe_name
+    check(safe('12345') == '12345' and safe('RIDER-1234') == 'RIDER-1234', '普通 PatientID 导出净化不改变合法文本')
+    check('/' not in safe('A/B') and safe('..') == 'Unknown' and safe('') == 'Unknown',
+          '显式导出净化斜杠/纯点/空 PatientID')
+    with tempfile.TemporaryDirectory() as directory:
+        destination = Path(directory) / 'projects'
+        v = m.MedicalViewer(project_dir=str(destination), autosave=False); v._kickoff_ai = lambda: None
+        try:
+            for index, pid in enumerate(('../PWNED', 'PID/WITH/SLASH')):
+                source = Path(directory) / str(index); source.mkdir(); sid = generate_uid()
+                for z in range(3):
+                    _write_min_dcm(str(source / f'{z}.dcm'), (8, 8), sid, z, z + 1, pid=pid)
+                v.load_data(str(source))
+                v.study_document.edit_mask(sid, [2], 5); v._sync_committed_edit()
+                saved = v.save_project()
+                path = Path(v.study_document.project_path)
+                check(saved and path.parent == destination
+                      and path.name == hashlib.sha256(sid.encode()).hexdigest() + '.miwproj'
+                      and 'PWNED' not in path.name and 'PID' not in path.name,
+                      f'PatientID={pid} 只能写入指定目录的 Study 哈希工程名')
+        finally:
+            v.close(); app.processEvents()
 
 
 def test_dicom_sort_consistency(app):
@@ -4123,7 +3909,7 @@ def test_dicom_sort_consistency(app):
     import tempfile
 
     from pydicom.uid import generate_uid
-    vs = m.MedicalViewer(); app.processEvents()
+    vs = m.MedicalViewer(autosave=False); app.processEvents()
     if vs.ai_thread:
         vs.ai_thread.cancel()
     sid = generate_uid()
@@ -4203,7 +3989,7 @@ def test_dialog_i18n_coverage(app):
     _QMB.information = staticmethod(lambda p, t, msg='', *a, **k: seen.append((t, msg)))
     vi = None
     try:
-        vi = m.MedicalViewer(); app.processEvents()
+        vi = m.MedicalViewer(autosave=False); app.processEvents()
         if vi.ai_thread: vi.ai_thread.cancel()
         vi.volume_hu = np.zeros((4, 32, 32), np.float32)
         vi.dicom_datasets = [None] * 4
@@ -4234,7 +4020,7 @@ def test_i18n_persistent(app):
 
     from PySide6.QtWidgets import QCheckBox, QComboBox, QGroupBox, QLabel, QPushButton
     CJK = re.compile(r'[一-鿿]')
-    vi = m.MedicalViewer(); app.processEvents()
+    vi = m.MedicalViewer(autosave=False); app.processEvents()
     if vi.ai_thread:
         vi.ai_thread.cancel()
     # 排除：语言按钮（英文态故意显示"中"表示可切回）+ 四个视图标题（瞬态/受模式渲染控制）
@@ -4791,7 +4577,7 @@ def test_dicom_landmark_orientation(app):
                 pixels[1, 8] = 1000  # superior + anterior + patient-left 的不对称 landmark
             _write_min_dcm(os.path.join(root, f"s{z}.dcm"), (rows, cols), sid,
                            ipp_z=z, inst=z + 1, slope=1, intercept=0, pixels=pixels)
-        v = m.MedicalViewer(); app.processEvents()
+        v = m.MedicalViewer(autosave=False); app.processEvents()
         v._kickoff_ai = lambda: None
         v.load_data(root); app.processEvents()
         vid = min(v.views)
@@ -5273,7 +5059,7 @@ def test_mpr_linkage(app):
     from constants import SAGITTAL
     vi = None
     try:
-        vi = m.MedicalViewer(); app.processEvents()
+        vi = m.MedicalViewer(autosave=False); app.processEvents()
         if vi.ai_thread: vi.ai_thread.cancel()
         Z, H, W = 10, 30, 40
         vi.volume_hu = np.zeros((Z, H, W), np.float32)
@@ -5354,7 +5140,7 @@ def test_panel_scroll(app):
     from PySide6.QtWidgets import QScrollArea
     vi = None
     try:
-        vi = m.MedicalViewer(); vi.setFixedHeight(900); vi.resize(1600, 900); vi.show()
+        vi = m.MedicalViewer(autosave=False); vi.setFixedHeight(900); vi.resize(1600, 900); vi.show()
         app.processEvents()
         if vi.ai_thread: vi.ai_thread.cancel()
         Z, H, W = 30, 128, 128
@@ -5426,7 +5212,7 @@ def test_compare_entry(app):
     QMessageBox.warning = staticmethod(lambda *a, **k: box.__setitem__('warn', box['warn'] + 1))
     vi, tmp = None, tempfile.mkdtemp()
     try:
-        vi = m.MedicalViewer(); app.processEvents()
+        vi = m.MedicalViewer(autosave=False); app.processEvents()
         if vi.ai_thread: vi.ai_thread.cancel()
 
         # 1) 还没有主序列就点「加载对比序列」
@@ -5519,7 +5305,7 @@ def test_crop_and_legend(app):
     vi, tmp = None, tempfile.mkdtemp()
     saved_q, saved_s, saved_w = QMessageBox.question, QFileDialog.getSaveFileName, QMessageBox.warning
     try:
-        vi = m.MedicalViewer(); app.processEvents()
+        vi = m.MedicalViewer(autosave=False); app.processEvents()
         if vi.ai_thread: vi.ai_thread.cancel()
         Z, H, W = 6, 40, 40
         vi.volume_hu = np.full((Z, H, W), -900.0, np.float32)
@@ -5688,7 +5474,7 @@ def test_matrix_recon_ui(app):
     import unittest.mock as _mock
     vi = None
     try:
-        vi = m.MedicalViewer(); app.processEvents()
+        vi = m.MedicalViewer(autosave=False); app.processEvents()
         if vi.ai_thread: vi.ai_thread.cancel()
         vi.tabs.setCurrentIndex(1); app.processEvents()
 
@@ -5785,7 +5571,7 @@ def test_probe_hu(app):
     from constants import SAGITTAL, TOOL_POINTER
     vi = None
     try:
-        vi = m.MedicalViewer(); app.processEvents()
+        vi = m.MedicalViewer(autosave=False); app.processEvents()
         if vi.ai_thread: vi.ai_thread.cancel()
         Z, H, W = 8, 32, 32
         vi.volume_hu = np.arange(Z * H * W, dtype=np.float32).reshape(Z, H, W)
@@ -5836,7 +5622,7 @@ def test_wheel_and_cine(app):
     from constants import SAGITTAL
     vi = None
     try:
-        vi = m.MedicalViewer(); app.processEvents()
+        vi = m.MedicalViewer(autosave=False); app.processEvents()
         if vi.ai_thread: vi.ai_thread.cancel()
         Z, H, W = 10, 24, 28
         vi.volume_hu = np.zeros((Z, H, W), np.float32)
@@ -6074,7 +5860,7 @@ def test_phantom_recon_flow(app):
     print("[空载模体重建链路]")
     vi = None
     try:
-        vi = m.MedicalViewer(); app.processEvents()
+        vi = m.MedicalViewer(autosave=False); app.processEvents()
         if vi.ai_thread: vi.ai_thread.cancel()
         check(vi.volume_hu is None, "空载启动，无任何数据")
         vi.tabs.setCurrentIndex(1); app.processEvents()
@@ -6243,7 +6029,7 @@ def test_zero_grade_guards(app, m):
 
     from constants import AXIAL, CORONAL
 
-    v = m.MedicalViewer(); app.processEvents()
+    v = m.MedicalViewer(autosave=False); app.processEvents()
     if v.ai_thread:
         v.ai_thread.cancel()
 
@@ -6654,8 +6440,8 @@ def test_doc_code_consistency():
     listed = re.findall(r'^([a-z_0-9]+)\.py\s{2,}', block, re.M)
     listed = [m for m in listed if m != 'constants']          # 常量表不算计算模块
     check(len(listed) >= 5, f"模块清单解析出 {len(listed)} 条（<5 说明是本测试的定位写错了）")
-    words = {'eight': 8, 'nine': 9, 'ten': 10, 'eleven': 11}
-    claimed = next((v for w, v in words.items() if f'{w} Qt-free' in arch), None)
+    count_match = re.search(r'\b(\d+) Qt-free compute modules', arch)
+    claimed = int(count_match.group(1)) if count_match else None
 
     def inventory_errors(declared_modules, listed_modules, claimed_count):
         errors = []
@@ -6673,7 +6459,7 @@ def test_doc_code_consistency():
     inventory_bad = inventory_errors(declared, listed, claimed)
     check(not inventory_bad,
           f"pyproject/root imports/ARCHITECTURE inventory 一致（问题: {inventory_bad or '无'}）")
-    check(len(declared) == 20 and len(qt_free_compute) == 11,
+    check(len(declared) == len(actual) and len(qt_free_compute) == claimed,
           f"当前 candidate inventory：{len(declared)} top-level modules / "
           f"{len(qt_free_compute)} Qt-free compute modules")
 
@@ -6877,7 +6663,7 @@ def test_mask_nondestructive(app):
     _QMB.question = staticmethod(_fake_q)
     vi = None
     try:
-        vi = m.MedicalViewer(); app.processEvents()
+        vi = m.MedicalViewer(autosave=False); app.processEvents()
         if vi.ai_thread: vi.ai_thread.cancel()
         Z, H, W = 10, 48, 48
         vol = np.random.RandomState(0).uniform(-1000, -900, (Z, H, W)).astype(np.float32)
@@ -6932,6 +6718,7 @@ def test_mask_cache_roundtrip(app):
     """mask/annotation 只在 geometry fingerprint 一致时恢复，所有 I/O 位于临时目录。"""
     print("[mask/annotation cache fingerprint save→reload]")
     import glob
+    import json
     import shutil
     import tempfile
 
@@ -6949,7 +6736,7 @@ def test_mask_cache_roundtrip(app):
     uid_a, uid_b = generate_uid(), generate_uid()
     da, db, dc = _mkdir_series(uid_a), _mkdir_series(uid_b), _mkdir_series(uid_a)
     try:
-        vc = m.MedicalViewer(); app.processEvents()
+        vc = m.MedicalViewer(autosave=False); app.processEvents()
         vc.persistence_dir = ed
         vc._kickoff_ai = lambda: None
         if vc.ai_thread:
@@ -6962,11 +6749,27 @@ def test_mask_cache_roundtrip(app):
         vc.volume_mask[0, :4, :4] = 5          # 标记为器官5，便于区分
         vc.global_annotations = {0: [{'id': 'a0', 'type': 'ruler',
                                       'p1': [1, 1], 'p2': [4, 4]}], 'all': []}
+        # 旧格式由显式合成夹具建立；产品仅允许读取迁移，不能再用旧 writer 制造它。
+        legacy_mask = os.path.join(ed, f'{pid}_mask.npz')
+        legacy_json = os.path.join(ed, f'{pid}_annotations.json')
+        import annotation_lab as _al
+        np.savez_compressed(legacy_mask, mask=vc.volume_mask, series_uid=np.array(uid_a),
+                            geometry_fingerprint=np.array(vc._current_geometry_fingerprint()),
+                            axis_contract=np.array(_al.MASK_AXIS_CONTRACT))
+        with open(legacy_json, 'w') as stream:
+            json.dump({'__meta__': {'series_uid': uid_a, 'geometry_fingerprint': vc._current_geometry_fingerprint()},
+                       **vc.global_annotations}, stream)
+        with open(legacy_mask, 'rb') as stream: original_mask = stream.read()
+        with open(legacy_json, 'rb') as stream: original_json = stream.read()
+        vc._load_saved_mask(pid)
         vc.save_project()
-        made = glob.glob(os.path.join(ed, f"{pid}_*"))
-        check(any(f.endswith("_mask.npz") for f in made)
-              and any(f.endswith("_annotations.json") for f in made),
-              "save_project 仅在临时 persistence_dir 落盘 mask + annotation")
+        made = glob.glob(os.path.join(ed, 'projects', '*.miwproj'))
+        check(len(made) == 1 and open(legacy_mask, 'rb').read() == original_mask
+              and open(legacy_json, 'rb').read() == original_json,
+              '旧缓存只读迁移到新工程包，原 JSON/NPZ 保持逐字节不变')
+        check(vc.study_document.series[uid_a].layers['working-organs'].provenance['origin'] == 'legacy-unknown'
+              and not any(layer.readonly for layer in vc.study_document.series[uid_a].layers.values()),
+              '旧 mask 只作为生成/修改来源未知的工作结果，不伪造原始 AI 层')
 
         # 重开序列 A（同 UID 同 shape）→ 应恢复
         vc.volume_mask = None
@@ -6978,12 +6781,21 @@ def test_mask_cache_roundtrip(app):
               "同 UID/shape/fingerprint → slice-indexed annotation 恢复")
 
         # 同 UID/shape，但 SOP→slice identity 不同：必须由 fingerprint 拒绝。
+        previous_source, previous_doc = vc._active_source, vc.study_document
         vc.load_data(dc); app.processEvents()
-        vc.volume_mask = None; vc.global_annotations = {'all': []}
-        check(not vc._load_saved_mask(pid), "同 UID/shape、不同 ordered SOP fingerprint → mask 拒绝")
-        vc._load_annotations_json(pid)
-        check(vc.global_annotations == {'all': []},
-              "同 UID/shape、不同 ordered SOP fingerprint → annotation 拒绝")
+        check(vc._active_source is previous_source and vc.study_document is previous_doc,
+              '同检查来源身份冲突：拒绝替换当前文档，保留已有来源')
+        fresh = m.MedicalViewer(autosave=False, project_dir=os.path.join(ed, 'unmatched'))
+        fresh.persistence_dir = ed; fresh._kickoff_ai = lambda: None
+        try:
+            fresh.load_data(dc)
+            check(not fresh._load_saved_mask(pid),
+                  "独立载入同 UID/shape、不同 ordered SOP fingerprint → mask 拒绝")
+            fresh._load_annotations_json(pid)
+            check(fresh.global_annotations == {'all': []},
+                  "独立载入同 UID/shape、不同 ordered SOP fingerprint → annotation 拒绝")
+        finally:
+            fresh.close(); app.processEvents()
 
         # 切到序列 B（同 PatientID、同 shape、不同 SeriesInstanceUID）→ 必须拒绝
         vc.load_data(db); app.processEvents()
@@ -7032,7 +6844,7 @@ def test_hu_conversion(app):
     import tempfile
 
     from pydicom.uid import generate_uid
-    vh = m.MedicalViewer(); app.processEvents()
+    vh = m.MedicalViewer(autosave=False); app.processEvents()
     if vh.ai_thread:
         vh.ai_thread.cancel()
     # (像素值, slope, intercept, 期望 HU)
@@ -7404,7 +7216,7 @@ def test_mesh_dialog_text_is_readable(app):
         hi, lo = max(a, b), min(a, b)
         return (hi + 0.05) / (lo + 0.05)
 
-    v = m.MedicalViewer()
+    v = m.MedicalViewer(autosave=False)
     app.processEvents()
     # 合成一个小立方体作为「器官」，只为让弹窗能被真实构造出来
     vol = np.zeros((12, 12, 12), dtype=np.uint8)
@@ -7493,7 +7305,7 @@ def test_annotation_text_does_not_scale_with_zoom(app):
         for i in range(3):
             _write_min_dcm(os.path.join(root, f"s{i}.dcm"), (256, 256), sid,
                            ipp_z=i, inst=i + 1, pix=1100, slope=1, intercept=-1024)
-        v = m.MedicalViewer()
+        v = m.MedicalViewer(autosave=False)
         v.resize(900, 700)
         v.show()
         v.load_data(root)
@@ -7727,7 +7539,7 @@ def test_mesh_patient_directions(app):
           "俯仰改变观察方向，而不是只在屏幕内旋转")
     vol = np.zeros((12, 26, 42), np.uint8); vol[1:11, 1:25, 1:41] = 5
     verts, faces = mesh3d.extract_surface(vol, 5, (1, 1, 1), step=1, smooth=0, decimate_grid=0)
-    viewer = m.MedicalViewer(); viewer._organ_stats = [{'id': 5, 'name_zh': '长方体', 'name_en': 'Cuboid'}]
+    viewer = m.MedicalViewer(autosave=False); viewer._organ_stats = [{'id': 5, 'name_zh': '长方体', 'name_en': 'Cuboid'}]
     ratios = {}
     def inspect():
         dlg = app.activeModalWidget(); mv = dlg.findChild(MeshView)
@@ -7768,7 +7580,7 @@ def test_compare_physical_grid_chain(app):
                 _write_min_dcm(fp, (9, 13), sid, z * 2.5, z + 1,
                                pixels=np.arange(117).reshape(9, 13) + 1024)
                 ds = m.pydicom.dcmread(fp); ds.PixelSpacing = list(spacing); ds.save_as(fp)
-        v = m.MedicalViewer(); v._kickoff_ai = lambda: None
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
         try:
             v.load_data(paths[0]); v.show(); v.combo_layout.setCurrentIndex(2)
             v.views[1]['cb_plane'].setCurrentIndex(SAGITTAL)
@@ -7828,7 +7640,7 @@ def test_spatial_landmark_roundtrips(app):
                 _write_min_dcm(os.path.join(data, f'{Z - z}.dcm'), (H, W), sid,
                     100 + z * dz, Z - int(z), slope=1, intercept=0,
                     pixel_spacing=(row, col), pixels=truth[z])
-            v = m.MedicalViewer(); kickoffs = []; v._kickoff_ai = lambda calls=kickoffs: calls.append(True)
+            v = m.MedicalViewer(autosave=False); kickoffs = []; v._kickoff_ai = lambda calls=kickoffs: calls.append(True)
             v.persistence_dir = cache; v.export_dir = cache
             try:
                 v.resize(1200 + seed * 80, 800); v.show(); v.load_data(data)
@@ -7881,9 +7693,19 @@ def test_spatial_landmark_roundtrips(app):
                 for filename in os.listdir(data):
                     fp = os.path.join(data, filename); ds = m.pydicom.dcmread(fp)
                     ds.PixelSpacing = [row * 1.1, col]; ds.save_as(fp)
+                previous_source, previous_doc = v._active_source, v.study_document
                 v.load_data(data)
-                check(not v.volume_mask.any() and not any(v.global_annotations.values()),
-                      f"seed {seed} UID/shape 不变但物理间距改变时拒绝旧蒙版和标注")
+                check(v._active_source is previous_source and v.study_document is previous_doc
+                      and np.array_equal(v.volume_mask, mask),
+                      f'seed {seed} 同检查空间冲突拒绝替换，旧工程未被清空')
+                fresh = m.MedicalViewer(autosave=False); fresh.persistence_dir = cache; fresh._kickoff_ai = lambda: None
+                try:
+                    fresh.load_data(data)
+                    check(fresh.study_document is None and fresh.volume_mask is None
+                          and not any(fresh.global_annotations.values()),
+                          f"seed {seed} 独立载入 UID/shape 不变但 spacing 变化时拒绝旧缓存")
+                finally:
+                    fresh.close(); app.processEvents()
             finally:
                 v.close(); app.processEvents()
 
@@ -7898,7 +7720,7 @@ def test_signed_dicom_orientation_chain(app):
     failures = []
     count = 0
     with tempfile.TemporaryDirectory() as root:
-        v = m.MedicalViewer(); calls = []; v._kickoff_ai = lambda: calls.append(True)
+        v = m.MedicalViewer(autosave=False); calls = []; v._kickoff_ai = lambda: calls.append(True)
         v.persistence_dir = root
         try:
             for col_axis in basis:
@@ -7917,7 +7739,7 @@ def test_signed_dicom_orientation_chain(app):
                             and v.volume_hu.shape == (4, 5, 7)
                             and np.isclose(v._slice_spacing(), 2.3)
                             and v.canonical_orientation == canonical
-                            and v.btn_mpr.isEnabled() == canonical
+                            and v.btn_mpr.isEnabled()
                             and bool(calls) == canonical):
                         failures.append(iop.tolist())
                     count += 1
@@ -7927,8 +7749,2371 @@ def test_signed_dicom_orientation_chain(app):
             v.close(); app.processEvents()
 
 
+def test_series_source_binding():
+    """原始来源身份不依赖患者几何；像素/帧身份变更不能恢复同一编辑网格。"""
+    import tempfile
+
+    import pydicom
+    from pydicom.uid import MRImageStorage, generate_uid
+
+    from study_data import SeriesVolume
+
+    print('[Study 来源绑定：无几何仍有可保存的原位网格]')
+    with tempfile.TemporaryDirectory() as directory:
+        study, series = generate_uid(), generate_uid()
+        frames = []
+        for i in range(3):
+            path = os.path.join(directory, f'{i}.dcm')
+            _write_min_dcm(path, (5, 7), series, i, i + 1,
+                           modality='MR', sop_class_uid=MRImageStorage, pix=100 + i)
+            ds = pydicom.dcmread(path); ds.StudyInstanceUID = study
+            frames.append(ds)
+        baseline = SeriesVolume.from_datasets(frames)
+        check(baseline.source_binding is not None and baseline.affine is not None,
+              '完整 MRI 来源与患者空间分别可证')
+        check(not baseline.geometry.hu_calibrated and baseline.intensity_unit == 'stored'
+              and np.all(baseline.volume[:, 0, 0] == [100, 101, 102]),
+              'MRI 即使携带 CT 风格 rescale 标签也不生成伪 HU')
+        for name in ('ImageOrientationPatient', 'ImagePositionPatient', 'PixelSpacing'):
+            from copy import deepcopy
+            missing = deepcopy(frames)
+            delattr(missing[0], name)
+            loaded = SeriesVolume.from_datasets(missing)
+            check(loaded.source_binding == baseline.source_binding and loaded.affine is None,
+                  f'缺 {name}：保留相同原位来源绑定，关闭患者空间')
+        changed = deepcopy(frames)
+        changed[0].PixelData = (np.full((5, 7), 999, dtype=np.int16)).tobytes()
+        check(SeriesVolume.from_datasets(changed).source_binding != baseline.source_binding,
+              '相同 UID/shape、不同像素不能匹配旧工程')
+        changed = deepcopy(frames); changed[1].SOPInstanceUID = changed[0].SOPInstanceUID
+        check(SeriesVolume.from_datasets(changed).source_binding is None,
+              '重复 SOP 身份在编辑前拒绝建立来源绑定')
+
+
+def test_study_candidate_loading():
+    """只读候选保留各模态/序列，失败候选不污染已经读出的影像。"""
+    import tempfile
+
+    import pydicom
+    from pydicom.uid import CTImageStorage, MRImageStorage, generate_uid
+
+    from study_data import read_series_directory
+
+    print('[Study 读取事务：多序列候选互相隔离]')
+    with tempfile.TemporaryDirectory() as directory:
+        study, ct, mr = generate_uid(), generate_uid(), generate_uid()
+        for series, modality, sop in ((ct, 'CT', CTImageStorage), (mr, 'MR', MRImageStorage)):
+            for i in range(3):
+                path = os.path.join(directory, f'{modality}{i}.dcm')
+                _write_min_dcm(path, (5, 7), series, i, i + 1, modality=modality,
+                               sop_class_uid=sop, pix=200 + i)
+                ds = pydicom.dcmread(path); ds.StudyInstanceUID = study; ds.save_as(path)
+        candidate = read_series_directory(directory)
+        check(len(candidate.series) == 2 and {s.modality for s in candidate.series} == {'CT', 'MR'},
+              '同 Study 的 CT/MR 分别解码，保留全部序列')
+        check(all(s.study_uid == study and s.source_binding for s in candidate.series),
+              '候选保留可验证的检查/序列来源')
+        previous = [s.volume.copy() for s in candidate.series]
+        with tempfile.TemporaryDirectory() as empty:
+            failed = read_series_directory(empty)
+        check(not failed.series and bool(failed.warnings), '空目录失败有明确原因')
+        check(all(np.array_equal(s.volume, before)
+                  for s, before in zip(candidate.series, previous, strict=True)),
+              '后续读取失败不修改之前的候选体积')
+
+
+def test_patient_plane_sampler():
+    """显示采样与点击命中共用 LPS 变换，验证不对称数据和边界。"""
+    import mpr_geometry as mg
+
+    print('[患者平面采样：显示/标签/命中共用变换]')
+    shape = (5, 7, 9)
+    volume = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    affine = np.diag([2., 3., 4., 1.]); affine[:3, 3] = [-10, 20, 30]
+    target = (3, 2, 6)
+    for plane in (AXIAL, CORONAL, SAGITTAL):
+        mapping = mg.patient_plane(affine, shape, plane, target)
+        x, y, distance = mapping.voxel_to_scene(target)
+        rendered = mapping.sample(volume)
+        check(mapping.scene_to_voxel(x, y) == target and abs(distance) < 1e-8,
+              f'plane={plane} 已知来源体素往返一致')
+        check(abs(float(rendered[round(y), round(x)]) - volume[target]) < 1e-5,
+              f'plane={plane} 图像采样显示同一体素')
+        check(mapping.scene_to_voxel(-100, -100) is None,
+              f'plane={plane} 视图外坐标拒绝，不裁剪到边缘')
+    a = mg.patient_plane(affine, shape, AXIAL, target)
+    check(a.scene_to_voxel(-0.5, 0) == (3, 0, 0)
+          and a.scene_to_voxel(8.5, 0) is None
+          and a.scene_to_voxel(-0.5001, 0) is None,
+          '单体素命中严格遵循 [-0.5, size-0.5) 半开区间')
+    theta = np.deg2rad(25)
+    rotation = np.array([[np.cos(theta), 0, np.sin(theta)],
+                         [0, 1, 0], [-np.sin(theta), 0, np.cos(theta)]])
+    affine[:3, :3] = rotation @ affine[:3, :3]
+    for plane in (AXIAL, CORONAL, SAGITTAL):
+        mapping = mg.patient_plane(affine, shape, plane, target)
+        x, y, distance = mapping.voxel_to_scene(target)
+        check(mapping.scene_to_voxel(x, y) == target and abs(distance) < 1e-8,
+              f'斜采集 plane={plane} 使用患者空间，来源位置往返正确')
+        labels = np.zeros(shape, dtype=np.uint16); labels[target] = 321
+        sampled = mapping.sample(labels, labels=True)
+        check(set(np.unique(sampled)) <= {0, 321},
+              f'斜采集 plane={plane} 标签采样不会制造插值类别')
+
+
+def test_multiseries_viewer_loading(app):
+    """从加载和序列下拉入口验证 MRI、切换及失败事务；不运行推理。"""
+    import tempfile
+
+    import pydicom
+    from pydicom.uid import CTImageStorage, MRImageStorage, generate_uid
+
+    print('[多序列产品入口：CT/MRI 切换与对比读取隔离]')
+    with tempfile.TemporaryDirectory() as directory:
+        study, ct, mr = generate_uid(), generate_uid(), generate_uid()
+        for uid, modality, sop, count in ((ct, 'CT', CTImageStorage, 4),
+                                           (mr, 'MR', MRImageStorage, 3)):
+            folder = os.path.join(directory, modality); os.mkdir(folder)
+            for i in range(count):
+                path = os.path.join(folder, f'{i}.dcm')
+                _write_min_dcm(path, (5, 7), uid, i, i + 1, modality=modality,
+                               sop_class_uid=sop, pix=200 + i)
+                ds = pydicom.dcmread(path); ds.StudyInstanceUID = study; ds.save_as(path)
+        v = m.MedicalViewer(autosave=False); calls = []; v._kickoff_ai = lambda: calls.append(True)
+        v.persistence_dir = os.path.join(directory, 'cache')
+        try:
+            v.load_data(directory)
+            doc = getattr(v, 'study_document', None)
+            check(doc is not None and set(doc.series) == {ct, mr}, '产品载入全部 CT/MRI 序列')
+            if doc is None:
+                return
+            v.volume_mask[1, 2, 3] = 5
+            v.combo_series.setCurrentIndex(v.combo_series.findData(mr))
+            check(v.active_series_uid == mr and not v.hu_calibrated
+                  and np.all(v.volume_hu[:, 0, 0] == [200, 201, 202]),
+                  '序列下拉切到 MRI，显示原始灰度，不套 CT rescale')
+            check(len(calls) == 1 and not v.btn_compare.isEnabled(),
+                  'MRI 不调用 CT AI，也不开放 CT 随访')
+            primary = v.volume_hu
+            compare, _ = v._read_compare_dir(os.path.join(directory, 'CT'))
+            check(compare is not None and v.study_document is doc and v.volume_hu is primary
+                  and v.active_series_uid == mr, '对比读取成功不污染主检查/序列')
+            v.load_data(os.path.join(directory, 'missing'))
+            check(v.study_document is doc and v.volume_hu is primary, '读取失败保留整个活动文档')
+            v.combo_series.setCurrentIndex(v.combo_series.findData(ct))
+            check(v.volume_mask[1, 2, 3] == 5 and v.study_document is doc,
+                  '切回 CT 保留原标注，不重建检查或清空 mask')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_oblique_mri_viewer_mapping(app):
+    """实际主窗口的斜采集图像、mask 和 hover 必须使用同一空间映射。"""
+    import tempfile
+
+    import pydicom
+    from pydicom.uid import MRImageStorage, generate_uid
+
+    print('[斜采集 MRI 产品显示/定位]')
+    angle = np.deg2rad(30)
+    iop = (np.cos(angle), 0, -np.sin(angle), 0, 1, 0)
+    normal = np.cross(iop[:3], iop[3:])
+    with tempfile.TemporaryDirectory() as directory:
+        study, uid = generate_uid(), generate_uid()
+        for z in range(6):
+            path = os.path.join(directory, f'{z}.dcm')
+            _write_min_dcm(path, (7, 9), uid, None, z + 1, iop=iop,
+                           ipp=normal * z * 2, modality='MR', sop_class_uid=MRImageStorage,
+                           pixel_spacing=(1.5, 1), pixels=np.arange(63).reshape(7, 9) + z * 100)
+            ds = pydicom.dcmread(path); ds.StudyInstanceUID = study; ds.save_as(path)
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
+        v.persistence_dir = os.path.join(directory, 'cache')
+        try:
+            v.load_data(directory)
+            check(v.btn_mpr.isEnabled() and not v.canonical_orientation,
+                  '有效斜采集开放解剖 MPR，旧 CT canonical 推理资格仍为 False')
+            if not v.btn_mpr.isEnabled():
+                return
+            v.combo_layout.setCurrentIndex(2)
+            v.show(); app.processEvents()
+            target = (3, 2, 6)
+            v.current_3d_pos = list(target)
+            v.btn_mpr.setChecked(True); v.on_mpr_toggled(True)
+            for vid in (1, 2, 3):
+                vd = v.views[vid]
+                mapping = vd.get('patient_plane')
+                check(mapping is not None, f'V{vid} 有来源空间映射')
+                if mapping is None:
+                    continue
+                x, y, _ = mapping.voxel_to_scene(target)
+                v.sync_crosshair(QPointF(x, y), vid)
+                check(tuple(v.current_3d_pos) == target, f'V{vid} hover 不按原数组轴误定位')
+                px = vd['view'].image_item.pixmap()
+                check((px.height(), px.width()) == mapping.shape, f'V{vid} 显示网格与命中网格一致')
+                check(not vd['cb_proj'].isEnabled(), f'V{vid} 斜采集未适配厚层投影明确禁用')
+                pixel = (mapping.shape[1] // 2, mapping.shape[0] // 2)
+                clicked = vd['view'].mapFromScene(QPointF(pixel[0] + 0.5, pixel[1] + 0.5))
+                expected = mapping.scene_to_voxel(*pixel)
+                v.measure_hu(clicked, vid)
+                check(expected is not None
+                      and f'{float(v.volume_hu[expected]):.1f}' in v.lbl_hu_value.text(),
+                      f'V{vid} 实际屏幕探针读取患者空间对应的来源值')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_unbound_source_disables_editing(app):
+    import tempfile
+
+    import pydicom
+    from pydicom.uid import generate_uid
+
+    print('[来源不可绑定时在编辑入口拒绝]')
+    with tempfile.TemporaryDirectory() as directory:
+        uid = generate_uid()
+        for i in range(3):
+            path = os.path.join(directory, f'{i}.dcm')
+            _write_min_dcm(path, (5, 7), uid, i, i + 1)
+            ds = pydicom.dcmread(path); del ds.StudyInstanceUID; ds.save_as(path)
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
+        v.persistence_dir = os.path.join(directory, 'cache')
+        try:
+            v.load_data(directory)
+            check(v.volume_hu is not None and v._active_source.source_binding is None,
+                  '身份不全仍能阅片，但没有虚构来源绑定')
+            check(all(not button.isEnabled() for key, button in v.tool_btns.items() if key != 'btn_ptr')
+                  and all(not vd['view'].annotation_enabled for vd in v.views.values()),
+                  '无法安全保存的来源在落笔前禁用编辑')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_nonaxial_scroll_direction(app):
+    import tempfile
+
+    from pydicom.uid import generate_uid
+
+    print('[非轴状来源：滚轮沿显示解剖面导航]')
+    with tempfile.TemporaryDirectory() as directory:
+        uid = generate_uid()
+        for z in range(5):
+            _write_min_dcm(os.path.join(directory, f'{z}.dcm'), (7, 9), uid, None, z + 1,
+                           iop=(0, 1, 0, 0, 0, 1), ipp=(z * 2, 0, 0))
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
+        v.persistence_dir = os.path.join(directory, 'cache')
+        try:
+            v.load_data(directory); v.views[1]['cb_plane'].setCurrentIndex(SAGITTAL)
+            v.current_3d_pos = [2, 3, 4]; v.update_display()
+            v.on_wheel_mpr(-120, 1)
+            check(v.current_3d_pos == [3, 3, 4] and v.slider_slice.value() == 3,
+                  'Sagittal 来源在 Sagittal 显示滚轮前进患者 L 方向，不误改来源 column')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_document_ordered_undo():
+    """混合两序列的像素和普通标注：严格按提交顺序回退，包括置信度。"""
+    from types import SimpleNamespace
+
+    from study_data import SeriesRecord, StudyDocument
+
+    print('[文档事务：跨序列统一 Undo]')
+    doc = StudyDocument('test-study')
+    for sid in ('a', 'b'):
+        binding = {'digest': sid, 'shape': [3, 4, 5]}
+        source = SimpleNamespace(source_binding=binding, geometry_binding=None)
+        doc.series[sid] = SeriesRecord(source, binding, None, np.zeros((3, 4, 5), np.uint8),
+                                       confidence=np.full((3, 4, 5), 200, np.uint8))
+    doc.edit_mask('a', [23], 5, cursor=[1, 0, 3])
+    annotations = {'all': [], 1: [{'id': 'ruler-1', 'type': 'ruler',
+                                  'p1': [1, 1], 'p2': [2, 2]}]}
+    doc.edit_annotations('b', annotations, cursor=[1, 2, 3])
+    doc.edit_mask('a', [23], 0, cursor=[1, 0, 3])
+    check(doc.revision == 3 and len(doc.history) == 3,
+          '画笔、另一序列的标尺、橡皮各提交一步，共用一个顺序历史')
+    command = doc.undo()
+    check(command.series_uid == 'a' and doc.series['a'].working_mask.flat[23] == 5
+          and doc.series['a'].confidence.flat[23] == 0,
+          '首先撤销橡皮，恢复人工标签且不伪造模型置信度')
+    command = doc.undo()
+    check(command.series_uid == 'b' and command.cursor == (1, 2, 3)
+          and doc.series['b'].annotations == {'all': []},
+          '第二步撤销另一序列的普通标注，并返回应定位的序列与位置')
+    doc.undo()
+    check(not doc.series['a'].working_mask.any()
+          and doc.series['a'].confidence.flat[23] == 200 and doc.revision == 6,
+          '最后撤销画笔，标签与原有模型置信度同时恢复；Undo 产生新 revision')
+    revision = doc.revision
+    doc.edit_mask('a', [], 5)
+    doc.edit_annotations('b', {'all': []})
+    check(doc.revision == revision and not len(doc.history),
+          '空操作和完全相同标注不产生 revision 或历史')
+
+    doc.edit_mask('a', [2], 7)
+    doc.edit_mask('b', [3], 8)
+    source = doc.series['b'].source; doc.series['b'].source = None
+    revision, count = doc.revision, len(doc.history)
+    try:
+        doc.undo()
+        rejected = False
+    except ValueError:
+        rejected = True
+    check(rejected and doc.revision == revision and len(doc.history) == count
+          and doc.series['a'].working_mask.flat[2] == 7,
+          '栈顶来源未连接时拒绝 Undo，不跳过它也不改 revision')
+    doc.series['b'].source = source; doc.undo(); doc.undo()
+    for step in range(22):
+        doc.edit_mask('a', np.ones((3, 4, 5), bool), 2 if step % 2 == 0 else 0)
+    check(len(doc.history) == 20, '整卷操作保留真实的最近 20 步，不按槽位合并')
+    restored = []
+    for step in range(20):
+        doc.undo(); restored.append(np.all(doc.series['a'].working_mask == (2 if step % 2 == 0 else 0)))
+    check(all(restored) and doc.undo() is None, '20 次整卷 Undo 均按原时间顺序逐步恢复')
+
+
+def test_ai_original_working_layers():
+    """AI 输出只读，后续 AI 不覆盖人工结果，显式采用版本可撤销。"""
+    from types import SimpleNamespace
+
+    from study_data import SeriesRecord, StudyDocument
+
+    print('[图层来源：原始 AI 与人工工作结果]')
+    binding = {'digest': 'source', 'shape': [2, 3, 4]}
+    source = SimpleNamespace(source_binding=binding, geometry_binding=None)
+    doc = StudyDocument('study')
+    doc.series['a'] = SeriesRecord(source, binding, None, np.zeros((2, 3, 4), np.uint8))
+    original = np.full((2, 3, 4), 5, np.uint8)
+    confidence = np.full(original.shape, 180, np.uint8)
+    version = doc.add_ai_result('a', original, confidence, {'model': 'synthetic-fixture-v1'})
+    doc.adopt_ai_result('a', version)
+    doc.edit_mask('a', [3], 0)
+    layer = doc.series['a'].layers[version]
+    original[:] = 1; confidence[:] = 1
+    check(layer.readonly and not layer.mask.flags.writeable
+          and np.all(layer.mask == 5) and np.all(layer.confidence == 180)
+          and doc.series['a'].working_mask.flat[3] == 0,
+          '原始 AI 自有只读数组，工作层擦成 0 不回露原始标签')
+    count = len(doc.history)
+    new_version = doc.add_ai_result('a', np.full((2, 3, 4), 7, np.uint8), None,
+                                     {'model': 'synthetic-fixture-v2'})
+    check(doc.series['a'].working_mask.flat[3] == 0 and len(doc.history) == count,
+          '接收新 AI 版本保留旧工作层和全工程历史')
+    doc.adopt_ai_result('a', new_version)
+    doc.undo()
+    working = doc.series['a'].layers[doc.series['a'].active_layer_id]
+    check(working.mask.flat[3] == 0 and working.confidence.flat[3] == 0
+          and working.provenance['ai_version'] == version and working.provenance['modified'],
+          '采用新版本的 Undo 恢复人工标签、原有置信度及来源状态')
+    doc.undo()
+    check(np.all(working.mask == 5) and np.all(working.confidence == 180)
+          and not working.provenance['modified'],
+          '继续撤销橡皮，回到未经人工修改的工作结果')
+
+
+def test_document_pixel_gestures(app):
+    """实际 Qt 点击/拖动覆盖三面；屏幕缩放不改变单个来源体素。"""
+    import tempfile
+
+    from pydicom.uid import generate_uid
+    from PySide6.QtCore import QPointF
+    from PySide6.QtTest import QTest
+
+    from constants import TOOL_SEG_BRUSH
+
+    print('[三视图事务：实际鼠标单体素与笔画]')
+    with tempfile.TemporaryDirectory() as directory:
+        uid = generate_uid()
+        for z in range(8):
+            _write_min_dcm(os.path.join(directory, f'{z}.dcm'), (12, 16), uid, z * 2, z + 1,
+                           pixel_spacing=(1.5, 0.7), pix=200)
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
+        v.persistence_dir = os.path.join(directory, 'cache')
+        try:
+            v.load_data(directory); v.show(); app.processEvents()
+            doc = v.study_document
+            v.spin_brush.setValue(0)  # 产品控件的单体素模式
+            v.change_active_tool(TOOL_SEG_BRUSH)
+            target = (3, 5, 7)
+            view = v.views[1]['view']
+            for plane in (m.AXIAL, m.CORONAL, m.SAGITTAL):
+                v.current_3d_pos = list(target)
+                v.views[1]['cb_plane'].setCurrentIndex(plane); v.update_display(); app.processEvents()
+                mapping = v.views[1].get('patient_plane')
+                sx, sy, _ = mapping.voxel_to_scene(target)
+                position = view.mapFromScene(QPointF(sx + .5, sy + .5))
+                before = doc.revision
+                QTest.mouseClick(view.viewport(), Qt.LeftButton, Qt.NoModifier, position)
+                check(np.count_nonzero(v.volume_mask) == 1 and v.volume_mask[target] != 0
+                      and doc.revision == before + 1 and len(doc.history) == 1,
+                      f'{plane} 实际单击只写目标来源体素并提交一步')
+                v._undo_mask_edit()
+                check(not v.volume_mask.any() and len(doc.history) == 0,
+                      f'{plane} Ctrl+Z 入口恢复该笔像素标注')
+            v.current_3d_pos = list(target)
+            v.views[1]['cb_plane'].setCurrentIndex(m.CORONAL); v.btn_mpr.setChecked(True)
+            v.update_display(); app.processEvents()
+            mapping = v.views[1]['patient_plane']
+            start = mapping.voxel_to_scene(target)
+            end = mapping.voxel_to_scene((5, 5, 9))
+            p1 = view.mapFromScene(QPointF(start[0] + .5, start[1] + .5))
+            p2 = view.mapFromScene(QPointF(end[0] + .5, end[1] + .5))
+            before = doc.revision
+            QTest.mousePress(view.viewport(), Qt.LeftButton, Qt.NoModifier, p1)
+            QTest.mouseMove(view.viewport(), p2)
+            check(view.is_drawing and doc.revision == before and not v.volume_mask.any()
+                  and v.current_3d_pos == list(target),
+                  'Coronal 拖画中的 hover 不切层，预览不修改已提交状态')
+            QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, p2)
+            check(v.volume_mask[target] != 0 and v.volume_mask[5, 5, 9] != 0
+                  and doc.revision == before + 1 and len(doc.history) == 1,
+                  '纵横拖动后整笔只提交一次，保留两个端点')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_stroke_navigation_contract(app):
+    """三面和斜采集的整笔实际鼠标操作，以及中途导航的取消语义。"""
+    import tempfile
+
+    from pydicom.uid import MRImageStorage, generate_uid
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtTest import QTest
+
+    from constants import TOOL_SEG_BRUSH
+
+    for degrees in (0, 30):
+        angle = np.deg2rad(degrees)
+        iop = (np.cos(angle), 0, -np.sin(angle), 0, 1, 0)
+        normal = np.cross(iop[:3], iop[3:])
+        with tempfile.TemporaryDirectory() as directory:
+            study = generate_uid()
+            for index in range(2):
+                uid = generate_uid()
+                for z in range(24):
+                    _write_min_dcm(os.path.join(directory, f'{index}-{z}.dcm'), (40, 48), uid, None, z+1,
+                        iop=iop, ipp=normal*z*2, pixel_spacing=(1.5, .7), study_uid=study,
+                        modality='MR', sop_class_uid=MRImageStorage, pix=100)
+            v = m.MedicalViewer(project_dir=directory, autosave=False); v._kickoff_ai = lambda: None
+            try:
+                v.load_data(directory); v.show(); QTest.qWait(150)
+                doc, view = v.study_document, v.views[1]['view']
+                v.spin_brush.setValue(0); v.btn_mpr.setChecked(True)
+                target = (10, 18, 22)
+                for plane in (AXIAL, CORONAL, SAGITTAL):
+                    v.change_active_tool(TOOL_SEG_BRUSH)
+                    v.current_3d_pos = list(target)
+                    v.views[1]['cb_plane'].setCurrentIndex(plane); v.update_display(); app.processEvents()
+                    mapping = v.views[1]['patient_plane']
+                    x, y, _ = mapping.voxel_to_scene(target)
+                    first = view.mapFromScene(QPointF(x+.5, y+.5))
+                    last = view.mapFromScene(QPointF(x+4.5, y+3.5))
+                    end = view.mapToScene(last)
+                    lps = (mapping.origin + (end.x()-.5)*mapping.spacing[1]*mapping.axes[:,0]
+                           + (end.y()-.5)*mapping.spacing[0]*mapping.axes[:,1])
+                    endpoint = tuple(np.floor((np.linalg.inv(v._active_source.affine) @ [*lps, 1])[:3][::-1]+.5).astype(int))
+                    before = doc.revision
+                    v.btn_cine.click()
+                    QTest.mousePress(view.viewport(), Qt.LeftButton, Qt.NoModifier, first)
+                    QTest.qWait(35)  # 覆盖换面后 20ms 的延迟适配晚于开始绘制到达。
+                    QTest.mouseMove(view.viewport(), last); app.processEvents()
+                    check(view.is_drawing and not v.cine_timer.isActive()
+                          and v.current_3d_pos == list(target) and doc.revision == before,
+                          f'{degrees}°/{plane} 拖画停止 Cine，hover 不导航且没有半笔提交')
+                    QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, last); app.processEvents()
+                    check(doc.revision == before+1 and len(doc.history) == 1
+                          and v.volume_mask[target] == 255 and v.volume_mask[endpoint] == 255,
+                          f'{degrees}°/{plane} 整笔按患者坐标落在两端，只提交一步')
+                    v.btn_undo.click(); app.processEvents()
+                    check(not v.volume_mask.any() and not len(doc.history),
+                          f'{degrees}°/{plane} 一次 Undo 回退整笔')
+
+                for action in ('tool', 'plane', 'wheel', 'series'):
+                    v.views[1]['cb_plane'].setCurrentIndex(AXIAL)
+                    v.current_3d_pos = list(target); v.change_active_tool(TOOL_SEG_BRUSH)
+                    v.update_display(); app.processEvents()
+                    mapping = v.views[1]['patient_plane']; x,y,_ = mapping.voxel_to_scene(target)
+                    first = view.mapFromScene(QPointF(x+.5,y+.5))
+                    last = view.mapFromScene(QPointF(x+3.5,y+2.5))
+                    before, source_uid = doc.revision, v.active_series_uid
+                    QTest.mousePress(view.viewport(), Qt.LeftButton, Qt.NoModifier, first)
+                    QTest.mouseMove(view.viewport(), last); app.processEvents()
+                    started = view.is_drawing
+                    if action == 'tool':
+                        v.tool_btn_group.button(TOOL_RULER).click()
+                    elif action == 'plane':
+                        v.views[1]['cb_plane'].setCurrentIndex(CORONAL)
+                    elif action == 'wheel':
+                        event = QWheelEvent(QPointF(last), QPointF(view.viewport().mapToGlobal(last)),
+                            QPoint(), QPoint(0,120), Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
+                        QApplication.sendEvent(view.viewport(), event)
+                    else:
+                        other = next(sid for sid in doc.series if sid != source_uid)
+                        v.combo_series.setCurrentIndex(v.combo_series.findData(other))
+                    app.processEvents()
+                    cancelled = not view.is_drawing
+                    QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, last); app.processEvents()
+                    check(started and cancelled and doc.revision == before and not len(doc.history)
+                          and all(not layer.mask.any() for record in doc.series.values() for layer in record.layers.values()),
+                          f'{degrees}° 笔画中 {action} 先取消预览，松开不写入任何序列 '
+                          f'(started={started}, cancelled={cancelled}, revision={before}->{doc.revision}, history={len(doc.history)})')
+            finally:
+                v.close(); app.processEvents()
+
+
+def test_annotation_patient_geometry():
+    """普通标注保留创建平面；其他视图显示真实交点/交线。"""
+    import mpr_geometry as mg
+
+    print('[普通标注：空间存储与跨面相交]')
+    shape, cursor = (20, 40, 60), (8, 15, 20)
+    affine = np.diag([.7, 1.5, 2., 1.])
+    source = mg.patient_plane(affine, shape, m.CORONAL, cursor)
+    ruler = {'id': 'r', 'type': 'ruler', 'p1': [10.5, 4.5], 'p2': [30.5, 12.5]}
+    bound = mg.bind_annotation(ruler, source, cursor, m.CORONAL)
+    pts = np.asarray(bound['space']['points_lps'])
+    check(np.allclose(pts[:, 1], 22.5)
+          and np.isclose(np.linalg.norm(pts[1] - pts[0]), np.hypot(14, 16)),
+          'Coronal 卡尺以真实 LPS 坐标保存，距离不套 Axial 间距')
+    own = mg.project_annotation(bound, source)
+    check(own['coplanar'] and np.allclose(own['points'], [ruler['p1'], ruler['p2']]),
+          '创建平面往返保留原场景位置，包括像素中心约定')
+    cross = mg.project_annotation(bound, mg.patient_plane(affine, shape, m.SAGITTAL, cursor))
+    check(not cross['coplanar'] and len(cross['points']) == 1,
+          'Sagittal 仅显示卡尺与当前面的交点，不复制一条二维卡尺')
+    absent = mg.project_annotation(bound, mg.patient_plane(affine, shape, m.CORONAL, (8, 16, 20)))
+    check(not absent['points'], '平行的另一切片不显示旧平面的卡尺')
+    roi = {'id': 'e', 'type': 'roi', 'rect': [10.5, 4.5, 20., 8.]}
+    bound_roi = mg.bind_annotation(roi, source, cursor, m.CORONAL)
+    cross_roi = mg.project_annotation(bound_roi, mg.patient_plane(affine, shape, m.SAGITTAL, cursor))
+    check(not cross_roi['coplanar'] and len(cross_roi['points']) == 2,
+          '正交切面显示椭圆区域的真实交线端点')
+    raw = mg.bind_annotation(ruler, None, cursor, m.AXIAL)
+    check(raw['space']['kind'] == 'source' and 'points_lps' not in raw['space'],
+          '无患者几何时只保存来源切片坐标，不伪造 LPS')
+
+
+def test_document_spatial_annotations(app):
+    """MRI Coronal 标尺与 ROI 的实际鼠标创建、移动、缩放、批量删除、Undo。"""
+    import tempfile
+    from copy import deepcopy
+
+    from pydicom.uid import MRImageStorage, generate_uid
+    from PySide6.QtCore import QPointF
+    from PySide6.QtTest import QTest
+
+    from constants import TOOL_POINTER, TOOL_ROI, TOOL_RULER
+
+    print('[MRI 普通标注：真实 Qt 创建/移动/撤销]')
+    with tempfile.TemporaryDirectory() as directory:
+        uid = generate_uid()
+        for z in range(36):
+            _write_min_dcm(os.path.join(directory, f'{z}.dcm'), (64, 80), uid, z * 2, z + 1,
+                           pixel_spacing=(1.5, .7), modality='MR', sop_class_uid=MRImageStorage, pix=100)
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
+        v.persistence_dir = os.path.join(directory, 'cache')
+        try:
+            v.load_data(directory); v.show(); app.processEvents()
+            v.views[1]['cb_plane'].setCurrentIndex(m.CORONAL); app.processEvents()
+            view, doc = v.views[1]['view'], v.study_document
+
+            def drag(tool, a, b):
+                v.change_active_tool(tool)
+                first, last = view.mapFromScene(QPointF(*a)), view.mapFromScene(QPointF(*b))
+                QTest.mousePress(view.viewport(), Qt.LeftButton, Qt.NoModifier, first)
+                QTest.mouseMove(view.viewport(), last)
+                QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, last)
+                app.processEvents()
+
+            drag(TOOL_RULER, (8.5, 5.5), (22.5, 12.5))
+            annos = [a for values in v.global_annotations.values() for a in values]
+            rulers = [a for a in annos if a['type'] == 'ruler']
+            check(len(rulers) == 1 and rulers[0].get('space', {}).get('plane') == m.CORONAL,
+                  'MRI Coronal 鼠标卡尺写入带创建平面的空间标注')
+            if not rulers:
+                return
+            check(any('mm' in item.toPlainText() for item in view.scene.items()
+                      if hasattr(item, 'toPlainText')),
+                  '空间卡尺在当前视图显示实际毫米距离')
+            drag(TOOL_ROI, (10.5, 4.5), (60.5, 30.5))
+            rois = [item for item in view.scene.items() if isinstance(item, ROIGraphicsItem)]
+            check(len(rois) == 1 and v.tool_btns['btn_roi'].isEnabled(),
+                  'MRI ROI 可创建并显示可移动对象，无需伪装为 HU')
+            if not rois:
+                return
+            v.change_active_tool(TOOL_POINTER)
+            item = rois[0]; aid = item.toolTip()
+            before = deepcopy(next(a for values in v.global_annotations.values() for a in values if a['id'] == aid))
+            count = len(doc.history)
+            center = item.mapToScene(item.rect().center())
+            p1, p2 = view.mapFromScene(center), view.mapFromScene(center + QPointF(3, 2))
+            QTest.mousePress(view.viewport(), Qt.LeftButton, Qt.NoModifier, p1)
+            QTest.mouseMove(view.viewport(), p2)
+            during = next(a for values in v.global_annotations.values() for a in values if a['id'] == aid)
+            check(during == before and len(doc.history) == count,
+                  'ROI 拖动预览没有改写已提交标注或历史')
+            QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, p2); app.processEvents()
+            after = next(a for values in v.global_annotations.values() for a in values if a['id'] == aid)
+            check(after['rect'] != before['rect'] and after['space']['points_lps'] != before['space']['points_lps']
+                  and len(doc.history) == count + 1,
+                  '松开 ROI 同时提交新轮廓与患者坐标，只新增一步')
+            v._undo_mask_edit(); app.processEvents()
+            restored = next(a for values in v.global_annotations.values() for a in values if a['id'] == aid)
+            check(restored == before, 'ROI 移动 Undo 完整恢复几何与属性')
+            item = next(g for g in view.scene.items() if isinstance(g, ROIGraphicsItem))
+            corner = item.mapToScene(item.rect().bottomRight() - QPointF(2, 2))
+            p1, p2 = view.mapFromScene(corner), view.mapFromScene(corner + QPointF(6, 5))
+            QTest.mousePress(view.viewport(), Qt.LeftButton, Qt.NoModifier, p1)
+            QTest.mouseMove(view.viewport(), p2)
+            during = next(a for values in v.global_annotations.values() for a in values if a['id'] == aid)
+            check(during == before and len(doc.history) == count,
+                  'ROI 手柄缩放期间不修改已提交几何或历史')
+            QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, p2); app.processEvents()
+            resized = next(a for values in v.global_annotations.values() for a in values if a['id'] == aid)
+            check(resized['rect'][2] > before['rect'][2] and resized['rect'][3] > before['rect'][3]
+                  and resized['space']['points_lps'] != before['space']['points_lps']
+                  and len(doc.history) == count + 1,
+                  'ROI 手柄松开只提交一步，尺寸与患者坐标同步增大')
+            v._undo_mask_edit(); app.processEvents()
+            restored = next(a for values in v.global_annotations.values() for a in values if a['id'] == aid)
+            check(restored == before, 'ROI 缩放 Undo 恢复原始轮廓及空间属性')
+            for graphic in view.scene.items():
+                if graphic.toolTip():
+                    graphic.setSelected(True)
+            count = len(doc.history)
+            QTest.keyClick(view, Qt.Key_Delete); app.processEvents()
+            check(not any(v.global_annotations.values()) and len(doc.history) == count + 1,
+                  '一次 Delete 删除多个选中标注只提交一个批量操作')
+            v._undo_mask_edit()
+            check(sum(map(len, v.global_annotations.values())) == 2,
+                  '一次 Undo 同时恢复该批标尺和 ROI')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_document_ai_lifecycle(app):
+    """产品 AI 回调进入只读版本；编辑与显示重置不能丢失工作结果。"""
+    import tempfile
+    from types import SimpleNamespace
+
+    from pydicom.uid import generate_uid
+
+    from constants import TOOL_SEG_BRUSH
+
+    print('[AI 产品接入：版本/独立病灶/重置]')
+    with tempfile.TemporaryDirectory() as directory:
+        uid = generate_uid()
+        for z in range(3):
+            _write_min_dcm(os.path.join(directory, f'{z}.dcm'), (8, 8), uid, z, z + 1, pix=100)
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
+        v.persistence_dir = os.path.join(directory, 'cache')
+        try:
+            v.load_data(directory)
+            v.ai_thread = SimpleNamespace(confidence=np.full(v.volume_hu.shape, 190, np.uint8),
+                used_fallback=False, resampled_from=None, isRunning=lambda: False, cancel=lambda: None)
+            v.on_auto_ai_finished(np.full(v.volume_hu.shape, 5, np.uint8), 1., v._ai_generation)
+            doc = v.study_document; record = doc.series[uid]
+            originals = [layer for layer in record.layers.values() if layer.readonly]
+            check(len(originals) == 1 and np.all(originals[0].mask == 5),
+                  '真实 AI 回调创建可追溯的独立原始结果版本')
+            if not originals:
+                return
+            v.spin_brush.setValue(0); v.change_active_tool(TOOL_SEG_BRUSH)
+            v.cb_paint_target.setCurrentIndex(v.cb_paint_target.findData(255))
+            v.handle_seg_paint(1, [(3.5, 3.5)], False)
+            lesion = record.layers[record.active_layer_id]
+            check(lesion.kind == 'lesion' and lesion.lesion_id
+                  and lesion.mask[1, 3, 3] == 255 and record.layers['working-organs'].mask[1, 3, 3] == 5,
+                  '手工病灶位于独立图层，可与器官占用同一体素')
+            count, before = len(doc.history), v.volume_mask.copy()
+            v.on_auto_ai_finished(np.full(v.volume_hu.shape, 7, np.uint8), 2., v._ai_generation)
+            check(len([x for x in record.layers.values() if x.readonly]) == 2
+                  and len(doc.history) == count and np.array_equal(v.volume_mask, before),
+                  '下一 AI 回调只新增原始版本，保留人工结果和旧历史')
+            v.reset_all_states(); app.processEvents()
+            check(np.array_equal(v.volume_mask, before) and len(doc.history) == count,
+                  '工作区重置只恢复显示，不清标注或 Undo')
+            original = originals[0]
+            v.cb_layers.setCurrentIndex(v.cb_layers.findData(original.layer_id)); app.processEvents()
+            check(not v.views[1]['view'].annotation_enabled and not v.tool_btns['btn_brush'].isEnabled(),
+                  '原始 AI 对照模式在编辑入口明确只读')
+            v.cb_layers.setCurrentIndex(v.cb_layers.findData(lesion.layer_id)); app.processEvents()
+            v._undo_mask_edit()
+            check(not v.volume_mask.any() and np.all(original.mask == 5),
+                  '重置及 AI 对照后仍可撤回最后一笔，原始结果不变')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_document_lesion_instances():
+    from types import SimpleNamespace
+
+    from study_data import SeriesRecord, StudyDocument
+
+    print('[病灶实例：独立重叠图层与创建 Undo]')
+    binding = {'digest': 'source', 'shape': [2, 3, 4]}
+    source = SimpleNamespace(source_binding=binding, geometry_binding=None)
+    doc = StudyDocument('study')
+    doc.series['a'] = SeriesRecord(source, binding, None, np.full((2, 3, 4), 5, np.uint8))
+    first = doc.create_lesion_layer('a')
+    second = doc.create_lesion_layer('a')
+    record = doc.series['a']
+    doc.edit_mask('a', [2], 255, layer_id=first)
+    doc.edit_mask('a', [2], 255, layer_id=second)
+    check(record.layers[first].lesion_id != record.layers[second].lesion_id
+          and record.layers[first].mask.flat[2] == record.layers[second].mask.flat[2] == 255
+          and record.layers['working-organs'].mask.flat[2] == 5,
+          '两个不同病灶和器官可占同一来源体素，实例身份互相独立')
+    doc.undo()
+    check(record.layers[first].mask.flat[2] == 255 and not record.layers[second].mask.any(),
+          '撤销仅影响目标病灶，不擦掉重叠器官或另一病灶')
+    doc.undo(); doc.undo()
+    check(second not in record.layers and first in record.layers,
+          '继续撤销创建操作，移除正确的空实例图层')
+
+
+def test_linked_lesion_identity():
+    """同检查不同序列共享病灶身份，各自范围与历史保持独立。"""
+    import tempfile
+    from pathlib import Path
+
+    from project_store import capture_project_snapshot, load_project_snapshot, save_project_snapshot
+
+    with tempfile.TemporaryDirectory() as directory:
+        doc, sources = _project_document_fixture(directory)
+        first, second = [source.series_uid for source in sources]
+        source_layer = doc.create_lesion_layer(first)
+        doc.edit_mask(first, [21], 255, layer_id=source_layer)
+        original = doc.series[first].layers[source_layer]
+        try:
+            target_layer = doc.create_lesion_layer(second, reference_series_uid=first,
+                                                  reference_layer_id=source_layer)
+        except (TypeError, ValueError) as exc:
+            check(False, f'可在另一序列创建同一病灶身份的独立图层：{exc}')
+            return
+        target = doc.series[second].layers[target_layer]
+        check(target.lesion_id == original.lesion_id and not target.mask.any()
+              and original.mask.flat[21] == 255 and not np.shares_memory(target.mask, original.mask),
+              '关联只共享 lesion ID，目标是独立空图层且参考范围保持原位')
+        revision = doc.revision
+        try:
+            doc.create_lesion_layer(second, reference_series_uid=first, reference_layer_id=source_layer)
+            rejected = False
+        except ValueError:
+            rejected = True
+        check(rejected and doc.revision == revision, '同序列重复关联同一病灶被拒绝，不增加历史')
+        rejected = 0
+        for sid, lid in ((second, source_layer), (first, 'working-organs'), ('missing-series', source_layer)):
+            try:
+                doc.create_lesion_layer(second, reference_series_uid=sid, reference_layer_id=lid)
+            except ValueError:
+                rejected += 1
+        check(rejected == 3 and doc.revision == revision,
+              '自身序列、器官图层及未知来源不能建立病灶关联，失败保持原状态')
+        doc.edit_mask(second, [33], 255, layer_id=target_layer)
+        path = Path(directory) / 'linked.miwproj'
+        save_project_snapshot(capture_project_snapshot(doc), path)
+        restored = load_project_snapshot(path); restored.attach_sources(sources)
+        check(restored.series[second].layers[target_layer].lesion_id == original.lesion_id
+              and restored.series[second].layers[target_layer].mask.flat[33] == 255,
+              '工程重开后同一 lesion ID 与各序列独立范围一起恢复')
+        rows = [row for record in restored.series.values() for row in record.statistics
+                if row['lesion_id'] == original.lesion_id]
+        check({row['series_uid'] for row in rows} == {first, second}
+              and all(row['type_status'] == 'unknown' and row['voxel_count'] == 1 for row in rows),
+              '同编号病灶摘要按序列分别记录范围，不凭关联生成瘤种或合并体积')
+        restored.undo(); restored.undo()
+        check(target_layer not in restored.series[second].layers
+              and restored.series[first].layers[source_layer].mask.flat[21] == 255,
+              '重开后依次 Undo 目标编辑和关联，不修改参考序列病灶')
+
+
+def test_document_clear_and_track(app):
+    import tempfile
+
+    from pydicom.uid import generate_uid
+    from PySide6.QtCore import QRectF
+
+    print('[文档批量操作：清当前面与三维追踪]')
+    with tempfile.TemporaryDirectory() as directory:
+        uid = generate_uid()
+        for z in range(5):
+            _write_min_dcm(os.path.join(directory, f'{z}.dcm'), (12, 16), uid, z, z + 1, pix=100)
+        v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
+        v.persistence_dir = os.path.join(directory, 'cache')
+        try:
+            v.load_data(directory)
+            doc, record = v.study_document, v.study_document.series[uid]
+            v.volume_mask.fill(5); v.volume_conf = np.full(v.volume_mask.shape, 190, np.uint8)
+            v.current_3d_pos = [2, 4, 7]
+            v.views[1]['cb_plane'].setCurrentIndex(m.CORONAL); v.update_display()
+            before_mask, before_conf = v.volume_mask.copy(), v.volume_conf.copy()
+            v.clear_current_slice(1)
+            expected = before_mask.copy(); expected[:, 4, :] = 0
+            check(np.array_equal(v.volume_mask, expected) and len(doc.history) == 1,
+                  '清空 Coronal 当前面只清对应来源体素，其余层保持原样')
+            v._undo_mask_edit()
+            check(np.array_equal(v.volume_mask, before_mask) and np.array_equal(v.volume_conf, before_conf),
+                  '清当前面 Undo 同时恢复标签和置信度')
+            v.views[1]['cb_plane'].setCurrentIndex(m.AXIAL)
+            v.handle_3d_track_requested(1, QRectF(3, 3, 6, 6))
+            check(record.layers[record.active_layer_id].kind == 'lesion'
+                  and np.all(record.layers['working-organs'].mask == 5) and v.volume_mask.any()
+                  and len(doc.history) == 1,
+                  '真实三维追踪提交独立病灶图层的一步，不覆盖重叠器官')
+            v._undo_mask_edit()
+            check(not v.volume_mask.any() and np.all(record.layers['working-organs'].mask == 5),
+                  '追踪 Undo 回退目标病灶，器官图层完整保留')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_pixel_transform_boundaries(app):
+    import tempfile
+
+    from pydicom.uid import MRImageStorage, generate_uid
+    from PySide6.QtCore import QPointF
+    from PySide6.QtTest import QTest
+
+    from constants import TOOL_SEG_BRUSH
+
+    print('[像素精修：斜采集/缩放平移/边界/中途 resize]')
+    for degrees in (0, 30):
+        angle = np.deg2rad(degrees)
+        iop = (np.cos(angle), 0, -np.sin(angle), 0, 1, 0)
+        normal = np.cross(iop[:3], iop[3:])
+        with tempfile.TemporaryDirectory() as directory:
+            uid = generate_uid()
+            for z in range(10):
+                _write_min_dcm(os.path.join(directory, f'{z}.dcm'), (20, 24), uid, None, z + 1,
+                    iop=iop, ipp=normal * z * 2, pixel_spacing=(1.5, .7),
+                    modality='MR', sop_class_uid=MRImageStorage, pix=100)
+            v = m.MedicalViewer(autosave=False); v._kickoff_ai = lambda: None
+            v.persistence_dir = os.path.join(directory, 'cache')
+            try:
+                v.load_data(directory); v.show(); app.processEvents()
+                doc, view = v.study_document, v.views[1]['view']
+                v.spin_brush.setValue(0); v.change_active_tool(TOOL_SEG_BRUSH)
+                target = (4, 9, 11)
+                for plane in (m.AXIAL, m.CORONAL, m.SAGITTAL):
+                    v.current_3d_pos = list(target)
+                    v.views[1]['cb_plane'].setCurrentIndex(plane); v.update_display(); app.processEvents()
+                    mapping = v.views[1]['patient_plane']
+                    x, y, _ = mapping.voxel_to_scene(target)
+                    view.scale(1.6, 1.6); view._user_zoomed = True
+                    view.centerOn(x + 1.5, y + 1.5)
+                    transform = view.transform()
+                    position = view.mapFromScene(QPointF(x + .5, y + .5))
+                    QTest.mouseClick(view.viewport(), Qt.LeftButton, Qt.NoModifier, position)
+                    check(np.count_nonzero(v.volume_mask) == 1 and v.volume_mask[target] == 255,
+                          f'{degrees}° / {plane} 缩放平移后实际单击仍只命中来源目标体素')
+                    check(view.transform() == transform,
+                          f'{degrees}° / {plane} 提交精修后保持用户缩放')
+                    v._undo_mask_edit()
+                    before = doc.revision
+                    outside = view.mapFromScene(QPointF(-5.5, y + .5))
+                    QTest.mouseClick(view.viewport(), Qt.LeftButton, Qt.NoModifier, outside)
+                    check(not v.volume_mask.any() and doc.revision == before,
+                          f'{degrees}° / {plane} 边界外点击不夹到边缘，不产生修改')
+                v.change_active_tool(TOOL_SEG_BRUSH)
+                position = view.mapFromScene(QPointF(x + .5, y + .5))
+                before = doc.revision
+                QTest.mousePress(view.viewport(), Qt.LeftButton, Qt.NoModifier, position)
+                v.resize(v.width() + 32, v.height()); app.processEvents()
+                check(not view.is_drawing and doc.revision == before,
+                      f'{degrees}° 笔画中改变窗口几何取消预览')
+                QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, position)
+                check(not v.volume_mask.any() and doc.revision == before,
+                      f'{degrees}° resize 后松开不提交旧屏幕坐标')
+            finally:
+                v.close(); app.processEvents()
+
+
+def _project_document_fixture(directory, modalities=('MR', 'MR')):
+    from pydicom.uid import CTImageStorage, MRImageStorage, generate_uid
+
+    from study_data import StudyDocument, read_series_directory
+
+    study_uid = generate_uid()
+    for index in range(2):
+        sid = generate_uid()
+        for z in range(3):
+            _write_min_dcm(os.path.join(directory, f'{index}-{z}.dcm'), (4, 5), sid, z * 2, z + 1,
+                           modality=modalities[index],
+                           sop_class_uid=MRImageStorage if modalities[index] == 'MR' else CTImageStorage,
+                           pix=100 + index,
+                           pixel_spacing=(1.5, .7), study_uid=study_uid)
+    sources = read_series_directory(directory).series
+    doc = StudyDocument(sources[0].study_uid); doc.attach_sources(sources)
+    return doc, sources
+
+
+def test_project_store_roundtrip():
+    """完整检查保存后先离线恢复全部状态；重新接入来源再逐步 Undo。"""
+    import tempfile
+    import zipfile
+
+    from project_store import capture_project_snapshot, load_project_snapshot, save_project_snapshot
+
+    print('[工程包：两序列保存、恢复与原顺序 Undo]')
+    with tempfile.TemporaryDirectory() as directory:
+        doc, sources = _project_document_fixture(directory)
+        a, b = [s.series_uid for s in sources]
+        version = doc.add_ai_result(a, np.full((3, 4, 5), 5, np.uint8),
+                                    np.full((3, 4, 5), 180, np.uint8), {'origin': 'synthetic'})
+        doc.adopt_ai_result(a, version)
+        doc.edit_annotations(b, {'all': [], 1: [{'id': 'r1', 'type': 'ruler',
+                                                'p1': [1, 1], 'p2': [2, 2]}]})
+        doc.edit_mask(a, [27], 0)
+        path = os.path.join(directory, 'study.miwproj')
+        receipt = save_project_snapshot(capture_project_snapshot(doc), path)
+        restored = load_project_snapshot(path)
+        check(receipt.revision == doc.revision == restored.revision
+              and restored.document_id == doc.document_id and len(restored.history) == 3
+              and len(restored.series) == 2 and all(r.source is None for r in restored.series.values()),
+              '工程包恢复同一版本的全部序列、图层和三步历史；不伪装来源已连接')
+        with zipfile.ZipFile(path) as package:
+            check({'manifest.json', 'history.json', 'summary.csv'} <= set(package.namelist())
+                  and not any(name.endswith('.dcm') for name in package.namelist()),
+                  '标准 ZIP 内含 JSON/NPZ/CSV 与历史，不包含原始 DICOM')
+        restored.attach_sources(sources)
+        restored.undo()
+        check(restored.series[a].working_mask.flat[27] == 5
+              and restored.series[a].confidence.flat[27] == 180,
+              '跨次第一步 Undo 恢复被擦除标签和模型置信度')
+        restored.undo()
+        check(restored.series[b].annotations == {'all': []}, '跨次第二步 Undo 回退另一序列标尺')
+        restored.undo()
+        check(not restored.series[a].working_mask.any() and restored.series[a].confidence is None
+              and np.all(restored.series[a].layers[version].mask == 5)
+              and not restored.series[a].layers[version].mask.flags.writeable,
+              '跨次第三步 Undo 回退采用动作，原始 AI 只读版本保留')
+
+
+def test_project_snapshot_isolation():
+    """后台保存持有完整 revision；新编辑不改快照，也不在每次捕获复制所有体积。"""
+    import tempfile
+
+    from project_store import capture_project_snapshot, load_project_snapshot, save_project_snapshot
+
+    print('[工程快照：共享只读数组与编辑隔离]')
+    with tempfile.TemporaryDirectory() as directory:
+        doc, sources = _project_document_fixture(directory)
+        a = sources[0].series_uid
+        doc.edit_mask(a, [2], 5)
+        current = doc.series[a].working_mask
+        snapshot = capture_project_snapshot(doc)
+        meta = next(r for r in snapshot.manifest['series'] if r['series_uid'] == a)
+        frozen = snapshot.arrays[meta['file']][meta['layers'][0]['mask_key']]
+        check(np.shares_memory(current, frozen) and not frozen.flags.writeable,
+              '捕获保存快照共享只读数组，不逐次复制所有序列体积')
+        doc.edit_mask(a, [2], 7)
+        check(frozen.flat[2] == 5 and doc.series[a].working_mask.flat[2] == 7,
+              '保存期间的新编辑写入独立工作数组，旧快照保持原标签')
+        path = os.path.join(directory, 'snapshot.miwproj')
+        receipt = save_project_snapshot(snapshot, path)
+        saved = load_project_snapshot(path); saved.attach_sources(sources)
+        check(saved.series[a].working_mask.flat[2] == 5 and len(saved.history) == 1
+              and receipt.revision < doc.revision,
+              '后台落盘只包含捕获时的完整状态及历史，不混入较新 revision')
+        saved.undo()
+        check(not saved.series[a].working_mask.any(), '快照恢复后的 Undo 与该保存版本完全对应')
+
+
+def test_project_atomic_and_partial():
+    """只连接一个序列再保存，不缩减其余图层/历史；替换失败保留原件。"""
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from project_store import capture_project_snapshot, load_project_snapshot, save_project_snapshot
+
+    print('[工程保存：离线序列完整保留与替换失败]')
+    with tempfile.TemporaryDirectory() as directory:
+        doc, sources = _project_document_fixture(directory)
+        a, b = [s.series_uid for s in sources]
+        doc.edit_mask(a, [2], 5); doc.edit_mask(b, [3], 7)
+        path = Path(directory) / 'complete.miwproj'
+        save_project_snapshot(capture_project_snapshot(doc), path)
+        partial = load_project_snapshot(path); partial.attach_sources([sources[0]])
+        revision = partial.revision
+        try:
+            partial.undo(); refused = False
+        except ValueError:
+            refused = True
+        check(refused and len(partial.history) == 2 and partial.revision == revision,
+              '恢复子集时栈顶来源离线，Undo 明确拒绝且不跳步或丢历史')
+        save_project_snapshot(capture_project_snapshot(partial), path)
+        reloaded = load_project_snapshot(path)
+        check(set(reloaded.series) == {a, b} and reloaded.series[b].working_mask.flat[3] == 7
+              and len(reloaded.history) == 2,
+              '只连接一个序列后保存，另一个序列的标注和历史仍完整保留')
+        before = path.read_bytes()
+        partial.edit_mask(a, [4], 2)
+        try:
+            with patch('project_store.os.replace', side_effect=OSError('synthetic write failure')):
+                save_project_snapshot(capture_project_snapshot(partial), path)
+            failed = False
+        except OSError:
+            failed = True
+        check(failed and path.read_bytes() == before and not list(Path(directory).glob('.miwproj-*.tmp')),
+              '最终替换失败时上一完整工程逐字节保留，临时输出被清理')
+
+
+def _rewrite_project(path, mutate):
+    """仅改临时合成包；可重算摘要，验证语义门不会仅靠 checksum 假绿。"""
+    import hashlib
+    import json
+    import zipfile
+
+    with zipfile.ZipFile(path) as package:
+        members = {name: package.read(name) for name in package.namelist()}
+    manifest = json.loads(members['manifest.json'])
+    mutate(manifest, members)
+    members['manifest.json'] = json.dumps(manifest).encode()
+    members['manifest.sha256'] = hashlib.sha256(members['manifest.json']).hexdigest().encode()
+    with zipfile.ZipFile(path, 'w') as package:
+        for name, data in members.items():
+            package.writestr(name, data)
+
+
+def test_project_history_recovery():
+    import hashlib
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from project_store import (
+        HistoryRecoveryRequired,
+        ProjectError,
+        capture_project_snapshot,
+        load_project_snapshot,
+        save_project_snapshot,
+    )
+
+    print('[工程损坏：历史独立验证与受保护恢复副本]')
+    with tempfile.TemporaryDirectory() as directory:
+        doc, sources = _project_document_fixture(directory)
+        sid = sources[0].series_uid; doc.edit_mask(sid, [2], 5)
+        path = Path(directory) / 'original.miwproj'
+        save_project_snapshot(capture_project_snapshot(doc), path)
+
+        def damage_history(manifest, members):
+            history = json.loads(members['history.json'])
+            history['commands'][0]['chunks'][0]['start'] = 100000
+            members['history.json'] = json.dumps(history).encode()
+            manifest['history']['sha256'] = hashlib.sha256(members['history.json']).hexdigest()
+
+        _rewrite_project(path, damage_history)
+        try:
+            load_project_snapshot(path); refused = False
+        except HistoryRecoveryRequired:
+            refused = True
+        check(refused, '重算 checksum 后的越界历史仍被拒绝，不等到用户 Undo 才报错')
+        damaged_bytes = path.read_bytes()
+        recovered = load_project_snapshot(path, recover_history=True)
+        check(recovered.document_id != doc.document_id and len(recovered.history) == 0
+              and recovered.series[sid].working_mask.flat[2] == 5
+              and recovered.recovery['source_sha256'] == hashlib.sha256(damaged_bytes).hexdigest()
+              and recovered.project_path != str(path),
+              '仅历史损坏时恢复最终标注，以新文档 ID、来源证据和独立路径重建历史')
+        try:
+            save_project_snapshot(capture_project_snapshot(recovered), path); refused = False
+        except ProjectError:
+            refused = True
+        check(refused and path.read_bytes() == damaged_bytes, '恢复副本不能覆写损坏原件')
+        recovered.attach_sources(sources); recovered.edit_mask(sid, [3], 7)
+        save_project_snapshot(capture_project_snapshot(recovered), recovered.project_path)
+        reopened = load_project_snapshot(recovered.project_path); reopened.attach_sources(sources); reopened.undo()
+        check(reopened.series[sid].working_mask.flat[2] == 5
+              and reopened.series[sid].working_mask.flat[3] == 0,
+              '恢复副本重开后仅撤销恢复点之后的新编辑')
+
+        def damage_final(manifest, members):
+            members[manifest['series'][0]['file']] = b'not an NPZ'
+
+        _rewrite_project(path, damage_final)
+        try:
+            load_project_snapshot(path, recover_history=True); rejected_final = False
+        except HistoryRecoveryRequired:
+            rejected_final = False
+        except ProjectError:
+            rejected_final = True
+        check(rejected_final, '最终图层损坏时拒绝恢复，不用空图层冒充完整工程')
+
+
+def test_project_final_validation():
+    import hashlib
+    import io
+    import tempfile
+    import zipfile
+    from pathlib import Path
+
+    from project_store import (
+        HistoryRecoveryRequired,
+        ProjectError,
+        ProjectLimits,
+        capture_project_snapshot,
+        load_project_snapshot,
+        save_project_snapshot,
+    )
+
+    print('[工程最终状态：结构/来源/空间/NPZ 负例]')
+    with tempfile.TemporaryDirectory() as directory:
+        doc, sources = _project_document_fixture(directory)
+        sid = sources[0].series_uid; doc.edit_mask(sid, [2], 5)
+        path = Path(directory) / 'final.miwproj'
+        save_project_snapshot(capture_project_snapshot(doc), path)
+        good = path.read_bytes()
+
+        def extra_array(manifest, members):
+            meta = manifest['series'][0]
+            with np.load(io.BytesIO(members[meta['file']]), allow_pickle=False) as arrays:
+                payload = {key: arrays[key] for key in arrays.files}
+            payload['unreferenced'] = np.zeros((3, 4, 5), np.uint8)
+            data = io.BytesIO(); np.savez_compressed(data, **payload)
+            members[meta['file']] = data.getvalue()
+            meta['sha256'] = hashlib.sha256(data.getvalue()).hexdigest()
+
+        def oversized_npy_header(manifest, members):
+            meta = manifest['series'][0]
+            with zipfile.ZipFile(io.BytesIO(members[meta['file']])) as inner:
+                payloads = {key: inner.read(key) for key in inner.namelist()}
+            forged = io.BytesIO()
+            np.lib.format.write_array_header_1_0(forged, {'descr': '|u1', 'fortran_order': False,
+                                                         'shape': (2**40, 4, 5)})
+            payloads[meta['layers'][0]['mask_key'] + '.npy'] = forged.getvalue()
+            encoded = io.BytesIO()
+            with zipfile.ZipFile(encoded, 'w') as inner:
+                for key, data in payloads.items():
+                    inner.writestr(key, data)
+            members[meta['file']] = encoded.getvalue()
+            meta['sha256'] = hashlib.sha256(encoded.getvalue()).hexdigest()
+
+        cases = [
+            ('不支持 schema', lambda m, b: m.update(schema=999)),
+            ('来源摘要失配', lambda m, b: m['series'][0]['source_binding'].update(digest='0' * 64)),
+            ('不可逆空间 affine', lambda m, b: m['series'][0]['geometry_binding'].update(affine_lps=[[0]*4]*4)),
+            ('损坏普通标注', lambda m, b: m['series'][0]['annotations'].update(objects=[{'id':'bad', 'type':'roi', 'rect':[1,2]}])),
+            ('缺失只读 AI 引用', lambda m, b: m['series'][0]['layers'][0].update(provenance={'origin':'ai', 'ai_version':'missing', 'modified':False})),
+            ('未登记 NPZ 数组', extra_array),
+            ('NPY 头声明巨型体积但无像素', oversized_npy_header),
+        ]
+        for label, mutate in cases:
+            path.write_bytes(good); _rewrite_project(path, mutate)
+            try:
+                load_project_snapshot(path, recover_history=True); rejected = False
+            except HistoryRecoveryRequired:
+                rejected = False
+            except ProjectError:
+                rejected = True
+            check(rejected, f'{label} 在最终状态阶段拒绝，不进入历史恢复')
+        path.write_bytes(good)
+        try:
+            load_project_snapshot(path, limits=ProjectLimits(max_total_bytes=128)); rejected = False
+        except ProjectError:
+            rejected = True
+        check(rejected, '声明解压总量超过上限时在读取数组前拒绝')
+
+
+def test_project_statistics_record():
+    import csv
+    import io
+    import tempfile
+    import zipfile
+
+    from project_store import capture_project_snapshot, load_project_snapshot, save_project_snapshot
+
+    print('[工程自动记录：病灶范围/真实几何/HU 与离线统计]')
+    with tempfile.TemporaryDirectory() as directory:
+        doc, sources = _project_document_fixture(directory, ('CT', 'MR'))
+        ct = next(s for s in sources if s.modality == 'CT')
+        mr = next(s for s in sources if s.modality == 'MR')
+        lid = doc.create_lesion_layer(ct.series_uid)
+        doc.edit_mask(ct.series_uid, [0, 1, 22], 255, layer_id=lid)
+        doc.edit_mask(mr.series_uid, [3], 255, layer_id='working-manual')
+        path = os.path.join(directory, 'summary.miwproj')
+        save_project_snapshot(capture_project_snapshot(doc), path)
+
+        def rows():
+            with zipfile.ZipFile(path) as package:
+                return list(csv.DictReader(io.StringIO(package.read('summary.csv').decode())))
+
+        lesion = next(row for row in rows() if row['layer_id'] == lid)
+        check(int(lesion['voxel_count']) == 3 and abs(float(lesion['volume_ml']) - .0063) < 1e-10
+              and float(lesion['mean_hu']) == -924 and lesion['range_zyx'] == '[[0,0,0],[1,0,2]]'
+              and lesion['lesion_id'] == doc.series[ct.series_uid].layers[lid].lesion_id,
+              '保存自动记录独立病灶 ID、来源网格范围、体素数、真实体积与 HU')
+        mr_row = next(row for row in rows() if row['series_uid'] == mr.series_uid
+                      and row['layer_id'] == 'working-manual')
+        check(mr_row['mean_hu'] == '' and mr_row['type_status'] == 'unknown'
+              and mr_row['type_prediction'] == '' and mr_row['modified'] == 'True',
+              'MRI 不伪造 HU；人工标记不冒充已识别类型，明确记录未知和修订状态')
+        partial = load_project_snapshot(path); partial.attach_sources([mr])
+        save_project_snapshot(capture_project_snapshot(partial), path)
+        cached = next(row for row in rows() if row['layer_id'] == lid)
+        check(cached['mean_hu'] == lesion['mean_hu'] and cached['range_zyx'] == lesion['range_zyx']
+              and cached['statistics_computed_at'] == lesion['statistics_computed_at']
+              and cached['source_connected'] == 'False' and cached['statistics_status'] == 'cached',
+              '未连接序列保留原统计和计算时间，并标示缓存来源而非伪称重新测量')
+
+
+def test_viewer_project_roundtrip(app):
+    """产品保存/载入使用整检查工程，重开后不重跑 AI，Undo 仍可定位。"""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+
+    print('[产品工程：保存按钮与重新载入]')
+    with tempfile.TemporaryDirectory() as directory:
+        source_dir = Path(directory) / 'dicom'; source_dir.mkdir()
+        _project_document_fixture(str(source_dir))
+        project_dir = Path(directory) / 'projects'
+        legacy_dir = Path(directory) / 'legacy'; legacy_dir.mkdir()
+        original = legacy_dir / 'sentinel.npz'; original.write_bytes(b'protected legacy data')
+        v = m.MedicalViewer(project_dir=str(project_dir), autosave=False)
+        fresh = None
+        v.persistence_dir = str(legacy_dir); v._kickoff_ai = lambda: None
+        try:
+            v.load_data(str(source_dir)); app.processEvents()
+            doc, sid = v.study_document, v.active_series_uid
+            doc.edit_mask(sid, [2, 22], 255, layer_id='working-manual', cursor=[1, 0, 2], view_plane=m.CORONAL)
+            doc.series[sid].active_layer_id = 'working-manual'; v._sync_committed_edit()
+            expected_path = project_dir / (hashlib.sha256(doc.study_uid.encode()).hexdigest() + '.miwproj')
+            check(v.save_project() and expected_path.is_file() and doc.saved_revision == doc.revision,
+                  '产品保存写入 Study 哈希命名的 .miwproj，并确认对应 revision 已保存')
+            check(original.read_bytes() == b'protected legacy data' and len(list(legacy_dir.iterdir())) == 1,
+                  '新工程保存完全不覆盖旧导出目录中的产物')
+            check(str(expected_path) in v.lbl_project_status.toolTip()
+                  and all(fmt in v.lbl_project_status.toolTip() for fmt in ('JSON', 'NPZ', 'CSV')),
+                  '保存状态提供完整位置和工程内各格式说明')
+            fresh = m.MedicalViewer(project_dir=str(project_dir), autosave=False)
+            fresh.persistence_dir = str(legacy_dir)
+            kickoffs = []; fresh._kickoff_ai = lambda: kickoffs.append(True)
+            fresh.load_data(str(source_dir)); app.processEvents()
+            check(fresh.study_document.document_id == doc.document_id
+                  and len(fresh.study_document.series) == 2 and len(fresh.study_document.history) == 1
+                  and not kickoffs and np.count_nonzero(fresh.volume_mask) == 2,
+                  '重新载入来源自动恢复全部工程/历史/活动层，保留人工结果且不重跑 AI')
+            fresh._undo_mask_edit(); app.processEvents()
+            check(not fresh.volume_mask.any() and fresh.current_3d_pos == [1, 0, 2]
+                  and fresh.views[1]['plane'] == m.CORONAL,
+                  '跨次 UI Undo 恢复原标签并定位到原编辑平面及位置')
+        finally:
+            if fresh is not None:
+                fresh.close()
+            v.close(); app.processEvents()
+
+
+def test_viewer_autosave_queue(app):
+    import tempfile
+    import threading
+    import time
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from PySide6.QtTest import QTest
+
+    import annotation_lab
+    from project_store import load_project_snapshot
+
+    print('[后台保存：新修改合并、旧回执与最终 revision]')
+    with tempfile.TemporaryDirectory() as directory:
+        source_dir = Path(directory) / 'dicom'; source_dir.mkdir()
+        _project_document_fixture(str(source_dir))
+        entered, release = threading.Event(), threading.Event()
+        calls = []; writer = annotation_lab.save_project_snapshot
+
+        def delayed(snapshot, path):
+            calls.append(snapshot.manifest['revision'])
+            if len(calls) == 1:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError('synthetic save was not released')
+            return writer(snapshot, path)
+
+        v = m.MedicalViewer(project_dir=os.path.join(directory, 'projects'), autosave=True)
+        v._kickoff_ai = lambda: None
+        try:
+            with patch('annotation_lab.save_project_snapshot', side_effect=delayed):
+                v.load_data(str(source_dir)); doc, sid = v.study_document, v.active_series_uid
+                v._autosave_idle.timeout.emit()
+                check(entered.wait(2), '自动保存计时器驱动实际后台写入，不在 UI 线程执行压缩')
+                first_worker = v._save_worker
+                for index in (2, 7, 22):
+                    doc.edit_mask(sid, [index], 255, layer_id='working-manual')
+                    v._sync_committed_edit()
+                    v._autosave_idle.timeout.emit()
+                check(v._save_worker is first_worker and len(calls) == 1
+                      and doc.saved_revision < doc.revision,
+                      '保存期间三次编辑只合并为一个最新请求，不启动并行 worker 或标成已保存')
+                release.set()
+                deadline = time.monotonic() + 5
+                while (v._save_worker is not None or doc.saved_revision != doc.revision) and time.monotonic() < deadline:
+                    QTest.qWait(10)
+                check(len(calls) == 2 and calls[-1] == doc.revision and doc.saved_revision == doc.revision,
+                      '首个旧回执后仅再保存最新 revision，较新修改最终完整落盘')
+                restored = load_project_snapshot(doc.project_path)
+                check(np.count_nonzero(restored.series[sid].layers['working-manual'].mask) == 3
+                      and len(restored.history) == 3,
+                      '自动保存工程包含最终三次编辑与同一 revision 的完整 Undo')
+                check(v._autosave_idle.interval() == 2000 and v._autosave_max.interval() == 30000,
+                      '产品默认采用空闲 2 秒与连续操作 30 秒保存上限')
+        finally:
+            release.set(); v.close(); app.processEvents()
+
+
+def test_viewer_leave_save_failure(app):
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from PySide6.QtGui import QCloseEvent
+
+    from project_store import load_project_snapshot
+
+    print('[工程生命周期：切换/关闭保存及失败不丢工作]')
+    with tempfile.TemporaryDirectory() as directory:
+        first = Path(directory) / 'first'; first.mkdir(); _project_document_fixture(str(first))
+        second = Path(directory) / 'second'; second.mkdir(); _project_document_fixture(str(second))
+        v = m.MedicalViewer(project_dir=os.path.join(directory, 'projects'), autosave=True)
+        v._kickoff_ai = lambda: None
+        v._choose_save_failure = lambda: 'cancel'
+        try:
+            v.load_data(str(first)); doc, sid = v.study_document, v.active_series_uid
+            doc.edit_mask(sid, [2], 5); v._sync_committed_edit()
+            before_history = list(doc.history.commands)
+            with patch('annotation_lab.save_project_snapshot', side_effect=OSError('synthetic disk failure')):
+                v.load_data(str(second))
+                check(v.study_document is doc and v.volume_mask.flat[2] == 5
+                      and doc.history.commands == before_history and doc.saved_revision < doc.revision,
+                      '切换检查保存失败并取消离开时，保留原检查、标注、历史和 dirty')
+                event = QCloseEvent(); v.closeEvent(event)
+                check(not event.isAccepted() and v.study_document is doc,
+                      '关闭保存失败时可取消关闭，窗口不接受关闭事件')
+            v.load_data(str(second))
+            saved_first = load_project_snapshot(doc.project_path)
+            check(v.study_document is not doc and saved_first.series[sid].working_mask.flat[2] == 5
+                  and len(saved_first.history) == 1,
+                  '保存成功后才切换检查，旧检查的编辑与 Undo 已落盘')
+            current, active = v.study_document, v.active_series_uid
+            current.edit_mask(active, [7], 255, layer_id='working-manual'); v._sync_committed_edit()
+            event = QCloseEvent(); v.closeEvent(event)
+            final = load_project_snapshot(current.project_path)
+            check(event.isAccepted() and final.series[active].layers['working-manual'].mask.flat[7] == 255,
+                  '正常关闭保存最新提交版本，不依赖等待空闲计时器')
+        finally:
+            v._autosave_enabled = False; v.close(); app.processEvents()
+
+
+def test_viewer_open_and_recovery(app):
+    import hashlib
+    import json
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    print('[显式打开工程：保存时序、离线状态和恢复副本]')
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / 'dicom'; source.mkdir(); _project_document_fixture(str(source))
+        v = m.MedicalViewer(project_dir=os.path.join(directory, 'projects'), autosave=True)
+        v._kickoff_ai = lambda: None; v._choose_save_failure = lambda: 'cancel'
+        recovered = None
+        try:
+            v.load_data(str(source)); doc, sid = v.study_document, v.active_series_uid
+            doc.edit_mask(sid, [2], 5); v._sync_committed_edit(); v.save_project()
+            path = Path(doc.project_path)
+            doc.edit_mask(sid, [3], 7); v._sync_committed_edit()
+            check(v.open_project(str(path)) and v.volume_mask.flat[3] == 7
+                  and len(v.study_document.history) == 2,
+                  '显式打开当前路径先保存最新工作，不能把保存前读到的旧候选重新装回')
+            v._autosave_enabled = False; v.close()
+
+            def broken_history(manifest, members):
+                history = json.loads(members['history.json'])
+                history['commands'][-1]['chunks'][0]['start'] = 100000
+                members['history.json'] = json.dumps(history).encode()
+                manifest['history']['sha256'] = hashlib.sha256(members['history.json']).hexdigest()
+
+            _rewrite_project(path, broken_history)
+            original = path.read_bytes()
+            recovered = m.MedicalViewer(project_dir=str(path.parent), autosave=False)
+            recovered._kickoff_ai = lambda: None
+            with patch.object(QMessageBox, 'question', return_value=QMessageBox.Yes):
+                opened = recovered.open_project(str(path))
+            check(opened and len(recovered.study_document.series) == 2 and recovered.volume_hu is None
+                  and recovered.study_document.project_path != str(path)
+                  and not recovered.tool_btns['btn_brush'].isEnabled(),
+                  '用户选恢复副本后先完整载入离线工程；来源未连接时编辑入口禁用')
+            recovery_path = recovered.study_document.project_path
+            recovered.load_data(str(source)); app.processEvents()
+            check(recovered.study_document.project_path == recovery_path and recovered.save_project()
+                  and path.read_bytes() == original and Path(recovery_path).is_file(),
+                  '连接来源后继续保存到恢复副本，损坏原件始终逐字节保留')
+        finally:
+            v._autosave_enabled = False; v.close()
+            if recovered is not None:
+                recovered.close()
+            app.processEvents()
+
+
+def test_project_summary_recovery_limits():
+    import hashlib
+    import tempfile
+    from pathlib import Path
+
+    from project_store import (
+        HistoryRecoveryRequired,
+        ProjectError,
+        ProjectLimits,
+        capture_project_snapshot,
+        load_project_snapshot,
+        save_project_snapshot,
+    )
+
+    print('[工程边界：摘要/恢复元数据与保存容量门]')
+    with tempfile.TemporaryDirectory() as directory:
+        doc, sources = _project_document_fixture(directory)
+        doc.edit_mask(sources[0].series_uid, [2], 5)
+        path = Path(directory) / 'guard.miwproj'
+        snapshot = capture_project_snapshot(doc); save_project_snapshot(snapshot, path)
+        good = path.read_bytes()
+
+        def wrong_csv(manifest, members):
+            members['summary.csv'] = b'garbage,not the same revision\n'
+            manifest['summary']['sha256'] = hashlib.sha256(members['summary.csv']).hexdigest()
+
+        cases = [
+            ('CSV 与 manifest 摘要矛盾', wrong_csv),
+            ('摘要引用未知图层', lambda m, b: m['series'][0]['statistics'][0].update(layer_id='missing')),
+            ('恢复来源证据非法', lambda m, b: m.update(recovery={'source_path':'/tmp/source.miwproj',
+                'source_sha256':'bad', 'protected_paths':[], 'reason':'history', 'created_at':'bad'})),
+        ]
+        for label, mutate in cases:
+            path.write_bytes(good); _rewrite_project(path, mutate)
+            try:
+                load_project_snapshot(path, recover_history=True); refused = False
+            except HistoryRecoveryRequired:
+                refused = False
+            except ProjectError:
+                refused = True
+            check(refused, f'{label} 必须作为最终状态错误拒绝')
+        path.write_bytes(good)
+        try:
+            save_project_snapshot(snapshot, path, limits=ProjectLimits(max_total_bytes=64)); refused = False
+        except ProjectError:
+            refused = True
+        check(refused and path.read_bytes() == good,
+              '保存前执行与加载相同的容量门，不能成功覆盖为一个自己无法恢复的工程')
+
+
+def test_viewer_save_directory_race(app):
+    import tempfile
+    import threading
+    import time
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from PySide6.QtCore import QSettings
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QFileDialog
+
+    import annotation_lab
+    from project_store import load_project_snapshot
+
+    print('[保存位置：旧 worker 回执不能改回旧目录]')
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / 'dicom'; source.mkdir(); _project_document_fixture(str(source))
+        old_dir, new_dir = Path(directory) / 'old', Path(directory) / 'new'; new_dir.mkdir()
+        entered, release = threading.Event(), threading.Event()
+        original = annotation_lab.save_project_snapshot; calls = []
+
+        def delayed(snapshot, path):
+            calls.append(path)
+            if len(calls) == 1:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError('synthetic directory save was not released')
+            return original(snapshot, path)
+
+        v = m.MedicalViewer(project_dir=str(old_dir), autosave=True); v._kickoff_ai = lambda: None
+        v._project_settings = QSettings(os.path.join(directory, 'settings.ini'), QSettings.IniFormat)
+        try:
+            with patch('annotation_lab.save_project_snapshot', side_effect=delayed):
+                v.load_data(str(source)); doc = v.study_document
+                v._autosave_idle.timeout.emit(); entered.wait(2)
+                with patch.object(QFileDialog, 'getExistingDirectory', return_value=str(new_dir)):
+                    v.choose_project_directory()
+                v._autosave_idle.timeout.emit(); release.set()
+                deadline = time.monotonic() + 5
+                while (v._save_worker is not None or doc.saved_revision != doc.revision) and time.monotonic() < deadline:
+                    QTest.qWait(10)
+                check(Path(doc.project_path).parent == new_dir and len(calls) == 2
+                      and Path(calls[-1]).parent == new_dir and doc.saved_revision == doc.revision,
+                      '更换位置后旧回执不重写目标路径，合并请求落入新目录')
+                check(load_project_snapshot(doc.project_path).document_id == doc.document_id
+                      and v._project_settings.value('directory') == str(new_dir),
+                      '新目录中的完整工程有效，保存目录偏好也已记录')
+        finally:
+            release.set(); v._autosave_enabled = False; v.close(); app.processEvents()
+
+
+def test_project_raw_and_history_limit():
+    import tempfile
+    from copy import deepcopy
+
+    from mpr_geometry import bind_annotation
+    from project_store import capture_project_snapshot, load_project_snapshot, save_project_snapshot
+    from study_data import SeriesVolume, StudyDocument
+
+    print('[原位来源：缺几何保存与最近 20 次整卷 Undo]')
+    with tempfile.TemporaryDirectory() as directory:
+        _, sources = _project_document_fixture(directory)
+        datasets = deepcopy(sources[0].datasets)
+        for dataset in datasets:
+            for tag in ('ImageOrientationPatient', 'ImagePositionPatient', 'PixelSpacing'):
+                delattr(dataset, tag)
+        source = SeriesVolume.from_datasets(datasets)
+        doc = StudyDocument(source.study_uid); doc.attach_sources([source]); sid = source.series_uid
+        reference = bind_annotation({'id':'raw-ref', 'type':'ruler', 'p1':[1,1], 'p2':[2,2]},
+                                    None, [1, 0, 0], m.AXIAL, reference_all=True)
+        doc.edit_annotations(sid, {'all': [reference]})
+        for step in range(22):
+            doc.replace_mask(sid, np.full(source.volume.shape, 5 if step % 2 == 0 else 0, np.uint8), None)
+        path = os.path.join(directory, 'raw.miwproj')
+        save_project_snapshot(capture_project_snapshot(doc), path)
+        restored = load_project_snapshot(path); restored.attach_sources([source])
+        check(restored.series[sid].geometry_binding is None and restored.series[sid].annotations['all'] == [reference]
+              and len(restored.history) == 20,
+              '缺几何但来源可验证的原位参考完整保存，不补造患者坐标；持久化最近 20 步')
+        results = []
+        for step in range(20):
+            restored.undo(); results.append(np.all(restored.series[sid].working_mask == (5 if step % 2 == 0 else 0)))
+        check(all(results) and restored.undo() is None and restored.series[sid].annotations['all'] == [reference],
+              '重开后 20 次整卷 Undo 逐步恢复；更早的参考标注仍保留在最终状态')
+
+
+def test_project_mixed_source_identity(app):
+    import tempfile
+    from pathlib import Path
+
+    import pydicom
+
+    from project_store import (
+        ProjectError,
+        capture_project_snapshot,
+        load_project_snapshot,
+        save_project_snapshot,
+    )
+
+    print('[同检查混合来源：只读坏序列不阻断有效标注保存]')
+    with tempfile.TemporaryDirectory() as directory:
+        source_dir = Path(directory) / 'dicom'; source_dir.mkdir()
+        _, sources = _project_document_fixture(str(source_dir), ('CT', 'CT'))
+        for path in source_dir.glob('1-*.dcm'):
+            dataset = pydicom.dcmread(path); del dataset.SOPInstanceUID; dataset.save_as(path)
+        v = m.MedicalViewer(project_dir=str(Path(directory) / 'projects'), autosave=False)
+        kickoffs = []; v._kickoff_ai = lambda: kickoffs.append(v.active_series_uid)
+        try:
+            v.load_data(str(source_dir))
+            doc = v.study_document
+            good = next(sid for sid, record in doc.series.items() if record.source_binding)
+            bad = next(sid for sid, record in doc.series.items() if not record.source_binding)
+            v._activate_series(bad)
+            check(not v._view_editable(v.views[1]) and bad not in kickoffs,
+                  '缺 SOP 身份的 CT 仍可阅片，但不可编辑，也不启动无法保存的 AI')
+            doc.edit_mask(good, [2], 255, layer_id='working-manual')
+            path = Path(directory) / 'valid.miwproj'
+            try:
+                save_project_snapshot(capture_project_snapshot(doc), path)
+                restored = load_project_snapshot(path)
+                valid = set(restored.series) == {good} and restored.series[good].layers['working-manual'].mask.flat[2] == 255
+            except ProjectError:
+                valid = False
+            check(valid, '无标注的只读暂存序列不阻断有效来源的完整保存；保存内容可重新恢复')
+            doc.series[bad].working_mask.flat[1] = 5
+            try:
+                capture_project_snapshot(doc); refused = False
+            except ProjectError:
+                refused = True
+            check(refused, '来源身份丢失却包含标注时必须拒绝，不静默省略已标内容')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_project_save_history_boundary():
+    import tempfile
+    from pathlib import Path
+
+    from project_store import ProjectError, capture_project_snapshot, save_project_snapshot
+
+    print('[保存前历史校验：拒绝无法完整恢复的候选]')
+    with tempfile.TemporaryDirectory() as directory:
+        doc, sources = _project_document_fixture(directory); sid = sources[0].series_uid
+        doc.edit_mask(sid, [2], 5)
+        path = Path(directory) / 'safe.miwproj'
+        save_project_snapshot(capture_project_snapshot(doc), path); original = path.read_bytes()
+        # 模拟旁路写入破坏已提交事务边界；保存不能报告成功后才在重开时发现历史坏了。
+        doc.series[sid].working_mask = doc.series[sid].working_mask.copy()
+        doc.series[sid].working_mask.flat[2] = 8
+        try:
+            save_project_snapshot(capture_project_snapshot(doc), path); refused = False
+        except ProjectError:
+            refused = True
+        check(refused and path.read_bytes() == original,
+              '历史 after 与最终标签不一致时拒绝替换，上一份可恢复工程保持完整')
+
+
+def test_viewer_ai_autosave_and_preview(app):
+    import tempfile
+    import time
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtTest import QTest
+
+    from graphics_view import TOOL_SEG_BRUSH
+    from project_store import load_project_snapshot
+
+    print('[自动保存：纯 AI 结果与未提交鼠标预览]')
+    with tempfile.TemporaryDirectory() as directory:
+        source_dir = Path(directory) / 'dicom'; source_dir.mkdir()
+        _project_document_fixture(str(source_dir))
+        v = m.MedicalViewer(project_dir=str(Path(directory) / 'projects'), autosave=True)
+        v._kickoff_ai = lambda: None
+        try:
+            v.load_data(str(source_dir)); v.show(); QTest.qWait(180)
+            doc, sid = v.study_document, v.active_series_uid
+            v.ai_thread = SimpleNamespace(confidence=np.full(v.volume_hu.shape, 180, np.uint8),
+                used_fallback=False, resampled_from=None, isRunning=lambda: False, cancel=lambda: None)
+            v.on_auto_ai_finished(np.full(v.volume_hu.shape, 5, np.uint8), 1., v._ai_generation)
+            revision = doc.revision
+            v.on_auto_ai_finished(np.full(v.volume_hu.shape, 7, np.uint8), 1., v._ai_generation - 1)
+            check(doc.revision == revision, '过期 AI 回调不改变内容或保存 revision')
+            deadline = time.monotonic() + 6
+            while (doc.project_path is None or doc.saved_revision != doc.revision) and time.monotonic() < deadline:
+                QTest.qWait(10)
+            restored = load_project_snapshot(doc.project_path)
+            check(np.all(restored.series[sid].working_mask == 5)
+                  and len([layer for layer in restored.series[sid].layers.values() if layer.readonly]) == 1
+                  and restored.saved_at == doc.saved_at == v._last_saved_at,
+                  '无需手工编辑，真实 2 秒计时器自动保存 AI 原始/工作结果及保存时间')
+            v.spin_brush.setValue(0); v.change_active_tool(TOOL_SEG_BRUSH)
+            v.cb_paint_target.setCurrentIndex(v.cb_paint_target.findData(255))
+            view = v.views[1]['view']; point = view.mapFromScene(QPointF(2.5, 1.5))
+            revision = doc.revision
+            QTest.mousePress(view.viewport(), Qt.LeftButton, Qt.NoModifier, point)
+            v._autosave_idle.timeout.emit()
+            deadline = time.monotonic() + 5
+            while v._save_worker is not None and time.monotonic() < deadline:
+                QTest.qWait(10)
+            preview = load_project_snapshot(doc.project_path)
+            check(view.is_drawing and doc.revision == revision
+                  and not preview.series[sid].layers['working-manual'].mask.any(),
+                  '后台保存只读已提交数据，不保存半笔，也不取消正在进行的实际鼠标预览')
+            QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, point)
+            check(doc.revision == revision + 1 and np.count_nonzero(v.volume_mask) == 1,
+                  '保存后松开鼠标仍提交一个来源体素，历史与新 revision 一致')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_viewer_partial_project_preservation(app):
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from project_store import load_project_snapshot
+
+    print('[部分载入产品链路：保留未连接序列及其历史]')
+    with tempfile.TemporaryDirectory() as directory:
+        source_dir = Path(directory) / 'all'; source_dir.mkdir()
+        _, sources = _project_document_fixture(str(source_dir))
+        subset = Path(directory) / 'subset'; subset.mkdir()
+        for path in source_dir.glob('0-*.dcm'):
+            shutil.copyfile(path, subset / path.name)
+        project_dir = Path(directory) / 'projects'
+        v = m.MedicalViewer(project_dir=str(project_dir), autosave=False); v._kickoff_ai = lambda: None
+        fresh = None
+        try:
+            v.load_data(str(source_dir)); doc = v.study_document
+            for sid in doc.series:
+                doc.edit_mask(sid, [2], 255, layer_id='working-manual')
+            # 让最晚操作明确属于此次没有连接的序列。
+            offline = next(source.series_uid for source in sources if int(source.volume.flat[0]) == 101)
+            doc.edit_mask(offline, [3], 255, layer_id='working-manual')
+            v.save_project(); original_history = len(doc.history)
+            fresh = m.MedicalViewer(project_dir=str(project_dir), autosave=False); fresh._kickoff_ai = lambda: None
+            fresh.load_data(str(subset)); partial = fresh.study_document
+            check(len(partial.series) == 2 and partial.series[offline].source is None
+                  and np.count_nonzero(partial.series[offline].layers['working-manual'].mask) == 2,
+                  '只选一个 DICOM 子目录仍恢复全部工程，缺失序列保持离线标注')
+            revision = partial.revision; fresh._undo_mask_edit()
+            check(partial.revision == revision and len(partial.history) == original_history,
+                  '栈顶依赖离线来源时不弹栈，也不跳过它撤回更早编辑')
+            fresh.save_project(); restored = load_project_snapshot(partial.project_path)
+            check(len(restored.series) == 2 and len(restored.history) == original_history
+                  and np.count_nonzero(restored.series[offline].layers['working-manual'].mask) == 2
+                  and all(row['statistics_status'] == 'cached' for row in restored.series[offline].statistics),
+                  '部分载入后再保存不缩减内容，未连接序列保留缓存统计和原历史')
+        finally:
+            if fresh is not None:
+                fresh.close()
+            v.close(); app.processEvents()
+
+
+def test_viewer_save_directory_collision(app):
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QFileDialog
+
+    print('[保存位置：选择目录不覆盖另一份同名工程]')
+    with tempfile.TemporaryDirectory() as directory:
+        source_dir = Path(directory) / 'source'; source_dir.mkdir(); _project_document_fixture(str(source_dir))
+        chosen = Path(directory) / 'chosen'; chosen.mkdir()
+        v = m.MedicalViewer(project_dir=str(Path(directory) / 'old'), autosave=False); v._kickoff_ai = lambda: None
+        v._project_settings = QSettings(os.path.join(directory, 'settings.ini'), QSettings.IniFormat)
+        try:
+            v.load_data(str(source_dir)); v.save_project()
+            occupied = chosen / Path(v.study_document.project_path).name
+            occupied.write_bytes(b'pre-existing project, not authorized to overwrite')
+            original = occupied.read_bytes()
+            with patch.object(QFileDialog, 'getExistingDirectory', return_value=str(chosen)):
+                selected = v.choose_project_directory()
+            check(selected and v.save_project() and occupied.read_bytes() == original
+                  and Path(v.study_document.project_path).parent == chosen
+                  and Path(v.study_document.project_path) != occupied,
+                  '目录中已有同名文件时使用独立工程名，原文件不被覆盖，状态提供实际新路径')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_series_metadata_link():
+    import tempfile
+    from copy import deepcopy
+
+    from pydicom.uid import generate_uid
+
+    from series_registration import metadata_link, transfer_cursor, transform_points
+    from study_data import SeriesVolume
+
+    print('[多序列空间定位：身份、坐标与边界]')
+    with tempfile.TemporaryDirectory() as directory:
+        _, sources = _project_document_fixture(directory)
+        frames = [deepcopy(source.datasets) for source in sources]; reference = generate_uid()
+        for datasets in frames:
+            for ds in datasets:
+                ds.FrameOfReferenceUID = reference
+        moving, fixed = [SeriesVolume.from_datasets(datasets) for datasets in frames]
+        result = metadata_link(moving, fixed)
+        check(result.status == 'metadata' and np.array_equal(transform_points(result, [[1,2,3]]), [[1,2,3]])
+              and transfer_cursor(moving, fixed, [1,2,3], result) == (1,2,3),
+              '同 FrameOfReference 的元数据定位保留患者坐标，明确不冒充已验证图像配准')
+        frames[1] = deepcopy(frames[1])
+        for ds in frames[1]: ds.FrameOfReferenceUID = generate_uid()
+        different = SeriesVolume.from_datasets(frames[1])
+        try:
+            metadata_link(moving, different); rejected = False
+        except ValueError:
+            rejected = True
+        check(rejected, '不同或序列内冲突的 FrameOfReference 不能自动按同一患者坐标联动')
+        for ds in frames[1]:
+            ds.FrameOfReferenceUID = reference
+            ds.ImagePositionPatient = [1000,0,float(ds.ImagePositionPatient[2])]
+        remote = SeriesVolume.from_datasets(frames[1])
+        try:
+            metadata_link(moving, remote); rejected = False
+        except ValueError:
+            rejected = True
+        check(rejected, '空间无重叠时拒绝自动联动，不能把来源点夹到目标边缘')
+        check(transfer_cursor(moving, fixed, [100,2,3], result) is None,
+              '光标离开目标体积时返回无对应，不裁剪为一个貌似有效的位置')
+
+
+def _rigid_series_fixture(directory):
+    import pydicom
+    from pydicom.uid import MRImageStorage, generate_uid
+    from scipy.spatial.transform import Rotation
+
+    from study_data import read_series_directory
+
+    shape = (24, 36, 40); spacing = np.array([1., 1.2, 1.5])
+    axes = Rotation.from_euler('z', 15, degrees=True).as_matrix()
+    affine = np.eye(4); affine[:3,:3] = axes @ np.diag(spacing); affine[:3,3] = [-20,-20,-16]
+    xyz = np.indices(shape).reshape(3,-1)[::-1].T
+    world = np.einsum('ij,nj->ni', affine[:3,:3], xyz) + affine[:3,3]
+    motion = np.eye(4); motion[:3,:3] = Rotation.from_euler('xyz', [2,-3,4], degrees=True).as_matrix()
+    motion[:3,3] = [2.5,-1.8,1.2]
+    centers = np.array([[-4,-5,-3], [10,4,4], [-9,12,11], [4,13,-8]])
+
+    def phantom(points):
+        out = np.zeros(len(points))
+        for center, widths, scale in zip(centers, ([4,6,3], [3,4,6], [5,2,4], [2,3,2]), (900,600,1200,700), strict=True):
+            out += scale * np.exp(-np.sum(((points-center)/widths)**2,axis=1)/2)
+        return out
+
+    fixed = phantom(world)
+    moving = phantom(np.einsum('ij,nj->ni', motion[:3,:3], world) + motion[:3,3])
+    moving = .7 * moving + 12 * np.sqrt(moving)
+    study, reference = generate_uid(), generate_uid()
+    ids = [generate_uid(), generate_uid()]
+    for index, array in enumerate((moving, fixed)):
+        volume = np.rint(array.reshape(shape)).astype(np.int16)
+        for z in range(shape[0]):
+            path = os.path.join(directory, f'{index}-{z}.dcm')
+            _write_min_dcm(path, shape[1:], ids[index], None, z+1, modality='MR', sop_class_uid=MRImageStorage,
+                pixels=volume[z], study_uid=study, iop=[*axes[:,0], *axes[:,1]],
+                ipp=(affine @ [0,0,z,1])[:3], pixel_spacing=(spacing[1], spacing[0]))
+            dataset = pydicom.dcmread(path); dataset.FrameOfReferenceUID = reference; dataset.save_as(path)
+    sources = {s.series_uid: s for s in read_series_directory(directory).series}
+    return sources[ids[0]], sources[ids[1]], motion, centers
+
+
+def test_series_rigid_registration():
+    import tempfile
+    from dataclasses import replace
+
+    from series_registration import (
+        RegistrationCancelled,
+        register_rigid_3d,
+        result_matrix,
+        transform_points,
+        verify_landmarks,
+    )
+
+    print('[三维刚性配准：斜采集、跨强度与独立标志点]')
+    with tempfile.TemporaryDirectory() as directory:
+        moving, fixed, expected, landmarks = _rigid_series_fixture(directory)
+        result = register_rigid_3d(moving, fixed)
+        inverse = np.linalg.inv(expected)
+        moving_points = landmarks @ inverse[:3,:3].T + inverse[:3,3]
+        errors = np.linalg.norm(transform_points(result, moving_points) - landmarks, axis=1)
+        check(result.status == 'candidate' and errors.max() < 1.0,
+              f'完整三维旋转/平移在独立标志点误差 <1 mm，结果仍为待复核候选（{errors.max():.3f} mm）')
+        try:
+            result_matrix(result, moving, fixed); rejected = False
+        except ValueError:
+            rejected = True
+        check(rejected, '优化分数改善不自动允许标注对应，候选须先复核')
+        reviewed = verify_landmarks(result, moving_points, landmarks, tolerance_mm=1.0)
+        check(reviewed.status == 'landmarks' and np.allclose(result_matrix(reviewed, fixed, moving),
+                    np.linalg.inv(np.array(reviewed.moving_to_fixed_lps))),
+              '非共线独立标志点通过后可双向定位，反向矩阵符号正确')
+        for label, modified in (('无强度变化', replace(moving, volume=np.zeros_like(moving.volume))),):
+            try:
+                register_rigid_3d(modified, fixed); rejected = False
+            except ValueError:
+                rejected = True
+            check(rejected, f'{label} 时明确失败，不保存一个任意配准')
+        try:
+            register_rigid_3d(moving, fixed, cancelled=lambda: True); cancelled = False
+        except RegistrationCancelled:
+            cancelled = True
+        check(cancelled, '取消计算不产生有效配准结果')
+        try:
+            verify_landmarks(result, moving_points, landmarks + [12,0,0], tolerance_mm=1.); rejected = False
+        except ValueError:
+            rejected = True
+        check(rejected, '标志点明显错位时拒绝采用，即使优化度量曾改善')
+
+
+def test_registration_storage_and_history():
+    import tempfile
+    from copy import deepcopy
+    from pathlib import Path
+
+    from project_store import (
+        ProjectError,
+        capture_project_snapshot,
+        load_project_snapshot,
+        save_project_snapshot,
+    )
+    from series_registration import register_rigid_3d, verify_landmarks
+    from study_data import StudyDocument
+
+    print('[配准工程事务：结果版本、混合 Undo 与持久化]')
+    with tempfile.TemporaryDirectory() as directory:
+        moving, fixed, expected, landmarks = _rigid_series_fixture(directory)
+        doc = StudyDocument(moving.study_uid); doc.attach_sources([moving, fixed])
+        result = register_rigid_3d(moving, fixed)
+        inverse = np.linalg.inv(expected)
+        points = np.einsum('ij,nj->ni', inverse[:3,:3], landmarks) + inverse[:3,3]
+        verified = verify_landmarks(result, points, landmarks, tolerance_mm=1.)
+        notifications = []; doc.on_change = lambda current: notifications.append(current.revision)
+        old_revision = doc.revision
+        doc.add_registration(verified, expected_revision=old_revision)
+        check(doc.revision == old_revision + 1 and notifications == [doc.revision],
+              '纯配准结果进入独立版本并产生持久化 revision，不要求先手工编辑')
+        try:
+            doc.add_registration(result, expected_revision=old_revision); rejected = False
+        except ValueError:
+            rejected = True
+        check(rejected and len(doc.registrations) == 1, '过期输入 revision 的回调被拒绝，不改当前结果')
+        doc.adopt_registration(verified.result_id)
+        doc.edit_mask(fixed.series_uid, [2], 255, layer_id='working-manual')
+        path = Path(directory) / 'registered.miwproj'
+        save_project_snapshot(capture_project_snapshot(doc), path)
+        restored = load_project_snapshot(path)
+        check(restored.registrations == doc.registrations and restored.registration_links == doc.registration_links
+              and len(restored.history) == 2,
+              '三维变换/方向/参数/质量/来源及采用历史随完整工程恢复')
+        restored.attach_sources([fixed]); restored.undo()
+        before = deepcopy(restored.registration_links)
+        try:
+            restored.undo(); rejected = False
+        except ValueError:
+            rejected = True
+        check(rejected and restored.registration_links == before and len(restored.history) == 1,
+              '采用变换的 Undo 依赖两端来源，离线时拒绝而不弹栈或半撤回')
+        restored.attach_sources([moving]); restored.undo()
+        check(not restored.registration_links and len(restored.registrations) == 1
+              and not restored.series[fixed.series_uid].layers['working-manual'].mask.any(),
+              '重连后按统一顺序撤回采用，保留原配准结果版本，来源 mask 没有被重采样覆盖')
+
+        def bad_matrix(manifest, members):
+            manifest['registrations'][verified.result_id]['moving_to_fixed_lps'][0][0] = 2
+
+        _rewrite_project(path, bad_matrix)
+        try:
+            load_project_snapshot(path); rejected = False
+        except ProjectError:
+            rejected = True
+        check(rejected, '重算外层摘要也不能将缩放矩阵冒充三维刚性配准')
+
+
+def test_viewer_series_correspondence(app):
+    import tempfile
+    from copy import deepcopy
+    from pathlib import Path
+
+    import pydicom
+    from pydicom.uid import generate_uid
+    from PySide6.QtTest import QTest
+
+    print('[多序列产品联动：患者位置与只读对应标注]')
+    with tempfile.TemporaryDirectory() as directory:
+        _project_document_fixture(directory); reference = generate_uid()
+        for path in Path(directory).glob('*.dcm'):
+            ds = pydicom.dcmread(path); ds.FrameOfReferenceUID = reference; ds.save_as(path)
+        v = m.MedicalViewer(project_dir=str(Path(directory)/'projects'), autosave=False); v._kickoff_ai = lambda: None
+        try:
+            v.load_data(directory); v.show(); QTest.qWait(180)
+            doc = v.study_document; first = v.active_series_uid
+            second = next(sid for sid in doc.series if sid != first)
+            doc.series[first].active_layer_id = 'working-manual'
+            doc.edit_mask(first, [1*20 + 1*5 + 2], 255, layer_id='working-manual')
+            v._sync_committed_edit(); v.current_3d_pos = [1,1,2]
+            masks = {sid: deepcopy(record.layers['working-manual'].mask) for sid,record in doc.series.items()}
+            v.combo_series.setCurrentIndex(v.combo_series.findData(second)); app.processEvents()
+            check(v.current_3d_pos == [1,1,2] and '元数据' in v.lbl_series_link.text(),
+                  '通过真实序列选择控件切换到同一患者位置，并明确元数据定位状态')
+            v.cb_reference_series.setCurrentIndex(v.cb_reference_series.findData(first))
+            v.chk_reference_annotations.setChecked(True); app.processEvents()
+            references = [item for item in v.views[1]['view'].scene.items() if item.data(11) == 'series-reference']
+            check(bool(references) and all(not (item.flags() & item.GraphicsItemFlag.ItemIsSelectable) for item in references),
+                  '另一序列的来源 mask 显示为独立只读对应层，不能被点击误删')
+            check(all(np.array_equal(record.layers['working-manual'].mask, masks[sid]) for sid,record in doc.series.items())
+                  and len(doc.history) == 1,
+                  '切换与对应显示均不重采样覆盖任一来源 mask，也不制造编辑历史')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_viewer_linked_lesion(app):
+    import tempfile
+    from pathlib import Path
+
+    import pydicom
+    from pydicom.uid import generate_uid
+    from PySide6.QtTest import QTest
+
+    with tempfile.TemporaryDirectory() as directory:
+        _project_document_fixture(directory); frame = generate_uid()
+        for path in Path(directory).glob('*.dcm'):
+            ds = pydicom.dcmread(path); ds.FrameOfReferenceUID = frame; ds.save_as(path)
+        v = m.MedicalViewer(project_dir=str(Path(directory) / 'projects'), autosave=False)
+        v._kickoff_ai = lambda: None
+        try:
+            v.load_data(directory); v.show(); app.processEvents()
+            doc = v.study_document; first = v.active_series_uid
+            second = next(sid for sid in doc.series if sid != first)
+            v.btn_new_lesion.click(); app.processEvents()
+            reference_layer = doc.series[first].active_layer_id
+            doc.edit_mask(first, [21], 255, layer_id=reference_layer)
+            v._sync_committed_edit()
+            v.combo_series.setCurrentIndex(v.combo_series.findData(second)); app.processEvents()
+            v.cb_reference_series.setCurrentIndex(v.cb_reference_series.findData(first)); app.processEvents()
+            button = getattr(v, 'btn_link_lesion', None)
+            check(button is not None and button.isEnabled(), '可通过界面在当前序列关联参考序列的活动病灶')
+            if button is None:
+                return
+            before = len(doc.history)
+            QTest.mouseClick(button, Qt.LeftButton); app.processEvents()
+            target_layer = doc.series[second].active_layer_id
+            reference = doc.series[first].layers[reference_layer]
+            target = doc.series[second].layers[target_layer]
+            check(target.lesion_id == reference.lesion_id and not target.mask.any()
+                  and reference.mask.flat[21] == 255 and len(doc.history) == before + 1,
+                  '关联按钮创建同编号空图层并选择它，只产生一步历史')
+            check(not button.isEnabled(), '已有同编号图层时禁用重复关联')
+            QTest.mouseClick(v.btn_undo, Qt.LeftButton); app.processEvents()
+            check(target_layer not in doc.series[second].layers and button.isEnabled()
+                  and reference.mask.flat[21] == 255, '界面 Undo 撤销关联后可再次关联，参考病灶保留')
+            v.combo_series.setCurrentIndex(v.combo_series.findData(first)); app.processEvents()
+            v.cb_layers.setCurrentIndex(v.cb_layers.findData('working-organs')); app.processEvents()
+            v.combo_series.setCurrentIndex(v.combo_series.findData(second)); app.processEvents()
+            check(not button.isEnabled(), '参考活动结果为器官时禁止冒充病灶关联')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_registered_cross_grid_annotations():
+    import tempfile
+    from copy import deepcopy
+
+    from scipy.spatial.transform import Rotation
+
+    import mpr_geometry
+    from series_registration import (
+        RegistrationResult,
+        project_corresponding_annotation,
+        sample_corresponding_plane,
+        transfer_cursor,
+        verify_landmarks,
+    )
+    from study_data import SeriesVolume
+
+    print('[刚性对应：不同分辨率/方向/矩阵的标签与普通标注]')
+    with tempfile.TemporaryDirectory() as directory:
+        moving, old_fixed, motion, _ = _rigid_series_fixture(directory)
+        source_cursor = np.array([12,17,19]); target_cursor = np.array([8,10,12])
+        point = (moving.affine @ [*source_cursor[::-1],1])[:3]
+        target_point = (motion @ [*point,1])[:3]
+        axes = Rotation.from_euler('xyz', [8,12,-7], degrees=True).as_matrix()
+        affine = np.eye(4); affine[:3,:3] = axes @ np.diag([1.6,1.8,2.2])
+        affine[:3,3] = target_point - affine[:3,:3] @ target_cursor[::-1]
+        frames = deepcopy(old_fixed.datasets[:17])
+        for z, ds in enumerate(frames):
+            ds.Rows, ds.Columns = 21,25
+            ds.PixelData = np.zeros((21,25), np.int16).tobytes()
+            ds.ImageOrientationPatient = [*axes[:,0], *axes[:,1]]
+            ds.ImagePositionPatient = (affine @ [0,0,z,1])[:3].tolist()
+            ds.PixelSpacing = [1.8,1.6]
+        fixed = SeriesVolume.from_datasets(frames)
+        result = RegistrationResult(moving.series_uid, fixed.series_uid,
+            moving.source_binding['digest'], fixed.source_binding['digest'],
+            moving.geometry_binding, fixed.geometry_binding, tuple(map(tuple, motion)),
+            'candidate', 'SimpleITK-Euler3D-MattesMI')
+        landmarks = np.array([point, point+[3,0,0], point+[0,4,0]])
+        result = verify_landmarks(result, landmarks, landmarks @ motion[:3,:3].T + motion[:3,3])
+        check(transfer_cursor(moving, fixed, source_cursor, result) == tuple(target_cursor)
+              and transfer_cursor(fixed, moving, target_cursor, result) == tuple(source_cursor),
+              '已知三轴变换下双向定位落在独立构造的体素中心，允许两端网格不同')
+        volume = np.arange(np.prod(moving.volume.shape), dtype=np.uint32).reshape(moving.volume.shape) + 1
+        original = volume.copy(); inverse_motion = np.linalg.inv(motion)
+        plane = mpr_geometry.patient_plane(fixed.affine, fixed.volume.shape, AXIAL, target_cursor)
+        shown = sample_corresponding_plane(moving, fixed, volume, plane, result, labels=True)
+        # 标量患者坐标 oracle 检查整个目标面；不以相同 shape 或一个非零像素代替方向证明。
+        expected = np.zeros(plane.shape, np.uint32)
+        for y,x in np.ndindex(plane.shape):
+            lps = plane.origin + plane.axes[:,0]*x*plane.spacing[1] + plane.axes[:,1]*y*plane.spacing[0]
+            source_xyz = np.linalg.solve(moving.affine, inverse_motion @ [*lps,1])[:3]
+            if np.all(source_xyz >= -.5) and np.all(source_xyz < np.array(volume.shape[::-1])-.5):
+                expected[y,x] = volume[tuple(np.floor(source_xyz+.5).astype(int)[::-1])]
+        check(np.array_equal(shown, expected) and np.count_nonzero(shown) > 0 and np.array_equal(volume, original),
+              '跨网格整面 nearest-neighbor 标签与独立 oracle 一致，高标签保留且来源数组不变')
+        source_plane = mpr_geometry.patient_plane(moving.affine, moving.volume.shape, AXIAL, source_cursor)
+        sx,sy,_ = source_plane.voxel_to_scene(source_cursor)
+        annotation = mpr_geometry.bind_annotation({'id':'cross-grid-line', 'type':'ruler',
+            'p1':(sx-1.5,sy-1.5), 'p2':(sx+2.5,sy+2.5)}, source_plane, source_cursor, AXIAL)
+        original_annotation = deepcopy(annotation)
+        projected = project_corresponding_annotation(annotation, moving, fixed, plane, result)
+        tx,ty,_ = plane.voxel_to_scene(target_cursor)
+        check(not projected['coplanar'] and np.allclose(projected['points'], [[tx+.5,ty+.5]])
+              and annotation == original_annotation,
+              '普通标尺经三轴变换后显示真实平面交点；来源对象及坐标不被改写')
+        reference = deepcopy(annotation); reference['space']['kind'] = 'source'
+        check(project_corresponding_annotation(reference, moving, fixed, plane, result) is None,
+              '二维来源/全局参考没有三维语义，不能投影成另一个序列的标尺')
+
+
+def test_registration_review_sweep(app):
+    import tempfile
+    from copy import deepcopy
+    from unittest.mock import patch
+
+    from pydicom.uid import generate_uid
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDialog, QPushButton
+
+    import series_registration
+    from annotation_lab import RegistrationReviewDialog
+    from study_data import SeriesVolume
+
+    print('[配准复核：矢状采集仍沿三个患者平面完整浏览]')
+    with tempfile.TemporaryDirectory() as directory:
+        _, sources = _project_document_fixture(directory)
+        frames = [deepcopy(source.datasets) for source in sources]; reference = generate_uid()
+        for datasets in frames:
+            for z, ds in enumerate(datasets):
+                ds.FrameOfReferenceUID = reference
+                ds.ImageOrientationPatient = [0,1,0,0,0,1]
+                ds.ImagePositionPatient = [z*2,0,0]
+                ds.PixelSpacing = [1.5,.8]
+        moving, fixed = [SeriesVolume.from_datasets(datasets) for datasets in frames]
+        result = series_registration.metadata_link(moving, fixed)
+        sample = series_registration.sample_corresponding_plane; seen = []
+
+        def observed(source, target, volume, plane, result, **kwargs):
+            seen.append(float(plane.origin @ plane.axes[:,2]))
+            return sample(source, target, volume, plane, result, **kwargs)
+
+        with patch.object(series_registration, 'sample_corresponding_plane', side_effect=observed):
+            dialog = RegistrationReviewDialog(moving, fixed, result)
+            try:
+                dialog.show(); app.processEvents()
+                for plane, extent in enumerate((4.5,3.2,4.0)):
+                    slider = dialog.sliders[plane]
+                    slider.setValue(slider.maximum()); slider.setValue(slider.minimum())
+                    first = seen[-1]
+                    slider.setValue(slider.maximum()); last = seen[-1]
+                    check(np.allclose([first,last], [0,extent]),
+                          f'真实复核滑条 plane={plane} 覆盖患者坐标 0..{extent} mm，不误扫来源数组轴')
+                    aspect = (1.5,1.,2/3)[plane]
+                    check(all(abs(label.pixmap().width()/label.pixmap().height() - aspect) < .02
+                              for label in dialog.previews[plane]),
+                          f'配准复核 plane={plane} 三幅图按真实像素间距显示，物理宽高比 {aspect:.3f}')
+                keep = next(button for button in dialog.findChildren(QPushButton) if button.text() == '仅保留候选')
+                QTest.mouseClick(keep, Qt.LeftButton)
+                check(dialog.result() == QDialog.Rejected and not dialog.isVisible(), '点击仅保留候选确实拒绝采用')
+                dialog.show(); app.processEvents()
+                accept = next(button for button in dialog.findChildren(QPushButton) if button.text() == '已检查三面，采用')
+                QTest.mouseClick(accept, Qt.LeftButton)
+                check(dialog.result() == QDialog.Accepted and not dialog.isVisible(), '点击人工复核采用返回明确采用结果')
+            finally:
+                dialog.close(); app.processEvents()
+
+
+def test_viewer_registration_worker(app):
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    from project_store import load_project_snapshot
+
+    print('[配准产品入口：后台候选、明确采用与自动保存]')
+    with tempfile.TemporaryDirectory() as directory:
+        source_dir = Path(directory) / 'sources'; source_dir.mkdir()
+        moving, fixed, _, _ = _rigid_series_fixture(str(source_dir))
+        v = m.MedicalViewer(project_dir=str(Path(directory)/'projects'), autosave=True); v._kickoff_ai = lambda: None
+        try:
+            v.load_data(str(source_dir)); v._activate_series(fixed.series_uid)
+            v.cb_reference_series.setCurrentIndex(v.cb_reference_series.findData(moving.series_uid))
+            doc = v.study_document
+            with patch.object(v, '_review_registration', return_value=True):
+                started = v.start_series_registration()
+                loop = QEventLoop(); timer = QTimer(); timer.setInterval(20)
+                timer.timeout.connect(lambda: loop.quit() if v._registration_worker is None and doc.saved_revision == doc.revision else None)
+                deadline = QTimer(); deadline.setSingleShot(True); deadline.timeout.connect(loop.quit)
+                timer.start(); deadline.start(10000); loop.exec(); timer.stop(); deadline.stop()
+            check(started and len(doc.registrations) == 2 and len(doc.registration_links) == 1
+                  and len(doc.history) == 1,
+                  '实际 Qt worker 返回候选，明确复核采用后另记结果版本和一条统一 Undo')
+            saved = load_project_snapshot(doc.project_path)
+            check(saved.registration_links == doc.registration_links and saved.registrations == doc.registrations
+                  and '人工复核' in v.lbl_series_link.text(),
+                  '无需手工画笔，配准结果和采用状态自动落盘，界面不冒充标志点验证')
+            v._undo_mask_edit(); app.processEvents()
+            check(not doc.registration_links and len(doc.registrations) == 2,
+                  '界面 Undo 撤回采用而保留结果版本，随后可回到元数据定位')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_viewer_registration_cancellation(app):
+    import tempfile
+    from pathlib import Path
+    from threading import Event
+    from unittest.mock import patch
+
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    from series_registration import register_rigid_3d
+
+    print('[配准回调生命周期：过期、取消与关闭]')
+    with tempfile.TemporaryDirectory() as directory:
+        moving, fixed, _, _ = _rigid_series_fixture(directory)
+        result = register_rigid_3d(moving, fixed)
+        v = m.MedicalViewer(project_dir=str(Path(directory)/'projects'), autosave=False); v._kickoff_ai = lambda: None
+        try:
+            v.load_data(directory); v._activate_series(fixed.series_uid)
+            v.cb_reference_series.setCurrentIndex(v.cb_reference_series.findData(moving.series_uid))
+            doc = v.study_document
+            for mode in ('revision', 'cancel', 'close'):
+                entered, release = Event(), Event()
+
+                def delayed(*args, entered=entered, release=release, **kwargs):
+                    entered.set()
+                    if not release.wait(4):
+                        raise TimeoutError('test worker not released')
+                    return result  # 故意忽略取消，验证 UI 仍拒绝晚到结果。
+
+                with patch('series_registration.register_rigid_3d', side_effect=delayed), \
+                     patch.object(v, '_review_registration') as review:
+                    v.start_series_registration(); ready = entered.wait(2)
+                    if mode == 'revision':
+                        doc.edit_mask(fixed.series_uid, [3], 255, layer_id='working-manual'); v._sync_committed_edit()
+                    elif mode == 'cancel':
+                        v.btn_cancel_registration.click()
+                    before = doc.revision
+                    if mode == 'close':
+                        QTimer.singleShot(20, release.set); closed = v.close()
+                    else:
+                        release.set(); loop = QEventLoop()
+                        if v._registration_worker is not None:
+                            v._registration_worker.finished.connect(loop.quit); QTimer.singleShot(5000, loop.quit); loop.exec()
+                        closed = True
+                    check(ready and closed and v._registration_worker is None and not review.called
+                          and not doc.registrations and doc.revision == before,
+                          f'{mode}：晚到结果不接入、不弹复核，线程完成后可安全离开且原编辑仍保留')
+        finally:
+            v.close(); app.processEvents()
+
+
+def test_real_ct_annotation_project(app):
+    """本地公开 CT 的产品交互闭环；原图只读，工程隔离，禁止启动整卷器官推理。"""
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from PySide6.QtTest import QTest
+
+    from constants import TOOL_SEG_BRUSH
+    from project_store import load_project_snapshot
+
+    print('[真实 CT 产品闭环：调窗/三面编辑/保存/重开/Undo]')
+    with tempfile.TemporaryDirectory() as directory:
+        v = m.MedicalViewer(project_dir=directory, autosave=False)
+        v.persistence_dir = directory
+        launches = []
+
+        def forbid_inference():
+            launches.append(True)
+            raise AssertionError('This real-data acceptance must not launch whole-volume organ inference')
+
+        v._kickoff_ai = forbid_inference
+        try:
+            v.load_data(os.path.join(_ROOT, '肺癌')); v.resize(1280,800); v.show(); QTest.qWait(150)
+            source = v._active_source; doc = v.study_document; sid = v.active_series_uid
+            check(source.volume.shape == (233,512,512) and source.source_binding is not None
+                  and source.affine is not None and not v.hu_calibrated and not launches,
+                  '233 层公开 CT 以实际来源/空间接入，原始值不冒充 HU，不启动器官推理')
+            v.set_window(400,40); app.processEvents()
+            before = v.views[1]['view'].image_item.pixmap().toImage()
+            QTest.mouseClick(v.preset_btns[0], Qt.LeftButton); app.processEvents()
+            after = v.views[1]['view'].image_item.pixmap().toImage()
+            check(before != after and v._ct_preview_scale is not None and not v.hu_calibrated,
+                  '真实肺窗按钮改变显示预览，底层 CT HU 能力保持正确禁用')
+            v.spin_brush.setValue(0); v.change_active_tool(TOOL_SEG_BRUSH)
+            view = v.views[1]['view']; targets = []
+            for plane in (AXIAL,CORONAL,SAGITTAL):
+                target = (90+plane,220+plane,190+plane); targets.append(target)
+                v.current_3d_pos = list(target); v.views[1]['cb_plane'].setCurrentIndex(plane)
+                v.update_display(); app.processEvents()
+                mapping = v.views[1]['patient_plane']; sx,sy,_ = mapping.voxel_to_scene(target)
+                view.resetTransform(); view.scale(2,2); view.centerOn(sx+.5,sy+.5)
+                position = view.mapFromScene(QPointF(sx+.5,sy+.5))
+                QTest.mouseClick(view.viewport(), Qt.LeftButton, Qt.NoModifier, position)
+                check(v.volume_mask[target] == 255 and np.count_nonzero(v.volume_mask) == plane+1
+                      and len(doc.history) == plane+1,
+                      f'真实 CT plane={plane} 经鼠标单击只新增指定来源体素，历史顺序一致')
+            saved_mask = v.volume_mask.copy(); layer_id = doc.series[sid].active_layer_id
+            QTest.mouseClick(v.btn_save_proj, Qt.LeftButton); app.processEvents()
+            path = Path(doc.project_path)
+            check(path.parent == Path(directory) and path.is_file() and doc.saved_revision == doc.revision,
+                  '真实保存按钮将全部已标切片写到独立临时工程，并回报当前 revision 已保存')
+            restored = load_project_snapshot(path)
+            check(np.array_equal(restored.series[sid].layers[layer_id].mask, saved_mask)
+                  and len(restored.history) == 3,
+                  '离线读取完整工程的全部标记及最近三步与实际工作结果相同')
+            check(v.open_project(str(path)) and v.volume_hu is source.volume
+                  and np.array_equal(v.volume_mask, saved_mask) and not launches,
+                  '产品显式重开重新绑定同一影像，完整恢复工作结果且不重算 AI')
+            QTest.keyClick(v, Qt.Key_Z, Qt.ControlModifier); app.processEvents()
+            check(v.volume_mask[targets[-1]] == 0 and all(v.volume_mask[t] == 255 for t in targets[:-1])
+                  and len(v.study_document.history) == 2,
+                  '真实 Ctrl+Z 在重开后只撤回最后一个平面的单体素操作')
+            preserved = v.volume_mask.copy(); count = len(v.study_document.history)
+            v.reset_all_states(); app.processEvents()
+            check(np.array_equal(v.volume_mask, preserved) and len(v.study_document.history) == count,
+                  '真实 CT 显示重置保留跨切片工作结果与 Undo')
+            v.tabs.setCurrentIndex(1); v.toggle_phantom(); app.processEvents()
+            v.generate_sinogram()
+            with patch.object(v, 'display_numpy_image', wraps=v.display_numpy_image) as rendered:
+                v.run_fbp(); app.processEvents()
+            fbp = next((call.args[1] for call in rendered.call_args_list if call.args[0] == 4), None)
+            check(v.current_sinogram is not None and fbp is not None and np.isfinite(fbp).all()
+                  and np.std(fbp) > 0 and not v.views[4]['view'].image_item.pixmap().isNull()
+                  and np.array_equal(v.study_document.series[sid].layers[layer_id].mask, preserved),
+                  'CT 标注后进入原有模体重建入口，FBP 有效且不损坏工程标注')
+        finally:
+            v.close(); app.processEvents()
+
+
 def main_run():
     app = QApplication([])
+    test_patient_annotation_render_recovery(app)
+    test_viewer_linked_lesion(app)
+    test_registered_cross_grid_annotations()
+    test_registration_review_sweep(app)
+    test_viewer_registration_cancellation(app)
+    test_viewer_registration_worker(app)
+    test_viewer_series_correspondence(app)
+    test_registration_storage_and_history()
+    test_series_rigid_registration()
+    test_series_metadata_link()
+    test_viewer_save_directory_collision(app)
+    test_viewer_partial_project_preservation(app)
+    test_viewer_ai_autosave_and_preview(app)
+    test_project_save_history_boundary()
+    test_project_mixed_source_identity(app)
+    test_viewer_project_roundtrip(app)
+    test_viewer_autosave_queue(app)
+    test_viewer_leave_save_failure(app)
+    test_viewer_open_and_recovery(app)
+    test_project_summary_recovery_limits()
+    test_viewer_save_directory_race(app)
+    test_project_raw_and_history_limit()
+    test_project_store_roundtrip()
+    test_project_snapshot_isolation()
+    test_project_atomic_and_partial()
+    test_project_history_recovery()
+    test_project_final_validation()
+    test_project_statistics_record()
+    test_series_source_binding()
+    test_document_ordered_undo()
+    test_ai_original_working_layers()
+    test_document_pixel_gestures(app)
+    test_stroke_navigation_contract(app)
+    test_annotation_patient_geometry()
+    test_document_spatial_annotations(app)
+    test_document_ai_lifecycle(app)
+    test_document_lesion_instances()
+    test_linked_lesion_identity()
+    test_document_clear_and_track(app)
+    test_pixel_transform_boundaries(app)
+    test_study_candidate_loading()
+    test_patient_plane_sampler()
+    test_multiseries_viewer_loading(app)
+    test_oblique_mri_viewer_mapping(app)
+    test_unbound_source_disables_editing(app)
+    test_nonaxial_scroll_direction(app)
     test_spatial_ai_boundary_chain(app)
     test_mesh_patient_directions(app)
     test_compare_physical_grid_chain(app)
@@ -8014,10 +10199,8 @@ def main_run():
         test_performance_artifact_contract()  # 性能产物 provenance 合约：纯 stdlib + 临时文件
         test_doc_code_consistency()   # 文档与代码一致性：纯文本，无 Qt / 真实数据
     else:
-        v = m.MedicalViewer(data_dir=os.path.join(_ROOT, "肺癌"))
-        app.processEvents()
-        if v.ai_thread:
-            v.ai_thread.cancel()
+        test_real_ct_annotation_project(app)
+        v = _real_ct_test_viewer(app)
         test_startup(v)
         test_ai_engine(app)
         test_ai_inplane_axis_contract(app)
@@ -8119,6 +10302,7 @@ def main_run():
         test_doc_code_consistency()   # 文档与代码一致性：纯文本，无 Qt / 真实数据
         # 仅全套：需完整 git 历史，CI 浅克隆里没有 baseline object
         test_readme_self_attestation()  # README diff 自证点：git + 纯 stdlib
+        v.close(); app.processEvents(); v._test_directory.cleanup()
     total, passed = len(_CHECKS), sum(_CHECKS)
     # 这一行是计数的权威口径：报测试数请用它，不要数日志里的 PASS 行。
     print(f"\nCHECKS total={total} passed={passed} failed={total - passed}")

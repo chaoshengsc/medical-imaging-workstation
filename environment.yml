@@ -15,3 +15,4 @@ dependencies:
       - scipy==1.15.3
       - scikit-image==0.25.2
       - onnxruntime==1.23.2
+      - SimpleITK==2.5.3

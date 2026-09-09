@@ -20,6 +20,7 @@ import followup
 import mpr_geometry
 import registration
 from dicom_geometry import analyze_series
+from study_data import read_series_directory
 
 
 class CompareMixin:
@@ -51,27 +52,20 @@ class CompareMixin:
         self._enter_compare_mode()
 
     def _read_compare_dir(self, path):
-        """读取对比序列，返回 (volume_hu, datasets)。复用主读取逻辑但不破坏当前 self.dicom_datasets。"""
-        saved = self.dicom_datasets
-        saved_geometry = self.series_geometry
+        """读取独立 CT 候选，绝不临时修改主文档再尝试回滚。"""
         try:
-            if not self._read_dicom_dir(path):
+            candidate = read_series_directory(path)
+            if not candidate.series:
                 return None, []
-            geometry = self.series_geometry
+            source = max(candidate.series, key=lambda item: len(item.datasets))
+            geometry = source.geometry
             if not all((geometry.hu_calibrated, geometry.canonical_orientation,
                         geometry.inplane_spacing_valid, geometry.uniform_z_geometry_valid)):
                 return None, []
-            dsets = self.dicom_datasets
-            vol = np.array([
-                d.pixel_array.astype(np.float32) * float(d.RescaleSlope) +
-                float(d.RescaleIntercept) for d in dsets])
-            return vol, dsets
+            return source.volume, list(source.datasets)
         except Exception as e:
             print(f"读取对比序列失败: {e}")
             return None, []
-        finally:
-            self.dicom_datasets = saved   # 恢复主序列，绝不让对比读取污染主数据
-            self.series_geometry = saved_geometry
 
     @staticmethod
     def _zpos_array(datasets):
