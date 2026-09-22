@@ -288,6 +288,51 @@ def candidate_mask_provenance(card):
             'model_id': _value(card, 'model_id'), 'model_version': _value(card, 'version')}
 
 
+def _source_identity_has(card, *fields):
+    identity = _value(card, 'source_identity')
+    if not isinstance(identity, ModelSourceIdentity):
+        return False
+    return all(bool(getattr(identity, field)) for field in fields)
+
+
+_RECORD_CATEGORIES = {
+    # docs/AGENT_SYNC.md 里程碑 D 执行包第 3 条列的六类记录，一一对应到既有字段：
+    # 版本、来源分别落在卡片自身和 source_identity；输入序列要求落在
+    # required_sequences+modality；预处理/空间变换落在 source_identity 的测试
+    # transform 链和滑窗；输出身份落在 output_scope+type_scope。
+    'input_sequence_requirements': lambda card: (
+        _descriptor_is_known('required_sequences', _value(card, 'required_sequences'))
+        and _descriptor_is_known('modality', _value(card, 'modality'))),
+    'preprocessing': lambda card: _source_identity_has(card, 'official_input_filename',
+                                                        'official_test_transforms'),
+    'spatial_transform': lambda card: _source_identity_has(card, 'sliding_window',
+                                                            'official_device'),
+    'version': lambda card: _descriptor_is_known('version', _value(card, 'version')),
+    'source': lambda card: _source_identity_has(
+        card, 'upstream_repository', 'code_commit', 'code_license',
+        'weights_doi', 'weights_sha256', 'weights_license'),
+    'output_identity': lambda card: (
+        _descriptor_is_known('output_scope', _value(card, 'output_scope'))
+        and isinstance(_value(card, 'type_scope'), TypeOutputScope)),
+}
+
+
+def evidence_card_completeness(card):
+    """Report which of the six record categories a candidate model's card
+    actually carries (input-sequence requirements, preprocessing, spatial
+    transform, version, source, output identity).
+
+    This is a read-only audit, not an admission gate: it never mutates a
+    card, never authorizes execution or ingestion, and never claims a
+    category is complete beyond what the card's own recorded fields already
+    state. A category being present here says the record exists and is
+    internally consistent — it does not by itself mean the underlying
+    weights/code have been independently re-verified in this session.
+    """
+    missing = tuple(name for name, present in _RECORD_CATEGORIES.items() if not present(card))
+    return AdmissionDecision(not missing, 'evidence-card-completeness', missing)
+
+
 BIOMEDPARSE_CARD = ModelAdmissionCard(
     model_id='microsoft-biomedparse-v2',
     version='historical-local-candidate',
