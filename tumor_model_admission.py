@@ -258,15 +258,19 @@ def candidate_mask_admission(card):
     This is a lower, separate bar from product_execution_admission: patient/
     negative/OOD validation and automatic_execution/product_execution are not
     required here, because nothing runs automatically and nothing is adopted
-    automatically. It never authorizes autonomous execution and never touches
-    type_scope — a tumor-type claim stays gated by the strictly higher
-    lesion_type_admission, which callers must check on their own before ever
-    writing a type field anywhere near this candidate's provenance.
+    automatically. It still requires weights/code/license/input_contract/
+    task_compatibility to be actually VERIFIED, not merely HISTORICAL — a
+    model once validated on an older codebase or weight snapshot is not
+    treated as currently trustworthy without re-verification. It never
+    authorizes autonomous execution and never touches type_scope — a
+    tumor-type claim stays gated by the strictly higher lesion_type_admission,
+    which callers must check on their own before ever writing a type field
+    anywhere near this candidate's provenance.
     """
     failed = [field for field in _DESCRIPTORS
               if not _descriptor_is_known(field, _value(card, field))]
     failed.extend(field for field in _CANDIDATE_EVIDENCE
-                  if _value(card, field) not in (EvidenceState.VERIFIED, EvidenceState.HISTORICAL))
+                  if _value(card, field) is not EvidenceState.VERIFIED)
     return AdmissionDecision(not failed, 'candidate-mask-review', tuple(failed))
 
 

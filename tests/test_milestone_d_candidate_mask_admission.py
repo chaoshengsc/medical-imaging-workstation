@@ -99,6 +99,14 @@ def test_candidate_gate_does_not_require_product_execution_evidence():
         check(not decision.admitted and field in decision.failed_gates,
               f'候选复核门槛仍对 {field} 缺证据 fail-closed（不因门槛较低而放行）')
 
+    # 用户明确要求收紧：HISTORICAL（曾在旧代码/旧权重上验证过，未重新核实）不再算数，
+    # 候选复核这一层现在只认 VERIFIED——不因门槛低于产品执行就放宽到"曾经验证过"。
+    for field in ('weights', 'code', 'license', 'input_contract', 'task_compatibility'):
+        historical = replace(card, **{field: EvidenceState.HISTORICAL})
+        decision = candidate_mask_admission(historical)
+        check(not decision.admitted and field in decision.failed_gates,
+              f'{field} 只是 HISTORICAL（未重新核实）时仍拒绝，候选复核只接受 VERIFIED')
+
 
 def test_candidate_provenance_never_claims_a_tumor_type():
     print('[candidate_mask_provenance：不宣称瘤种]')
