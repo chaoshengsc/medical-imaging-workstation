@@ -1611,14 +1611,23 @@ class AnnotationMixin:
         return quantify.compute_organ_stats(self.volume_hu, self.volume_mask, spacing,
                                             self.organ_names, getattr(self, 'volume_conf', None))
 
+    def _mesh3d_ready(self):
+        """3D 表面重建只需几何有效、蒙版内有体素；不依赖 CT 专属的 HU 器官定量，
+        否则 MR 病灶标注（hu_calibrated 按设计恒为假）会永远看不到 3D 预览。"""
+        return bool(self.volume_mask is not None and self.volume_mask.any()
+                    and all((getattr(self, 'canonical_orientation', False),
+                             getattr(self, 'inplane_spacing_valid', False),
+                             getattr(self, 'uniform_z_geometry_valid', False))))
+
     def _update_organ_stats(self):
-        """刷新器官定量面板；无分割结果时清空并禁用导出按钮。"""
+        """刷新器官定量面板；无分割结果时清空并禁用导出按钮。3D 预览按钮的使能
+        单独看 _mesh3d_ready，与器官 HU 定量是否可用无关。"""
         self._organ_stats = self._compute_organ_stats()
         self._refresh_paint_target()   # 无论有无器官都刷新画笔目标下拉
+        self.btn_mesh3d.setEnabled(self._mesh3d_ready())
         if not self._organ_stats:
             self.lbl_ai_stats.setText("")
             self.btn_export_stats.setEnabled(False)
-            self.btn_mesh3d.setEnabled(False)
             return
         e = self.is_english
         lines = []
@@ -1653,7 +1662,6 @@ class AnnotationMixin:
             "画笔改过或 3D 追踪写入的体素不计入——它们的原值描述的是改动前那个标签。")
         self.lbl_ai_stats.setText("<br>".join(lines))
         self.btn_export_stats.setEnabled(True)
-        self.btn_mesh3d.setEnabled(True)
 
     def show_model_card(self):
         """弹出模型说明卡：出处如何被推断出来、实测到什么程度、有哪些已知局限。
@@ -1682,10 +1690,7 @@ class AnnotationMixin:
         取 cb_paint_target 的选中项作为对象，与画笔编辑保持同一"当前器官"语义，
         不再单设一个下拉——多一个状态就多一处可能不同步。
         """
-        if (self.volume_mask is None or not self._organ_stats
-                or not all((getattr(self, 'canonical_orientation', False),
-                            getattr(self, 'inplane_spacing_valid', False),
-                            getattr(self, 'uniform_z_geometry_valid', False)))):
+        if not self._mesh3d_ready():
             return
         lid = self.cb_paint_target.currentData()
         e = self.is_english
@@ -1721,7 +1726,7 @@ class AnnotationMixin:
         """三维预览弹窗：可鼠标拖动旋转的渲染视图 + 预设视角 + 形状特征 + STL 导出。"""
         e = self.is_english
         nm = next((r['name_en'] if e else r['name_zh'] for r in self._organ_stats if r['id'] == lid),
-                  f"label {lid}")
+                  ("Manual annotation" if e else "手动标注") if lid == MANUAL_TRACK_LABEL else f"label {lid}")
         rgb = (int(LABEL_LUT[lid][0]), int(LABEL_LUT[lid][1]), int(LABEL_LUT[lid][2]))
         dlg = QDialog(self)
         dlg.setWindowTitle(f"3D · {nm}")
