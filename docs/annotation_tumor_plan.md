@@ -663,3 +663,13 @@ NeuroVFM访问复查：用户告知“做了”后，使用现有独立环境及
 - **不做的事，如实记录：** 未重新核实 NeuroVFM 的 HuggingFace gated-repo 访问状态（那需要本机凭据发起鉴权请求，超出本轮"纯文字研究"范围）；未下载 Prima 的任何权重文件来核实上述许可声明是否与实际分发文件一致；未新增候选、未触碰 `tumor_model_admission.py`。
 
 下一步仍是 2026-09-08 记录里已经写清楚的那条：NeuroVFM 待用户对齐 HF 账号权限后再复查访问状态；Prima 若要继续，下一步是核实权重实际大小/摘要是否与许可声明一致，以及能否找到跨机构的独立患者级验证证据——这两步都需要下载文件或联系官方，不在本轮范围内。工作区仅改动本文档，未改产品代码，未提交模型作业。
+
+### NeuroVFM 访问状态复查（2026-09-22，用户对齐账号权限后）
+
+用户明确指示"账号权限对齐后再复查访问状态"。用本机既有 `huggingface_hub`（1.11.0）凭据（`whoami` 确认为账号 `sunce764`）对两个固定 revision 发起只读元数据请求：`hf_hub_download(repo_id, filename='config.json', revision=...)`，只取 config.json，不取权重文件（`pytorch_model.bin`）。
+
+- **`mlinslab/neurovfm-encoder`@`d5194fc70a162185f8ef062e362bd522a35312a9`：访问已获批**，不再是 2026-09-08 记录的 403/GatedRepoError。取回 `config.json`（385 字节）：`{"which": "vit", "params": {"embed_dim": 768, "depth": 12, "num_heads": 12, "embed_layer_cf": {"which": "voxel", "params": {"in_chans": 1, "embed_dim": 738, "bias": true, "fused_bias_fc": true, "patch_hw_size": 16, "patch_d_size": 4}}, "pos_emb_cf": {"which": "pe3d", ...}}}`——ViT-Base 规模（12层/12头/768维），体素 patch 编码（16×16×4）+ 3D 位置编码；`fused_bias_fc: true` 印证了 2026-09-08 "NeuroVFM CPU适配范围审计"里对 FusedDense/FusedBias 的顾虑不是空想，实际配置确实要用到。
+- **`mlinslab/neurovfm-dx-mri`@`628b661744482e528374d9c9ef1b54aded3d4c6e`：访问已获批**，同样不再 403。取回 `config.json`（212 字节）：`{"which": "classify_then_aggregate", "params": {"hidden_dim": 384, "W_out": 74, "mlp_out_dim": 74, "mlp_hidden_dims": [384], "use_gating": true, "use_norm": true, "use_output_bias_scale": true}}`——MIL 分类头输出 74 维（不是 Prima 的 52 维，两个模型的诊断标签体系不同，不能混用或直接比较）。
+- **仍未下载**：`pytorch_model.bin` 权重本体（合计约 290MB，2026-09-08 已记录字节数但未下载校验）。本次只验证了"能不能读到配置"，不代表已验证权重文件本身的哈希、许可条款文本、或模型可以在 CPU 上正确加载与推理。
+
+**结论：** 访问门已开，可以推进到"下载并校验权重哈希→按 2026-09-08 的 CPU 适配范围审计继续静态核对完整架构键→有界 CPU 冒烟"这条路径，但下载 290MB 权重文件、安装/核对推理所需依赖、执行任何前向计算，都超出当前"只读元数据"的授权范围，需要用户单独明确批准（对应硬边界"不下载模型、不训练、不用 GPU"）。产品代码未改，未安装新依赖，未下载权重文件，工作区本节只追加了这段记录。
