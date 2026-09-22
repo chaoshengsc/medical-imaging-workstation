@@ -11,6 +11,25 @@
 - 执行者完成一轮后更新“当前交接”，连同代码一起提交；审查者从该 commit 开始工作。
 - 不下载模型、不训练、不用 GPU、不上传数据、不远端 push；不把候选分割标成自动诊断。
 
+## 自动反馈包与循环
+
+工作会话每次完成一个写入阶段，必须在同一次提交中把下列反馈写入“当前交接”；缺少任一项，视为尚未交给审查：
+
+```text
+Feedback for review
+Commit: <hash>
+Scope completed: <one sentence>
+Files changed: <paths>
+Validation: <exact commands and pass/fail>
+Known limits / failures: <facts only>
+Decision requested: <none, or one concrete question>
+Next safe task: <one bounded task>
+```
+
+循环固定为：**MUI 工作**完成实现和本地提交 → 写入上述反馈包 → **MUI 审查与规划**只基于该提交复核、记录结论并写出下一项任务 → **MUI 工作**认领下一项任务。审查结论不是等待点。
+
+本文件和 Git 提交是两会话共享的可靠投递层：同一工作树中的反馈一经提交即可被审查会话读取。当前桌面环境没有向另一 Claude 会话自动输入消息或唤醒其执行的接口；因此不能把“文件已投递”表述成“审查会话已运行”。若未来有受支持的跨会话消息接口，再把最后一步替换成直接通知，不改变本记录格式。
+
 ## 已恢复的基础
 
 - 代码工作树：`/Users/sc/01_Projects/MUI`
