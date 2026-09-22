@@ -77,11 +77,24 @@
 
 ## 当前交接
 
-- 当前里程碑：A
-- 写入者：未分配
-- 基线提交：`a1db432`
-- 已验证：应用主窗口可创建；VS-SEG-002 T1 已实际载入为 `MR 120×512×512`；模型准入测试 6/6 通过。
-- 下一任务：完成里程碑 A 的真实病例“人工标注 → 保存 → 重开”闭环，并只修复该闭环中的失败。
+```text
+Milestone: A（已通过）
+Base commit: a1db432
+Writer: Claude
+Completed: VS-SEG-002 / VS-SEG-003 两例真实 MRI 的“载入→人工标注→Undo→保存→重开→标注仍在且空间不漂移”闭环已用真实数据验证通过；恢复后的 study_data/annotation_state/project_store 本身未发现根因缺陷，未做产品代码改动。同时修复了 tumor_model_admission.py 未登记进 pyproject.toml/ARCHITECTURE.md 的一致性守卫失败。
+Commits: 0dcb2c5
+Files changed: tests/test_milestone_a_mri_workflow.py（新增）, pyproject.toml, docs/ARCHITECTURE.md
+Validation:
+  - `SKIP_REAL_DATA=1 python tests/test_gui.py` → 1487 项，1486 通过 / 1 失败（见已知限制）
+  - `python tests/test_milestone_a_mri_workflow.py` → 38/38 通过（两例真实 MRI 全流程）
+  - `python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过
+  - `git diff --check` → 无空白/冲突残留
+Known limits:
+  - AGENT_SYNC 里程碑 A 执行包第 2 条写的是“Undo/Redo”，但全仓库（含 tests/）没有任何 Redo 实现，annotation_tumor_plan.md 的产品需求原文也只要求 Undo，未提及 Redo。判断为 AGENT_SYNC 措辞与产品口径不一致，未擅自新增 Redo 功能（那是超出“基础闭环验证”范围的新功能），验收按 annotation_tumor_plan.md 的 Undo-only 口径执行。需要用户/下一位 agent 确认：是否要在里程碑 B/C 正式排入 Redo 需求。
+  - `tumor_model_admission.qualify_vs_t1_source` 引用了不存在的模块 `series_read_qc`（`from series_read_qc import model_input_qc_safe`），且调用 `SeriesVolume.from_datasets(..., read_qc=...)`，与当前 `study_data.SeriesVolume.from_datasets(cls, datasets)` 签名不符——`SeriesVolume` 也没有 `read_qc` 字段。该函数当前没有任何测试覆盖，一旦被调用会直接抛异常。这是 RECOVERY_20260921.md 里程碑 D 相关模块（模型准入）的恢复缺口，不属于里程碑 A 的标注闭环，未在本轮修复；`tests/test_gui.py` 的“每个第三方 import 都已声明”一项因此仍标红，如实保留未掩盖。
+  - 里程碑 A 执行包第 3 条提到的“MPR 联动、显示切换及关闭重开后的工作区恢复”，本轮只验证了 Milestone A 验收句所要求的文档级闭环（标注数据+几何绑定），未做 MedicalViewer 级 GUI 工作区状态（窗口布局、当前视图）回归；这部分与里程碑 C 的“返回原工作位置”验收重叠，留给 C 执行。
+Next safe task: 里程碑 B——确认工程文件全量标注/图层保存恢复、真实 Undo 语义、单体素编辑边界，以及原始 AI 与人工工作层的数据模型分离（可复用本轮 tests/test_milestone_a_mri_workflow.py 的真实数据接入方式）。若要处理 qualify_vs_t1_source 的 series_read_qc 缺口，应作为里程碑 D 的独立任务单列，不要在 B/C 顺带修。
+```
 
 ## 每轮交接模板
 
