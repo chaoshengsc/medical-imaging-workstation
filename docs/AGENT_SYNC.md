@@ -207,3 +207,54 @@ Known limits / failures: <facts only>
 Decision requested: <none, or one concrete question>
 Next safe task: <one bounded task>
 ```
+
+## 当前交接（里程碑 C 反馈包）
+
+```text
+Feedback for review
+Commit: ef73100
+Scope completed: 用 VS-SEG-002/VS-SEG-003 两例真实 MRI，通过离屏 Qt 的真实 MedicalViewer 实例
+  （非 Qt-free 数据层）新增 tests/test_milestone_c_workspace_continuity.py，验证里程碑 C 执行包
+  第 1/2/5 条：任务切换（临床阅片↔重建实验室）与四窗/单窗布局切换的相机连续性、以及标注+切换
+  全流程+保存+新窗口重开后的数据/几何完整性。第 3/4 条（3D 预览的 mask 门槛、3D 视角随切片联动）
+  未覆盖——用真实数据验证后确认是一个需要产品决策的已有缺口，见下方 Decision requested，
+  未擅自修改 main.py/annotation_lab.py/mesh3d.py 的任何门禁逻辑。
+Files changed:
+  - tests/test_milestone_c_workspace_continuity.py（新增，唯一入库改动文件）
+Validation（逐条对应 AGENT_SYNC 要求的验收命令，均现场重跑非缓存结果）:
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py` → 38/38 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_annotation_workflow.py` → 76/76 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_c_workspace_continuity.py` → 30/30 通过
+    （VS-SEG-002、VS-SEG-003 各 15 项：载入/标注 3 项、任务切换相机+数据 5 项、布局切换相机 3 项、
+    重开无丢失 4 项）
+  - `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py` → 1486/1487 通过，
+    失败数未超过已知的 1 项（series_read_qc 未声明），与里程碑 A/B 交接时完全一致，无新增回归
+  - `/opt/miniconda3/envs/dicom_gui/bin/python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过
+  - `ruff check tests/test_milestone_c_workspace_continuity.py` → All checks passed；`git diff --check` → 无残留
+Known limits / failures:
+  - 执行包第 3/4 条未纳入自动化回归：用一次性探针脚本（未入库）在 VS-SEG-002 上现场验证——
+    即使给 working-manual 图层画出一个真实的 400 体素病灶 mask，`btn_mesh3d.isEnabled()` 仍为 False，
+    因为 `annotation_lab.py:_compute_organ_stats` 无条件要求 `hu_calibrated`，而
+    `study_data.py:148` 对非 CT 模态强制把 `hu_calibrated` 置假（这是 annotation_tumor_plan.md
+    明确要求的"HU 证明仅在 CT 入口有效"设计，不是本轮引入的缺陷）。结果是当前产品里 MR 病灶标注
+    完全无法触发 3D 预览按钮，与其可用性判据完全无关于 mask 内容。这不违反验收句字面
+    （没有出现"空白3D"，因为它压根不显示），但意味着"3D 视角与切片选中位置关联"这一条在真实 MR
+    数据上根本无法验证——3D 预览此刻对 MR 标注工作流不可达。
+  - 是否要让 3D 预览脱离 `hu_calibrated`/器官定量门槛、改为直接看 working-manual/病灶图层是否有
+    非零 mask，是一个会改变产品可见行为的决定，且不在 docs/ui_review.md 任何一轮"优化 UI"已确认
+    规则范围内（那些轮次全部基于 CT 工作流，早于 MR/VS-SEG 标注支持被恢复）。按里程碑 C 的停止
+    条件（"『优化 UI』会话未确认过的产品可见行为"），本轮未擅自修改 mesh3d.py 或
+    annotation_lab.py 的门禁逻辑，只如实记录现状。
+  - series_read_qc 缺口仍未处理，继续留给里程碑 D，本轮未触碰 tumor_model_admission.py。
+Decision requested: 是否要为 MR 病灶标注单独开一条 3D 预览可用性判据（不依赖 CT 专属的
+  hu_calibrated/器官定量），直接以 working-manual 或病灶图层是否有非零体素为准？这决定了
+  里程碑 C 第 3/4 条以及"进入/退出 3D"这部分验收要点该怎么继续；在收到方向前不会去改
+  btn_mesh3d 的使能逻辑或 mesh3d.py。
+Next safe task:
+  - 若决定要做：把"3D 预览可用性"改为检查 working-manual/病灶图层非零体素（与 hu_calibrated
+    解耦），限定只改 annotation_lab.py 的 `_update_organ_stats`/`btn_mesh3d` 使能路径，
+    不改 mesh3d.py 内部渲染算法；再补 tests/test_milestone_c_*.py 里第 3/4 条的真实数据回归
+    （3D 视角随 `current_3d_pos` 更新、无 mask 时保持禁用）。
+  - 若决定暂不做：里程碑 C 按"MPR/任务切换连续性"部分验收通过、3D 相关两条明确标记为"MR 工作流
+    暂不支持"推进里程碑 D（`tumor_model_admission.py` 的 fail-closed 逻辑与 series_read_qc 缺口）。
+```
