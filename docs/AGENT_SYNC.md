@@ -199,3 +199,42 @@ Known limits / failures: <facts only>
 Decision requested: <none, or one concrete question>
 Next safe task: <one bounded task>
 ```
+
+## 当前交接（用户已批复两项开放决策）
+
+```text
+Feedback for review
+Commit: 262a2b4
+Scope completed: 用户对上一轮两项开放决策直接批复：(1) 里程碑 C 遗留的"3D 视角随切片联动"
+  明确不做；(2) `candidate_mask_admission` 收紧为只接受 `EvidenceState.VERIFIED`，不再接受
+  `HISTORICAL`。本轮只落地第 (2) 项代码改动，第 (1) 项是"不做"，未产生任何改动。
+  收紧后对两个真实候选的影响：BIOMEDPARSE_CARD 新增在 weights/code 上被拒（此前只因
+  license/task_compatibility 被拒），VS_SEG_CARD 拒绝集合不变（其 weights/input_contract/
+  task_compatibility 本来就是 PENDING，不是 HISTORICAL）——两者此前已被拒绝，收紧没有制造新的
+  拒绝，只是让 BiomedParse 的拒绝理由更严格、更准确。
+Files changed:
+  - tumor_model_admission.py（`candidate_mask_admission` 内一行判定条件收窄 + docstring 说明）
+  - tests/test_milestone_d_candidate_mask_admission.py（新增 5 项回归，把"仅 HISTORICAL 时拒绝"
+    钉死，防止以后被悄悄放宽回去而没有测试报错）
+Validation（逐条重跑非缓存结果）:
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py` → 38/38 通过
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_annotation_workflow.py` → 76/76 通过
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_c_workspace_continuity.py` → 44/44 通过
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_vs_t1_source_qualification.py` → 12/12 通过
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_candidate_mask_admission.py`
+    → 36/36 通过（比上一轮多 5 项：HISTORICAL-only 逐字段拒绝回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_evidence_card_completeness.py` → 14/14 通过
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_execution_request_admission.py` → 20/20 通过
+  - `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py` → 1487/1487 全绿（保持）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过
+  - `ruff check tumor_model_admission.py tests/test_milestone_d_candidate_mask_admission.py`
+    → All checks passed；`git diff --check` → 无残留
+Known limits / failures: 无新增。上一轮交接里提到的"流程节奏"提醒已收到——本轮严格按用户逐条
+  下达的指示执行，未自行连续认领超出当次指示范围的条目。
+Decision requested: 无。三项开放决策中的两项（C item 4、HISTORICAL 口径）已批复完毕；第三项
+  （执行申请模板是否需要）仍待用户方便时回复，不阻塞任何已完成验收。
+Next safe task: 四个里程碑（A/B/C/D）第一轮工作、复核和用户决策均已完成闭环。下一步取决于用户：
+  若要继续，建议方向是里程碑 B/D 已识别但明确排在范围外的项目（例如"执行申请模板"的决定，或
+  annotation_tumor_plan.md 里 R2 及以后的模型研究方向）；若无新指示，本会话保持等待，不主动新增
+  未经明确授权的产品改动。
+```
