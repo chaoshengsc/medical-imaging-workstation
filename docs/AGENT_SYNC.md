@@ -327,3 +327,62 @@ Next safe task: 里程碑 D 执行包第 3 条——设计"每个候选模型的
   BIOMEDPARSE_CARD/VS_SEG_CARD 现有字段做一次逐项审计，指出哪些字段当前是 NOT_ESTABLISHED/
   PENDING/UNKNOWN 且缺一句"如何补齐"的说明，而不是新增运行代码。
 ```
+
+## 当前交接（里程碑 D 反馈包：执行包第 3 条）
+
+```text
+Feedback for review
+Commit: f85086f
+Scope completed: 里程碑 D 执行包第 3 条——为候选模型记录输入序列要求、预处理、空间变换、
+  版本、来源、输出身份。新增只读审计函数 `evidence_card_completeness(card)`
+  （tumor_model_admission.py，纯新增，未改任何既有函数/字段/证据卡），把这六类记录映射到既有字段
+  （required_sequences+modality / source_identity.official_test_transforms+input_filename /
+  source_identity.sliding_window+official_device / version / source_identity 的
+  repo+commit+license+weights 身份 / output_scope+type_scope），逐项判断是否齐备。
+  对仓库里两张真实证据卡的审计结果（未修改任一字段）：
+    - VS_SEG_CARD：六类记录全部齐备（其 KCL_VS_SEG_T1_SOURCE_IDENTITY 是本轮之前就存在的真实
+      数据，非本轮补造）；但 weights/input_contract/cpu_budget/task_compatibility 仍是 pending、
+      patient/negative/ood 仍是 not-established——记录完整不等于获准执行，两者独立成立。
+    - BIOMEDPARSE_CARD：缺 preprocessing / spatial_transform / source 三类，根因是它从恢复起
+      就没有任何 `source_identity`（`ModelSourceIdentity`）——这是既有缺口，本轮没有在缺乏独立
+      重新核实的情况下去补一个 source_identity（补了等于凭空宣称"来源已核实"，属于伪造证据）。
+Files changed:
+  - tumor_model_admission.py（纯新增一个私有 helper + 一个类别映射表 + 一个公开审计函数）
+  - tests/test_milestone_d_evidence_card_completeness.py（新增）
+Validation（逐条对应 AGENT_SYNC 要求的验收命令，均现场重跑非缓存结果）:
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py` → 38/38 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_annotation_workflow.py` → 76/76 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_c_workspace_continuity.py` → 44/44 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_vs_t1_source_qualification.py` → 12/12 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_candidate_mask_admission.py` → 31/31 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_evidence_card_completeness.py` → 14/14 通过
+    （两张真实卡的审计断言 5 项 + 合成卡六类记录各自独立验证 9 项，附完整字段级 EvidenceState
+    缺口打印——BiomedParse 9 项非 VERIFIED、VS-SEG 8 项非 VERIFIED，逐字段列在测试输出里）
+  - `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py` → 1487/1487 全绿（保持）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过
+  - `ruff check tumor_model_admission.py tests/test_milestone_d_evidence_card_completeness.py`
+    → All checks passed；`git diff --check` → 无残留
+Known limits / failures:
+  - 只做了审计，没有去补 BIOMEDPARSE_CARD 缺失的 source_identity，也没有去把 VS_SEG_CARD 的
+    weights/input_contract/cpu_budget/task_compatibility 从 pending 推进——那些都需要真实去核实
+    权重文件、试跑代码或运行资源，是里程碑 D 执行包第 4 条以及"真实模型效果"讨论的范围，本轮
+    明确不做。
+  - `evidence_card_completeness` 目前只有 BIOMEDPARSE_CARD/VS_SEG_CARD 两个真实调用对象；和
+    上一轮的 `candidate_mask_admission` 一样，没有接到任何 UI/main.py 调用路径，因为没有真实
+    模型触发它——同样按"没有真实调用方不预先设计接入代码"的原则未做。
+  - 里程碑 D 执行包第 1-3 条均已完成；第 4 条本身的性质是"只有权重、输入契约、患者级验证和运行
+    资源均有证据时，才单独提出执行申请"——这是一条流程规则（"证据不全就不能申请执行"），不是
+    一段可独立交付的代码；结合前三条的审计结果，目前两张卡都不满足，因此没有可以现在提出的执行
+    申请，第 4 条在这个意义上随着第 1-3 条的完成已经自然生效（fail-closed 的准入函数本身就在
+    强制它），而不是还欠一段实现。
+Decision requested: 里程碑 D 是否可以视为整体完成（四条执行包全部落地，验收句"无模型包、缺少序列
+  证据、空间身份不匹配、伪造结果均会被拒绝；不产生诊断或效能声明"已被 A/B/C 三个 D 测试文件加上
+  既有 6 项准入测试共同覆盖）？如果认为第 4 条需要一段独立的、面向未来"提出执行申请"这个动作本身
+  的代码或文档模板，请明确指出该模板应长什么样（本轮判断为流程规则已经生效，没有主动去写一个
+  没有真实使用场景的申请模板）。
+Next safe task: 若里程碑 D 判定通过，四个里程碑（A/B/C/D）已按 AGENT_SYNC 全部走完一轮；
+  剩余的开放决策项汇总为：(1) 里程碑 C item 4，3D 视角随切片/病灶位置联动该怎么定义；
+  (2) 上一轮 candidate_mask_admission 的 HISTORICAL 证据口径是否要收紧为只接受 VERIFIED；
+  (3) 本轮的"里程碑 D 第 4 条是否需要独立代码"。三项都不阻塞已完成的验收，可等用户方便时逐一批复；
+  在没有新指示前，不建议再新增没有真实模型/真实调用方的候选接入代码。
+```
