@@ -258,3 +258,50 @@ Next safe task:
   - 若决定暂不做：里程碑 C 按"MPR/任务切换连续性"部分验收通过、3D 相关两条明确标记为"MR 工作流
     暂不支持"推进里程碑 D（`tumor_model_admission.py` 的 fail-closed 逻辑与 series_read_qc 缺口）。
 ```
+
+## 当前交接（里程碑 C 反馈包：第 3 条决策落地）
+
+```text
+Feedback for review
+Commit: f49c369
+Scope completed: 用户对上一轮 Decision requested 回复"做"，已实现：3D 预览可用性判据
+  与 CT 专属的 hu_calibrated/器官 HU 定量解耦，改为只看几何是否有效 + 蒙版是否有真实体素
+  （新增 annotation_lab.py:_mesh3d_ready，供 btn_mesh3d 使能与 show_mesh3d 自身门禁共用）；
+  在 VS-SEG-002/003 真实 MR 上验证：空蒙版禁用→画出真实病灶体素后可用→show_mesh3d 产出非空
+  网格（有正体积）→撤销回空后重新禁用，全程通过。mesh3d.py 的渲染/抽面算法未改动，
+  CT 器官路径的 3D 可用性条件不变（对 CT 而言新判据是旧判据的超集，不改变现有行为）。
+Files changed:
+  - annotation_lab.py（_mesh3d_ready 新增；_update_organ_stats/show_mesh3d 改用它；
+    _show_mesh_dialog 的标题兜底给 MANUAL_TRACK_LABEL 一个可读名，不再显示"label 255"）
+  - tests/test_milestone_c_workspace_continuity.py（补执行包第 3 条的真实数据回归）
+Validation（逐条对应 AGENT_SYNC 要求的验收命令，均现场重跑非缓存结果）:
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py` → 38/38 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_annotation_workflow.py` → 76/76 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_c_workspace_continuity.py` → 44/44 通过
+    （比上一轮多 14 项：VS-SEG-002/003 各新增 7 项第 3 条 3D 可用性回归）
+  - `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py` → 1486/1487 通过，
+    失败数未超过已知的 1 项（series_read_qc 未声明），CT 器官/3D 既有测试均未受影响，无新增回归
+  - `/opt/miniconda3/envs/dicom_gui/bin/python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过
+  - `ruff check annotation_lab.py tests/test_milestone_c_workspace_continuity.py` → All checks passed；
+    `git diff --check` → 无残留
+Known limits / failures:
+  - 执行包第 4 条（3D 视角随当前切片/病灶选中位置联动）仍未实现：核对
+    `show_mesh3d`/`_show_mesh_dialog` 后确认 `current_3d_pos` 与 3D 视角（`MeshView(azimuth=30.0,
+    elevation=20.0)` 固定默认值）在代码里完全没有连接，这是一个需要单独设计的新功能（比如"3D 打开
+    时自动摆到能看清当前切片对应位置的角度"具体该怎么定义），不在这次"做"的授权范围内
+    （那次授权只针对第 3 条的可用性判据）。未擅自实现，留待下一次明确决策。
+  - series_read_qc 缺口仍未处理，继续留给里程碑 D，本轮未触碰 tumor_model_admission.py。
+Decision requested: 是否要继续做第 4 条（3D 视角随切片/病灶位置联动）？如果要做，需要先明确一句
+  "视角联动"具体指什么行为（例如：打开 3D 时按 current_3d_pos 所在层的位置自动选一个能看到该层
+  病灶的默认方位角，而不是固定 30°/20°），再评估要不要改 mesh3d.py 或只改
+  _show_mesh_dialog 传入的初始角度。
+Next safe task:
+  - 若决定要做第 4 条：先在 annotation_lab.py 里加一个把 current_3d_pos 换算成初始
+    azimuth/elevation 的纯函数（可放 mesh3d.py 或 annotation_lab.py，视是否需要几何库函数），
+    `_show_mesh_dialog` 用它替换硬编码的 30.0/20.0；补真实数据回归：改变切片位置后重新打开 3D，
+    断言初始视角随之变化。
+  - 若决定第 4 条暂不做，或已经足够：里程碑 C 按当前范围（执行包 1/2/3/5）验收通过，推进里程碑 D
+    ——`tumor_model_admission.py` 的 fail-closed 逻辑与 series_read_qc 缺口（该模块引用不存在的
+    `series_read_qc.model_input_qc_safe`，且调用签名与当前 `study_data.SeriesVolume.from_datasets`
+    不符，详见里程碑 A 交接时的记录）。
+```
