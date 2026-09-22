@@ -152,6 +152,43 @@ Next task（里程碑 B，一项连续执行任务）:
     - 触及 tumor_model_admission.py 或 series_read_qc 缺口。
 ```
 
+## 当前交接（里程碑 B 反馈包）
+
+```text
+Feedback for review
+Commit: 0d0a3eb
+Scope completed: 用 VS-SEG-002/VS-SEG-003 两例真实 MRI，新增 tests/test_milestone_b_annotation_workflow.py，
+  对里程碑 B 执行包 1-5 条逐项验证；全部通过，未在 study_data.py / project_store.py / annotation_lab.py
+  中发现需要修复的根因缺陷，因此本轮未改动任何产品代码。
+Files changed:
+  - tests/test_milestone_b_annotation_workflow.py（新增，唯一改动文件）
+Validation（逐条对应 AGENT_SYNC 要求的验收命令，均现场重跑非缓存结果）:
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py` → 38/38 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_annotation_workflow.py` → 76/76 通过
+    （VS-SEG-002、VS-SEG-003 各 38 项，对应执行包 1-5 条 × 两病例）
+  - `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py` → 1486/1487 通过，
+    失败数未超过已知的 1 项（series_read_qc 未声明），与里程碑 A 交接时完全一致，无新增回归
+  - `/opt/miniconda3/envs/dicom_gui/bin/python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过
+  - `ruff check tests/ pyproject.toml` → All checks passed；`git diff --check` → 无残留
+Known limits / failures:
+  - 执行包第 4 条（working-manual 与 AI 图层数据模型隔离）：VS-SEG-002/003 是本次恢复的公开研究病例，
+    没有随附任何历史 AI 推理缓存或权重产物可用于验证“旧 AI 结果隔离”。本轮如实只用 `add_ai_result`
+    这个既有 API 契约本身（合成一个只读版本层）验证隔离结构，测试内有明确注释说明这不代表、
+    不冒充这两例真的跑过 AI 推理或存在可考的历史模型输出。未伪造结果掩盖这一缺口。
+  - series_read_qc 缺口（`tumor_model_admission.qualify_vs_t1_source` 引用不存在的模块）未处理，
+    按里程碑 A 交接时的判断继续留给里程碑 D，本轮未触碰 tumor_model_admission.py。
+  - 里程碑 B 验收句要求的“至少覆盖一个已知坏例”实际交付了三个（保存失败注入 / 来源身份篡改 /
+    几何绑定退化矩阵篡改），均在真实 MRI 派生的 doc/工程包上触发，不是脱离真实数据的纯合成反例。
+  - 未验证：annotation_lab.py / main.py 层面的 UI 交互（画笔手势、ROI 拖动、Cine）——本轮沿用里程碑 A
+    的做法，只验证 Qt 无关的核心数据模型（study_data/annotation_state/project_store），UI 手势层留给
+    里程碑 C 的 MPR/3D/UI 收敛范围，未越界验证。
+Decision requested: 无。
+Next safe task: 里程碑 C——按 AGENT_SYNC 执行包审查工具栏/侧栏/四切片/任务切换逻辑，用真实 VS-SEG 病例
+  验证进入/退出 MPR 与 3D 后能回到原工作位置且无数据丢失；可复用里程碑 A/B 两个测试文件里
+  `_load_case`/manifest 驱动真实数据的接入方式，但这一步需要 Qt（`m.MedicalViewer`）级测试，
+  不能只测 Qt-free 数据层。
+```
+
 ## 每轮交接模板
 
 ```text
