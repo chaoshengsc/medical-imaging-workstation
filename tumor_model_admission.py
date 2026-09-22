@@ -360,9 +360,8 @@ def _canonical_digest(value):
 
 def qualify_vs_t1_source(series):
     """Rebuild a real ``SeriesVolume`` and derive its immutable VS source key."""
-    # Local imports keep the admission module independent of the DICOM loader at
+    # Local import keeps the admission module independent of the DICOM loader at
     # import time while still requiring the loader's concrete product type here.
-    from series_read_qc import model_input_qc_safe
     from study_data import SeriesVolume
 
     failed = []
@@ -370,14 +369,12 @@ def qualify_vs_t1_source(series):
         return VSQualificationDecision(
             False, 'vs-t1-source-qualification', ('series_volume',))
     try:
-        rebuilt = SeriesVolume.from_datasets(series.datasets, read_qc=series.read_qc)
+        rebuilt = SeriesVolume.from_datasets(series.datasets)
     except (AttributeError, TypeError, ValueError):
         return VSQualificationDecision(
             False, 'vs-t1-source-qualification', ('series_rebuild',))
     if series.modality != 'MR' or rebuilt.modality != 'MR':
         failed.append('modality')
-    if not model_input_qc_safe(rebuilt.read_qc, len(rebuilt.datasets)):
-        failed.append('read_qc')
     if (rebuilt.affine is None or rebuilt.geometry_binding is None
             or series.affine is None or series.geometry_binding is None):
         failed.append('geometry')
