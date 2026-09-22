@@ -98,95 +98,87 @@ Next safe task: <one bounded task>
 ## 当前交接
 
 ```text
-Milestone: B（立即执行；不等待新的用户任务）
-Base commit: fb12d77
+Milestone: C（立即执行；不等待新的用户任务）
+Base commit: 614ccdd
 Writer: 下一个读取本文件的执行 agent（Claude 或 Codex）
-Review note（复核里程碑 A，已通过）:
-  - 复核方式：不看记录直接重跑三条验收命令，产出与 0dcb2c5/fb12d77 记录逐项一致。
-    `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py` → 38/38 通过（VS-SEG-002/003 真实 DICOM 现场载入，非缓存结果）。
-    `SKIP_REAL_DATA=1 .../python tests/test_gui.py` → 1486/1487，失败项与已知限制一致（series_read_qc）。
+
+Review note（复核里程碑 B 反馈包 0d0a3eb，已通过）:
+  - 复核方式：不看反馈包记录，直接重跑全部四条验收命令，现场产出与反馈包记录逐项一致：
+    `.../python tests/test_milestone_a_mri_workflow.py` → 38/38（防回归，未受 B 改动影响）。
+    `.../python tests/test_milestone_b_annotation_workflow.py` → 76/76（VS-SEG-002/003 各 38 项）。
+    `SKIP_REAL_DATA=1 .../python tests/test_gui.py` → 1486/1487，失败项仍是且只是已知的
+    series_read_qc 未声明，与里程碑 A 时完全一致，无新增回归。
     `.../python -m unittest tests.test_tumor_model_admission -v` → 6/6。
-  - 抽查 project_store.load_project_snapshot：确认“重开”是从磁盘 zip 重新解码整份 manifest + npz 层，
-    重建全新 StudyDocument，不是复用内存对象或伪装成功；几何绑定按逐字段比较，不是形状比较。
-  - 抽查“Undo/Redo 措辞差异”的已知限制：grep 全仓库确认没有任何 Redo 实现，
-    annotation_tumor_plan.md 原文（第 25/49 行）也只写 Undo，判断为 AGENT_SYNC 措辞误差，
-    此前 agent 未擅自新增功能，处理方式恰当。
-  - 抽查 series_read_qc 缺口：git log 确认该 import 是 a1db432 恢复提交带入的既有缺口，
-    不是本轮改出来的，未在里程碑 A 顺带“悄悄修好”掩盖问题，如实留给里程碑 D，处理方式恰当。
-  - 未发现：病例身份混淆、把显示效果当数据正确性、放宽模型边界、或删检查绕过失败。
-  - 结论：里程碑 A 验收句字面达成，且验证方法（真实数据、独立重开、逐字段比较）经得起复核，予以通过。
-    docs/AGENT_SYNC.md 是本次唯一改动，未碰产品代码。
+    `.../python -m ruff check tests/ pyproject.toml` → All checks passed。
+  - `git show --stat 0d0a3eb` 确认唯一改动文件是新增的
+    tests/test_milestone_b_annotation_workflow.py，未碰 study_data.py / project_store.py /
+    annotation_lab.py 等产品代码，与反馈包“未发现需要修复的根因缺陷”的说法一致。
+  - 通读测试源码逐条核对是否有“删检查/放宽校验/伪造数据”获得通过的迹象：
+    * 20 步历史上限：核对 annotation_state.py:EditHistory（commands 列表 + `del
+      self.commands[:-self.limit]`）和 EditCommand.apply 的显式 before/after 状态回放，
+      证实“连续 25 笔后严格剩 20 步、回退 5/15/20 步精确复原”不是测试断言碰巧对上，
+      而是真实的命令模式实现（非清空重画的近似效果）。
+    * 单体素越界拒绝：核对 annotation_state.py 中 `Selection must match the source grid`
+      等显式 ValueError 校验路径存在，负索引/越界索引确实会走真实拒绝分支。
+    * 已知坏例注入：核对 `project_store._json_bytes` / `np.savez_compressed` /
+      `os.replace` 三个 patch 目标在 project_store.py 中确实存在（61/463/481 行），
+      不是 patch 一个不存在的属性导致 AttributeError 被误判为“测试通过”。
+    * 几何篡改拒绝：`_rewrite_project` 重算了 manifest.sha256，证实 load_project_snapshot
+      拒绝退化 affine 靠的是几何语义校验，不是仅靠 checksum 不匹配侥幸失败。
+  - 抽查“无真实旧 AI 缓存”的已知限制：VS-SEG 恢复目录里确认没有历史 AI 推理产物，
+    测试对此有醒目注释且只验证 add_ai_result 的隔离契约本身，未冒充这是真实历史模型结果，
+    处理方式恰当，不构成“伪造 AI 数据”。
+  - 未发现：病例身份混淆、把显示效果当数据正确性、放宽模型或医学功能边界、删检查绕过失败。
+  - 结论：里程碑 B 验收句（两例 MRI 完整保存恢复回归 + 至少一个已知坏例）字面达成且实际交付
+    超出下限（3 个已知坏例），验证方法经得起复核，予以通过。docs/AGENT_SYNC.md 是本次唯一改动。
 
-Next task（里程碑 B，一项连续执行任务）:
-  目标：完成 annotation_tumor_plan.md 已确认的人工标注产品链路验收（里程碑 B 执行包 1-5 条），
-  产出为新增/扩展的自动化回归测试 + 必要的最小根因修复，不是新功能。
+Next task（里程碑 C，一项连续执行任务，可直接认领，不等待用户确认）:
+  目标：按 AGENT_SYNC 里程碑 C 执行包 1-5 条，验证载入病例→人工标注→进入/退出 MPR 与 3D→
+  能返回原工作位置且无数据丢失；产出为 Qt 级自动化回归测试（离屏，`QT_QPA_PLATFORM=offscreen`，
+  参照 tests/test_gui.py 已有的 `QApplication` 离屏用法）+ 必要的最小根因修复，不是新功能、
+  不是外观偏好重新讨论。
+  已知的具体入口（供直接定位，避免现场重新摸索）：
+    - main.py:447 `on_tab_changed`——临床阅片(0)/重建实验室(1) 切换，内部调用
+      `_enter_recon_mode` / `_exit_recon_mode`，切换用 `setUpdatesEnabled(False)` 防闪烁。
+    - main.py:659 `_anatomical_mpr_available`、main.py:665 `_sync_view_controls`——
+      MPR 可用性与控件状态的联动判断。
+    - main.py:752 `switch_layout`——四切片/其他布局切换时用 `_capture_view_camera` /
+      `_restore_view_camera` 保存和恢复被隐藏视图的相机位置，是“返回原工作位置”的关键路径。
+    - main.py 中 `btn_mesh3d`（约 272/945 行）与 mesh3d.py 的 `extract_surface` /
+      `render_mesh`——3D 预览入口；mesh3d.py 用软件光栅化，不是外部 GPU/VTK 依赖。
   允许修改文件：
-    - tests/test_milestone_b_*.py（新增，命名类比 tests/test_milestone_a_mri_workflow.py）
-    - study_data.py / project_store.py / annotation_lab.py（仅限修复本轮验证中发现的真实根因缺陷；
-      禁止为了让测试通过而放宽校验或删除既有断言）
-    - docs/AGENT_SYNC.md（收尾更新“当前交接”）
-    - docs/ARCHITECTURE.md / pyproject.toml（仅在发现新的登记缺口时同步，做法参照 0dcb2c5）
-  禁止修改：tumor_model_admission.py 的模型准入逻辑与其测试（属里程碑 D，出问题单列任务，不顺带修）；
-  不得触碰任何模型运行路径；不得引入 GPU/训练/下载权重。
-  执行包对应的验证要点（用 VS-SEG-002、VS-SEG-003 真实数据，复用 test_milestone_a_mri_workflow.py 的接入方式）：
-    1. 一次工程内产生多笔跨切片/跨图层标注，保存→重开，逐层逐体素比对，而非只比对单一体素。
-    2. 连续多步编辑后 Undo 多步，确认每步都是精确回退（而非清空重画的近似效果），
-       且跨“重开”后历史仍可继续 Undo（本轮已验证 1 步，B 需验证多步及 20 步上限，参照
-       annotation_tumor_plan.md 第 28/104 行的“最近 20 个已完成操作”上限）。
-    3. 单体素增删只影响来源网格中对应体素：构造边界/相邻体素的负例断言（本轮已覆盖单个相邻体素，
-       B 需覆盖更多边界情形，如切片边缘、跨视图坐标转换后的体素）。
-    4. 断言 working-manual 与原始 AI/候选图层在数据模型上物理隔离（不同数组、不同 key），
-       若仓库当前没有真实旧 AI 结果可接入，如实报告“无旧 AI 数据可验证”，不得伪造结果验证通过。
-    5. 至少构造一个已知坏例（保存失败磁盘写满/来源不匹配 series_uid 改写/geometry_binding 字段
-       被篡改后拒绝载入），断言明确拒绝而不是静默损坏或吞异常。
-  验收命令（新增 B 专属回归 + 复跑 A 防回归）：
+    - tests/test_milestone_c_*.py（新增，命名类比 test_milestone_a/b）
+    - main.py / mesh3d.py / annotation_lab.py（仅限修复本轮验证中发现的真实根因缺陷：
+      如返回不了原布局、方向标识错误、拖拽阻塞、空 mask 却显示 3D、把显示平滑误当数据修改；
+      禁止为了让测试通过而放宽校验、删除既有断言或简化 UI 状态机语义）
+    - docs/AGENT_SYNC.md（收尾更新“当前交接”，含 Feedback for review 反馈包）
+    - docs/ARCHITECTURE.md / pyproject.toml（仅在发现新的登记缺口时同步）
+  禁止修改：tumor_model_admission.py 与 series_read_qc 缺口（仍留给里程碑 D）；不得触碰模型运行路径；
+  不得下载模型、训练、用 GPU、上传数据、远端 push。
+  执行包对应的验证要点（用 VS-SEG-002、VS-SEG-003 真实数据，复用 `_load_case`/manifest 接入方式，
+  但需要在 `m.MedicalViewer` 实例上跑，不能只测 Qt-free 数据层）：
+    1. 工具栏/侧栏/四切片/任务切换（`on_tab_changed`、`switch_layout`）在真实病例上按“优化 UI”
+       会话已确认规则逐条核对，记录核对结果而非重新讨论外观偏好。
+    2. 载入→四切片浏览→切到重建实验室→切回临床阅片：断言切回后每个可见视图的相机位置/缩放
+       （`_capture_view_camera` 的返回值）与切换前逐字段一致，而非仅断言“没有崩溃”。
+    3. 保持纯黑背景与方向标识不变的前提下，验证 3D 预览只在 working 层确有非零 mask 时可用
+       （`btn_mesh3d` 使能状态），空 mask 时保持禁用而非渲染空/错误居中的 3D。
+    4. 3D 视角与当前切片/病灶选中位置的关联：改变切片定位后再打开 3D，断言 3D 视角参数
+       随之更新，而不是停留在上一次打开时的默认视角。
+    5. 进入/退出 MPR 与 3D 全流程不能丢失里程碑 A/B 已验证的标注数据：编辑后走一遍
+       进入 3D→退出→保存→重开，复用 test_milestone_a 的逐体素/几何绑定比对方式断言无丢失。
+  验收命令（新增 C 专属回归 + 复跑 A/B 防回归）：
     - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py`（须仍 38/38）
-    - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_*.py`（新测试须全绿，列出比例）
+    - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_annotation_workflow.py`（须仍 76/76）
+    - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_c_*.py`（新测试须全绿，列出比例）
     - `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py`（失败数不得超过
-      当前已知的 1 项 series_read_qc；新增失败即视为回归，需先修复或如实记录为新的已知限制再交接）
+      当前已知的 1 项 series_read_qc；新增失败即视为回归）
     - `/opt/miniconda3/envs/dicom_gui/bin/python -m unittest tests.test_tumor_model_admission -v`（须仍 6/6）
-  停止条件（遇到以下情况立即停止写产品代码，只记录交接，交回用户或下一位复核）：
-    - 发现的根因缺陷修复会改变已确认的模型运行路径、医学功能边界或产品可见行为；
-    - 需要新增 Redo 或其他 annotation_tumor_plan.md 未写明的功能才能让测试“通过”；
-    - 无法用现有真实数据（VS-SEG-002/003）构造某条验收要点的真实反例，且伪造反例会掩盖问题；
+  停止条件（遇到以下情况立即停止写产品代码，只记录交接，交回复核）：
+    - 修复会改变已确认的模型运行路径、医学功能边界，或“优化 UI”会话未确认过的产品可见行为；
+    - 需要真实 GPU/VTK 渲染或外部显示环境才能验证，离屏方式无法覆盖；
+    - 无法用现有真实数据在离屏 Qt 环境下复现某条验收要点，且用截图人工判断代替自动化断言；
     - 触及 tumor_model_admission.py 或 series_read_qc 缺口。
-```
-
-## 当前交接（里程碑 B 反馈包）
-
-```text
-Feedback for review
-Commit: 0d0a3eb
-Scope completed: 用 VS-SEG-002/VS-SEG-003 两例真实 MRI，新增 tests/test_milestone_b_annotation_workflow.py，
-  对里程碑 B 执行包 1-5 条逐项验证；全部通过，未在 study_data.py / project_store.py / annotation_lab.py
-  中发现需要修复的根因缺陷，因此本轮未改动任何产品代码。
-Files changed:
-  - tests/test_milestone_b_annotation_workflow.py（新增，唯一改动文件）
-Validation（逐条对应 AGENT_SYNC 要求的验收命令，均现场重跑非缓存结果）:
-  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py` → 38/38 通过（防回归）
-  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_annotation_workflow.py` → 76/76 通过
-    （VS-SEG-002、VS-SEG-003 各 38 项，对应执行包 1-5 条 × 两病例）
-  - `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py` → 1486/1487 通过，
-    失败数未超过已知的 1 项（series_read_qc 未声明），与里程碑 A 交接时完全一致，无新增回归
-  - `/opt/miniconda3/envs/dicom_gui/bin/python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过
-  - `ruff check tests/ pyproject.toml` → All checks passed；`git diff --check` → 无残留
-Known limits / failures:
-  - 执行包第 4 条（working-manual 与 AI 图层数据模型隔离）：VS-SEG-002/003 是本次恢复的公开研究病例，
-    没有随附任何历史 AI 推理缓存或权重产物可用于验证“旧 AI 结果隔离”。本轮如实只用 `add_ai_result`
-    这个既有 API 契约本身（合成一个只读版本层）验证隔离结构，测试内有明确注释说明这不代表、
-    不冒充这两例真的跑过 AI 推理或存在可考的历史模型输出。未伪造结果掩盖这一缺口。
-  - series_read_qc 缺口（`tumor_model_admission.qualify_vs_t1_source` 引用不存在的模块）未处理，
-    按里程碑 A 交接时的判断继续留给里程碑 D，本轮未触碰 tumor_model_admission.py。
-  - 里程碑 B 验收句要求的“至少覆盖一个已知坏例”实际交付了三个（保存失败注入 / 来源身份篡改 /
-    几何绑定退化矩阵篡改），均在真实 MRI 派生的 doc/工程包上触发，不是脱离真实数据的纯合成反例。
-  - 未验证：annotation_lab.py / main.py 层面的 UI 交互（画笔手势、ROI 拖动、Cine）——本轮沿用里程碑 A
-    的做法，只验证 Qt 无关的核心数据模型（study_data/annotation_state/project_store），UI 手势层留给
-    里程碑 C 的 MPR/3D/UI 收敛范围，未越界验证。
-Decision requested: 无。
-Next safe task: 里程碑 C——按 AGENT_SYNC 执行包审查工具栏/侧栏/四切片/任务切换逻辑，用真实 VS-SEG 病例
-  验证进入/退出 MPR 与 3D 后能回到原工作位置且无数据丢失；可复用里程碑 A/B 两个测试文件里
-  `_load_case`/manifest 驱动真实数据的接入方式，但这一步需要 Qt（`m.MedicalViewer`）级测试，
-  不能只测 Qt-free 数据层。
 ```
 
 ## 每轮交接模板
@@ -200,5 +192,18 @@ Commits: <hashes>
 Files changed: <paths>
 Validation: <commands and pass/fail>
 Known limits: <facts only>
+Next safe task: <one bounded task>
+```
+
+## 反馈包模板（工作会话完成一轮后，在同一提交内附上）
+
+```text
+Feedback for review
+Commit: <hash>
+Scope completed: <one sentence>
+Files changed: <paths>
+Validation: <exact commands and pass/fail>
+Known limits / failures: <facts only>
+Decision requested: <none, or one concrete question>
 Next safe task: <one bounded task>
 ```
