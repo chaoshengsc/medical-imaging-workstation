@@ -274,3 +274,33 @@ Next safe task: 若要继续模型研究方向，两条明确的下一步都已�
   一致、并寻找跨机构独立患者级验证证据（同样需要下载/联系官方，超出本轮范围）。若无新指示，
   本会话保持等待，不主动下载模型、安装依赖或运行推理。
 ```
+
+## 当前交接（NeuroVFM 访问状态复查：门已开，权重仍未下载）
+
+```text
+Feedback for review
+Commit: 97895f6
+Scope completed: 用户指示"NeuroVFM 账号权限对齐后再复查访问状态"。用本机既有 huggingface_hub
+  凭据（账号 sunce764，非本轮新配置）对两个固定 revision 只请求 config.json（不请求权重），
+  结果：两个 gated repo 的访问都已获批（此前 2026-09-08 是 403/GatedRepoError）。
+Files changed:
+  - docs/annotation_tumor_plan.md（追加一节记录访问状态变化与两份 config.json 的架构信息）
+Validation: `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py`
+  → 1487/1487 全绿（保持不变，文档改动不影响产品代码）；`git diff --check` → 无残留。
+Known limits / failures:
+  - 只取了两份 config.json（385+212 字节），完全没有下载 pytorch_model.bin 权重本体
+    （合计约 290MB）；没有核实权重文件哈希、没有核实权重许可条款文本、没有安装任何推理依赖、
+    没有做任何前向计算。"访问已获批"只表示门开了，不表示 CPU 适配、患者级验证或产品接入
+    往前推进了一步。
+  - config 内容确认了两点此前只是推测的细节：encoder 是 ViT-Base（depth 12/heads 12/768 维），
+    体素 patch embed 用 fused_bias_fc=true——2026-09-08"NeuroVFM CPU适配范围审计"里对
+    FusedDense/FusedBias 的顾虑现在有了具体配置依据；dx-mri 头输出 74 维，与 Prima 的 52 维
+    诊断标签体系不同，两个模型不能互相替代或直接比较指标。
+Decision requested: 是否要继续推进到"下载 290MB 权重文件并核对哈希"这一步？这会撞到"不下载
+  模型"的硬边界，需要用户单独、明确地为这一具体下载授权（不能从"账号权限已对齐"推导出
+  "可以下载权重"）。在收到这个单独授权前，本会话不会下载任何权重文件、不安装新依赖、
+  不做任何前向推理。
+Next safe task: 等待用户对上面那个具体决策的答复。若批准下载，需要先明确资源上限（沿用
+  2026-09-08 记录里的默认 4 threads / 15 分钟 / 12GiB 采样上限，或用户给新的数值）以及
+  下载后的第一步是只做哈希/文件大小核对还是直接进入 CPU 适配原型验证。
+```
