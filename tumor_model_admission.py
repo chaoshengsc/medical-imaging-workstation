@@ -244,6 +244,50 @@ def lesion_type_admission(card):
     return AdmissionDecision(not failed, 'lesion-type', tuple(failed))
 
 
+_CANDIDATE_EVIDENCE = ('weights', 'code', 'license', 'input_contract', 'task_compatibility')
+
+_CANDIDATE_MASK_FIXED_PROVENANCE = {
+    'origin': 'candidate-model', 'requires_review': True, 'auto_adopted': False,
+}
+
+
+def candidate_mask_admission(card):
+    """Admit a model's output only as an unreviewed candidate mask a human must
+    explicitly review and adopt before it can become the working result.
+
+    This is a lower, separate bar from product_execution_admission: patient/
+    negative/OOD validation and automatic_execution/product_execution are not
+    required here, because nothing runs automatically and nothing is adopted
+    automatically. It never authorizes autonomous execution and never touches
+    type_scope — a tumor-type claim stays gated by the strictly higher
+    lesion_type_admission, which callers must check on their own before ever
+    writing a type field anywhere near this candidate's provenance.
+    """
+    failed = [field for field in _DESCRIPTORS
+              if not _descriptor_is_known(field, _value(card, field))]
+    failed.extend(field for field in _CANDIDATE_EVIDENCE
+                  if _value(card, field) not in (EvidenceState.VERIFIED, EvidenceState.HISTORICAL))
+    return AdmissionDecision(not failed, 'candidate-mask-review', tuple(failed))
+
+
+def candidate_mask_provenance(card):
+    """The fixed provenance a candidate-mask ingestion must carry, bound to one
+    admitted card. Raises if the card does not pass candidate_mask_admission,
+    so a provenance dict cannot be produced for a model that was refused.
+
+    The result never contains a tumor-type field. It also never contains an
+    'adopted' or 'active' flag set to true — callers must feed this straight
+    into an AI-result-style read-only version (e.g. annotation_state's
+    add_ai_result) and leave adoption as a distinct, explicit later action;
+    this function does not perform or authorize that adoption itself.
+    """
+    decision = candidate_mask_admission(card)
+    if not decision.admitted:
+        raise ValueError(f'Candidate mask admission failed: {decision.failed_gates}')
+    return {**_CANDIDATE_MASK_FIXED_PROVENANCE,
+            'model_id': _value(card, 'model_id'), 'model_version': _value(card, 'version')}
+
+
 BIOMEDPARSE_CARD = ModelAdmissionCard(
     model_id='microsoft-biomedparse-v2',
     version='historical-local-candidate',
