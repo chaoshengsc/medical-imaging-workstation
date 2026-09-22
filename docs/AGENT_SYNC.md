@@ -273,3 +273,57 @@ Next safe task: 里程碑 D 执行包第 2 条——为候选模型（如 Biomed
   模型（独立版本、默认不自动采用、不宣称瘤种），这一步需要先确认是否已有候选权重/代码可实际试跑，
   没有真实权重时应如实止步于数据模型设计和 fail-closed 测试，不写依赖不存在权重文件的"占位成功"。
 ```
+
+## 当前交接（里程碑 D 反馈包：执行包第 2 条）
+
+```text
+Feedback for review
+Commit: 4b0064d
+Scope completed: 里程碑 D 执行包第 2 条——本仓库目前没有任何候选模型的真实权重/可运行代码
+  （BIOMEDPARSE_CARD、VS_SEG_CARD 均为 automatic_execution=product_execution=False 的研究记录卡），
+  因此本轮如实止步于"候选 mask 接入"的数据模型与 fail-closed 测试，不写依赖不存在权重文件的
+  占位成功。新增两个纯函数（tumor_model_admission.py，纯新增，未改任何既有函数/dataclass/证据卡）：
+  `candidate_mask_admission(card)`——比 product_execution_admission 更低但仍 fail-closed 的门槛
+  （不要求 patient/negative/OOD 验证或 automatic_execution/product_execution，因为候选接入本身
+  不会自动运行或自动采用；但仍要求 weights/code/license/input_contract/task_compatibility 齐备，
+  且完全不读 type_scope）；`candidate_mask_provenance(card)`——未通过准入就拒绝生成，通过后返回
+  固定形状的 provenance（origin=candidate-model、requires_review=True、auto_adopted=False、
+  绑定 model_id/model_version），按构造就不含任何瘤种字段、不含置真的 adopted/active 标记。
+Files changed:
+  - tumor_model_admission.py（纯新增两个函数 + 两个模块级常量，未改动任何既有代码）
+  - tests/test_milestone_d_candidate_mask_admission.py（新增）
+Validation（逐条对应 AGENT_SYNC 要求的验收命令，均现场重跑非缓存结果）:
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py` → 38/38 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_annotation_workflow.py` → 76/76 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_c_workspace_continuity.py` → 44/44 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_vs_t1_source_qualification.py` → 12/12 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_candidate_mask_admission.py` → 31/31 通过
+    （两个真实候选仍被拒绝 4 项 + 门槛本身的 fail-closed 负例 5 项 + 不宣称瘤种 5 项 +
+    VS-SEG-002/VS-SEG-003 各 8 项真实数据接入契约）
+  - `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py` → 1487/1487 全绿（保持）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过
+    （既有 6 项未受影响，本轮是纯新增）
+  - `ruff check tumor_model_admission.py tests/test_milestone_d_candidate_mask_admission.py`
+    → All checks passed；`git diff --check` → 无残留
+Known limits / failures:
+  - 只交付了准入闸门本身（纯函数，无 I/O、无 Qt），没有在 main.py/annotation_lab.py/ai_engine.py
+    里接一个真实的"运行模型→调用 candidate_mask_admission→写入 document"的按钮或后台任务——
+    没有真实模型可以触发这条路径，本轮判断为没有真实调用方时提前写这段接入代码属于"为假设的未来
+    预先设计"，按 CLAUDE.md 的既有原则未做；真实数据集成测试改用直接调用
+    `StudyDocument.add_ai_result`/`adopt_ai_result` 的方式验证接入契约本身成立，不是通过真实 UI
+    入口验证的。
+  - `candidate_mask_admission` 对 weights/code 字段接受 EvidenceState.HISTORICAL（不只
+    VERIFIED），这是本轮做出的一个具体口径选择：候选复核不等于产品自动执行，允许"历史上验证过、
+    当前未重新核实"的证据进入人工复核队列。这个口径没有被用户单独确认过，如果审查认为过宽
+    （例如应该要求 VERIFIED 才能进候选复核），请明确指出，改起来只是把
+    `_CANDIDATE_EVIDENCE` 那行的 `(EvidenceState.VERIFIED, EvidenceState.HISTORICAL)` 收紧为
+    `(EvidenceState.VERIFIED,)`，影响范围可控。
+  - 里程碑 D 执行包第 3-4 条（为每个模型记录输入/预处理/空间变换/版本/来源的完整证据卡模板、
+    权重+契约+患者级验证+运行资源齐备才申请执行）仍未开始。
+Decision requested: 上面"Known limits"里的 HISTORICAL 口径是否需要收紧为只接受 VERIFIED？
+  不阻塞下方 Next task。
+Next safe task: 里程碑 D 执行包第 3 条——设计"每个候选模型的证据卡必须记录哪些字段才算完整"
+  的模板/校验（输入序列要求、预处理步骤、空间变换约定、版本、来源、输出身份），可以先对
+  BIOMEDPARSE_CARD/VS_SEG_CARD 现有字段做一次逐项审计，指出哪些字段当前是 NOT_ESTABLISHED/
+  PENDING/UNKNOWN 且缺一句"如何补齐"的说明，而不是新增运行代码。
+```
