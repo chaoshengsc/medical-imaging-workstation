@@ -653,3 +653,13 @@ CPU细查：encoder调用已传use_flash_attn=False，但vit.py仍顶层导入Fl
 为进入发布配置验证，本次仅请求两项固定revision的config.json，HF均返回401（匿名访问），见config-access.json；不能推断用户已登录账号也无权限。需要用户在官方encoder与dx-mri页面完成访问批准。建议现在申请约290MB组合的访问；只申请不代表已下载、批准或运行。取得配置后继续对应架构原型，再严格检查权重，最后做有界MRI试跑。无新依赖、GPU/云端、上传、权重下载或真实病例推理；工作区未提交。
 
 NeuroVFM访问复查：用户告知“做了”后，使用现有独立环境及本机HF凭据读取两个固定revision的config.json，两项均返回403/GatedRepoError，见neurovfm-cpu-audit-20260908/authenticated-config-access.json。当前只能确认本机凭据尚不能读取，不能直接认定用户没有申请或一定尚未审批；也可能浏览器申请账号与本机凭据不同。未下载权重、未启动模型。下一步待批准或对齐账号后重查，不重复提交申请，不索取聊天中的token。
+
+### R2 纯文字资料复核（2026-09-22，MUI 恢复后的有界桌面研究）
+
+本机 `/Users/sc/01_Projects/GUI` 已丢失，2026-09-08 的 `Annotation_Projects/r2-*`、`neurovfm-cpu-audit-20260908/` 等独立研究目录（含已下载的 BiomedParse v2 权重、NeuroVFM CPU 原型代码摘要）均未随本次恢复带回，见 `docs/RECOVERY_20260921.md`。用户明确本轮"只做纯文字/公开资料研究"：不下载模型、不装依赖、不跑代码、不做任何需要本机凭据的鉴权请求（包括上面 NeuroVFM 的 HF gated-repo 复查，那需要本机凭据发起认证请求，本轮不重复）。只用 WebFetch/WebSearch 读取论文与仓库公开页面。
+
+- **Prima 论文已有 v2（2025-12-16），此前的引用只查过 v1。** [论文 v2](https://arxiv.org/html/2509.18638v2) 明确写"The Prima model parameters will be publicly available for investigational use only under an MIT license"——权重与代码都是 MIT、仅限研究用途；这更新了 2026-09-08 记录里"权重独立许可…仍未核实"的说法，现在论文正文本身给出了权重许可声明（仍是论文自述，不等于本机已核实实际分发文件的许可文本一致）。训练/测试划分是同一医疗系统内的时间隔离（训练止于 2023-05-31，测试为 2023-06-01–2024-05-30，29,435 名患者），不是跨机构的患者级独立验证，也没有说明同一患者是否可能跨越两个时间窗；未讨论 OOD/拒绝机制；输出是 52 诊断标签的 study-level 多标签向量（multi-hot，positive-weighted BCE 训练），不含病灶级定位，仅能事后用 LIME 解释——与本文件 2026-09-08 的既有提醒（"LIME 只能作解释，不能当精确 mask"）一致，不需要修改那条结论。**净结论：Prima 的权重可获得性证据比此前更明确，但患者级独立验证证据仍不满足 R3 门槛（同机构、非跨机构患者划分，且缺 OOD 拒绝），G2–G5 的推荐排序不变。**
+- **EfficientNetB1+U-Net、BRISC 2025 两条分类线索原地复核，结论不变。** 重新读取 [EfficientNetB1 论文 v2 全文](https://arxiv.org/html/2304.10039v2)：确认是 2D 切片按 70/15/15 随机比例划分（不是患者级），未提供代码或权重下载地址，未讨论 OOD。重新读取 [BRISC 论文 v5 全文](https://arxiv.org/html/2506.14318v5)：确认原文写"complete subject-level independence cannot be guaranteed"，许可 CC BY 4.0，仍未提供官方预训练权重下载。定向搜索发现两个新的第三方仓库（[youldash/brisc-tumor-segmentation](https://github.com/youldash/brisc-tumor-segmentation)、[sagor5271/Brain-Tumor-Segmentation-on-BRISC2025-](https://github.com/sagor5271/Brain-Tumor-Segmentation-on-BRISC2025-)），均是社区训练的分割（非分类）模型，不是官方发布，且不解决"分类组件"这个具体缺口，不纳入候选池（候选池上限已在 R1 用满）。两条线索仍卡在"无可核实的现成分类权重"，与 2026-09-08 的结论一致。
+- **不做的事，如实记录：** 未重新核实 NeuroVFM 的 HuggingFace gated-repo 访问状态（那需要本机凭据发起鉴权请求，超出本轮"纯文字研究"范围）；未下载 Prima 的任何权重文件来核实上述许可声明是否与实际分发文件一致；未新增候选、未触碰 `tumor_model_admission.py`。
+
+下一步仍是 2026-09-08 记录里已经写清楚的那条：NeuroVFM 待用户对齐 HF 账号权限后再复查访问状态；Prima 若要继续，下一步是核实权重实际大小/摘要是否与许可声明一致，以及能否找到跨机构的独立患者级验证证据——这两步都需要下载文件或联系官方，不在本轮范围内。工作区仅改动本文档，未改产品代码，未提交模型作业。
