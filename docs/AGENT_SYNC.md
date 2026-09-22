@@ -304,3 +304,42 @@ Next safe task: 等待用户对上面那个具体决策的答复。若批准下�
   2026-09-08 记录里的默认 4 threads / 15 分钟 / 12GiB 采样上限，或用户给新的数值）以及
   下载后的第一步是只做哈希/文件大小核对还是直接进入 CPU 适配原型验证。
 ```
+
+## 当前交接（NeuroVFM 权重已下载+哈希；许可条款是产品接入的具体障碍）
+
+```text
+Feedback for review
+Commit: d10b893
+Scope completed: 用户明确指示"下载"。下载了两个固定 revision 的 pytorch_model.bin（encoder
+  286,576,042 字节、dx-mri 3,789,726 字节，与 2026-09-08 记录的字节数完全一致），首次算出
+  真实 SHA256（encoder: 744cf058…8fc7；dx-mri: e3db6eee…2492b）。只做了下载+哈希+读取纯文本
+  README.md，没有安装新依赖、没有 torch.load、没有构造模型、没有任何前向推理——按"下载"这个
+  指示的字面范围止步，没有自行推进到"验证推理"。
+Files changed:
+  - docs/annotation_tumor_plan.md（追加一节记录哈希结果与许可发现）
+  - 两个权重文件本身在本机全局 HuggingFace 缓存（~/.cache/huggingface/hub/），已确认不在本
+    仓库工作树内，不会被 git 跟踪或提交。
+Validation: `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py`
+  → 1487/1487 全绿（保持不变）；`git diff --check` → 无残留；`find . -name pytorch_model.bin`
+  → 空（确认权重不在项目目录里）。
+Known limits / failures:
+  - **关键发现，需要决策**：两个仓库的官方 README 都写明权重许可是 CC-BY-NC-SA-4.0
+    （"Non-Commercial Research Use"），代码是 MIT。本项目 `pyproject.toml` 声明
+    `Proprietary — All rights reserved`——如果要把 NeuroVFM 接入 MUI 产品，这个 Non-Commercial
+    条款会直接冲突，除非官方另行给商用许可。这不是新的许可问题类别（CLIP-Driven 的
+    CC BY-NC-ND 之前就标过同类顾虑），但这次是对着真实下载、真实算出哈希的文件确认的，
+    不再是纯理论顾虑。
+  - 出处已升级为同行评审期刊（Nature Medicine，此前只查过 GitHub/HF 页面）：训练数据
+    218,882 例 MRI（单一机构，密歇根大学健康系统），诊断头是 74 项专家定义诊断本体的
+    modified AB-MIL 架构。仍是同机构队列，没有跨机构独立患者级验证证据。
+  - 没有做的事：没有验证权重内部键结构是否与 2026-09-08 CPU 适配审计假设的架构完全对应；
+    没有查论文全文是否有更详细的验证设计；没有把这两个文件路径接入产品代码或
+    `tumor_model_admission.py` 的任何证据卡（仍是零改动）。
+Decision requested: 这份 Non-Commercial 许可对 MUI 的商业模式是否可接受？如果不可接受（或
+  没有另行获取商用许可的渠道），继续投入 CPU 适配原型或推理验证的技术工作在许可层面就走不通，
+  建议先在这里止步，把资源转向别的候选或明确等待商用许可澄清；如果可接受或已经在协商商用许可，
+  再决定是否继续做 2026-09-08 记录里规划的 CPU 适配原型验证（那一步会需要新装依赖、构造模型、
+  执行前向计算，届时会撞到"不训练/不用 GPU"之外的"是否可以本地推理"这个新边界，需要再单独确认）。
+Next safe task: 等用户对上面的许可决策表态。在收到之前，本会话不会安装新依赖、不会构造/加载
+  模型对象、不会执行任何推理，不会把这两个权重文件接入任何产品代码路径。
+```
