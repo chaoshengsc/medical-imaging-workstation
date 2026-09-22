@@ -224,3 +224,52 @@ Known limits / failures: <facts only>
 Decision requested: <none, or one concrete question>
 Next safe task: <one bounded task>
 ```
+
+## 当前交接（里程碑 D 反馈包：执行包第 1 条）
+
+```text
+Feedback for review
+Commit: 6ca0465
+Scope completed: 修复 tumor_model_admission.qualify_vs_t1_source 自 a1db432 恢复提交起就存在的
+  坏引用——`from series_read_qc import model_input_qc_safe`（该模块在本仓库全部历史中从未存在过）
+  和 `SeriesVolume.from_datasets(..., read_qc=series.read_qc)`（当前 SeriesVolume 没有 read_qc
+  字段）。这两处都在 try/except 之外，此前该函数每次被调用都会直接 ModuleNotFoundError，从未
+  返回过任何 VSQualificationDecision。去掉这两处引用后，函数走剩下本来就有的真实校验（模态匹配、
+  几何/来源绑定存在性、与原始 SeriesVolume 逐字段重建比对）。因为修复前函数从未产出过一次真实的
+  “拒绝”结果，这次改动不构成 fail-closed 倒退——是用真正的判定取代了崩溃，不是放宽了已生效的判定。
+  未改 tumor_model_admission.py 中除这一个函数外的任何内容，未改 study_data.py 的字段或签名，
+  未虚构或安装 series_read_qc。
+Files changed:
+  - tumor_model_admission.py（仅 qualify_vs_t1_source 函数体，删 2 处坏引用，净减 4 行）
+  - tests/test_milestone_d_vs_t1_source_qualification.py（新增）
+Validation（逐条对应 AGENT_SYNC 要求的验收命令，均现场重跑非缓存结果）:
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py` → 38/38 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_annotation_workflow.py` → 76/76 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_c_workspace_continuity.py` → 44/44 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_vs_t1_source_qualification.py` → 12/12 通过
+    （VS-SEG-002、VS-SEG-003 各 6 项：正例 2 项 + 反例 4 项——非 SeriesVolume 输入、篡改
+    source_binding 摘要、篡改患者空间 affine、少一帧数据集）
+  - `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py` → **1487/1487 全绿**
+    （按预期从 1486/1487 变化——series_read_qc 未声明是全树唯一一项失败，随缺口修复自然消失，
+    不是靠放宽或删除该检查项本身）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过
+    （既有 6 项准入测试未受影响——它们测的是 `*_admission` 系列函数，与本次改的
+    `qualify_vs_t1_source` 是不同函数）
+  - `ruff check tumor_model_admission.py tests/test_milestone_d_vs_t1_source_qualification.py`
+    → All checks passed；`git diff --check` → 无残留
+Known limits / failures:
+  - 里程碑 D 执行包第 2-4 条（候选模型接入为"需复核候选 mask"、记录每个模型的输入/预处理/空间变换/
+    版本/来源、权重+契约+患者级验证+运行资源齐备才申请执行）均未开始——本轮按 AGENT_SYNC 明确划定
+    的停止条件，只做第 1 条（修复现有 fail-closed 逻辑本身的可运行性），不做需要真实模型权重、
+    患者级验证证据或运行资源的后续条目。
+  - `qualify_vs_t1_request`（调用 `qualify_vs_t1_source` 的上层函数）及其他准入函数未做改动，
+    也未新增针对它们的测试；本轮范围严格限定在 `qualify_vs_t1_source` 本身。
+  - 未发现"去掉 read_qc 校验后某个已知坏例从拒绝变成通过"的情况——已用真实数据构造的 4 个反例
+    （类型错误/来源摘要篡改/几何篡改/帧数篡改）在修复前后都会走到 `series_rebuild`/`series_volume`
+    这两个既有 gate 并被拒绝，read_qc 从未是这些反例被拒绝的唯一原因（修复前它们根本到不了
+    read_qc 那一行就已经 ModuleNotFoundError 崩溃了）。
+Decision requested: 无（里程碑 C item 4 的决策请求仍单独挂在上面的历史交接记录里，不受本轮影响）。
+Next safe task: 里程碑 D 执行包第 2 条——为候选模型（如 BiomedParse）设计"候选 mask"接入路径的数据
+  模型（独立版本、默认不自动采用、不宣称瘤种），这一步需要先确认是否已有候选权重/代码可实际试跑，
+  没有真实权重时应如实止步于数据模型设计和 fail-closed 测试，不写依赖不存在权重文件的"占位成功"。
+```
