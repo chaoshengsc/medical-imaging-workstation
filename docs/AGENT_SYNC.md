@@ -238,3 +238,39 @@ Next safe task: 四个里程碑（A/B/C/D）第一轮工作、复核和用户决
   annotation_tumor_plan.md 里 R2 及以后的模型研究方向）；若无新指示，本会话保持等待，不主动新增
   未经明确授权的产品改动。
 ```
+
+## 当前交接（用户指示"进入 R2 模型研究方向"，已按"只做纯文字研究"完成一轮）
+
+```text
+Feedback for review
+Commit: f144b1d
+Scope completed: 用户选择"执行申请模板暂时不做，进入 R2 模型研究方向"，并在确认范围时明确选择
+  "只做纯文字/公开资料研究"（不下载、不装依赖、不跑代码、不做任何需要本机凭据的鉴权请求）。
+  本轮只用 WebFetch/WebSearch 重新核对了 docs/annotation_tumor_plan.md 里两条仍活跃的研究线索
+  （Prima、EfficientNetB1+U-Net/BRISC 2025），未碰产品代码，未新增/修改任何 ModelAdmissionCard。
+  这不是里程碑 A/B/C/D 范围内的任务，是用户直接指定的独立研究任务。
+Files changed:
+  - docs/annotation_tumor_plan.md（追加一个带日期的新研究小节，未改动任何既有段落/结论）
+Validation: 文档改动不影响产品代码，仍复跑了 `SKIP_REAL_DATA=1
+  /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py` → 1487/1487 全绿（保持不变）；
+  `git diff --check` → 无残留。
+Known limits / failures:
+  - Prima 论文 v2（此前只查过 v1）明确写权重+代码均 MIT、仅限研究用途——但这只是论文自述，
+    本轮没有下载任何文件去核实分发的权重实际许可文本与论文声明是否一致。
+  - Prima 的患者级验证证据仍不满足 R3 门槛：训练/测试划分是同机构按时间切分（29,435 名患者，
+    测试窗口在训练截止后一年），不是跨机构的患者级独立验证，且没有 OOD/拒绝机制；输出是
+    study-level 52 标签多标签向量，不含病灶级定位。结论：G2–G5 的推荐排序不变，R3 仍 NO-GO。
+  - EfficientNetB1+U-Net、BRISC 2025 两条分类线索原地复核：仍无官方可下载权重，结论与
+    2026-09-08 记录一致；额外发现两个第三方 BRISC 分割（非分类）仓库，判断为不解决"分类组件"
+    这个具体缺口，未纳入候选池（候选池上限已在 R1 用满）。
+  - 没有做的事，如实记录：未重新核实 NeuroVFM 的 HuggingFace gated-repo 访问状态（那需要本机
+    凭据发起鉴权请求，超出本轮"纯文字研究"范围）；未下载 Prima 任何权重文件；未新增候选、
+    未触碰 tumor_model_admission.py。
+Decision requested: 无。上一轮遗留的唯一开放决策（执行申请模板是否需要）已由用户明确选择
+  "暂时不做"，本次不重复提问。
+Next safe task: 若要继续模型研究方向，两条明确的下一步都已写在 annotation_tumor_plan.md 新增小节
+  末尾：(1) NeuroVFM 待用户对齐 HF 账号权限后再复查访问状态（需要本机凭据鉴权，超出纯文字研究
+  范围，需用户另行明确授权）；(2) Prima 若要继续，需要下载权重核实许可声明与实际分发文件是否
+  一致、并寻找跨机构独立患者级验证证据（同样需要下载/联系官方，超出本轮范围）。若无新指示，
+  本会话保持等待，不主动下载模型、安装依赖或运行推理。
+```
