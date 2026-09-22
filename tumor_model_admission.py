@@ -333,6 +333,29 @@ def evidence_card_completeness(card):
     return AdmissionDecision(not missing, 'evidence-card-completeness', missing)
 
 
+_EXECUTION_REQUEST_EVIDENCE = ('weights', 'input_contract', 'patient_validation', 'cpu_budget')
+
+
+def execution_request_admission(card):
+    """Gate for whether an execution request may even be raised for a
+    candidate model — not whether that request would be granted.
+
+    docs/AGENT_SYNC.md milestone D item 4: only propose an execution request
+    once weights, the input contract, patient-level validation and runtime-
+    resource evidence are all established. This is deliberately narrower
+    than product_execution_admission, which additionally requires code,
+    license, task_compatibility, negative_validation, ood_rejection and the
+    automatic_execution/product_execution flags — those remain the separate,
+    stricter bar a request must still clear to be granted. A pass here is
+    the minimum bar to ask, never authorization to run or adopt anything.
+    """
+    failed = [field for field in _DESCRIPTORS
+              if not _descriptor_is_known(field, _value(card, field))]
+    failed.extend(field for field in _EXECUTION_REQUEST_EVIDENCE
+                  if _value(card, field) is not EvidenceState.VERIFIED)
+    return AdmissionDecision(not failed, 'execution-request', tuple(failed))
+
+
 BIOMEDPARSE_CARD = ModelAdmissionCard(
     model_id='microsoft-biomedparse-v2',
     version='historical-local-candidate',
