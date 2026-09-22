@@ -343,3 +343,26 @@ Decision requested: 这份 Non-Commercial 许可对 MUI 的商业模式是否可
 Next safe task: 等用户对上面的许可决策表态。在收到之前，本会话不会安装新依赖、不会构造/加载
   模型对象、不会执行任何推理，不会把这两个权重文件接入任何产品代码路径。
 ```
+
+## 当前交接（许可障碍已解除；CPU 推理验证仍待单独确认）
+
+```text
+Feedback for review
+Commit: c50fbc8
+Scope completed: 用户明确答复"我们不商用"，解除了上一轮标出的 NeuroVFM 权重许可障碍
+（CC-BY-NC-SA-4.0 Non-Commercial 与产品 Proprietary 声明的冲突）。
+Files changed:
+  - docs/annotation_tumor_plan.md（追加两句：记录用户答复，并写明两条限定——这只是用途确认
+    不等于改写 pyproject.toml 的许可声明；许可障碍解除不等于自动获得装依赖/跑推理的授权）。
+Validation: 纯文档改动，未跑产品回归（上一轮已确认 1487/1487，本次未改任何产品代码或依赖）。
+Known limits / failures: 无新增。
+Decision requested: 是否继续推进到 NeuroVFM 的 CPU 适配原型验证？这一步会需要：
+  安装 torch 之外的模型相关依赖（若当前 dicom_gui 环境缺失）、用固定源码构造模型对象、
+  执行至少一次前向计算（哪怕是随机小配置的原型验证，性质上仍是"在本机运行第三方模型代码"）。
+  这与"下载文件"是不同类别的动作，尚未获得授权。2026-09-08 的记录里已经有一个类似原型
+  （`cpu_prototype.py`，独立 AST 载入官方类、替换 FusedDense/FusedMLP 为等价 Linear 实现）
+  可参考，但那次是在合成小型配置上做的，从未加载过真实下载的这两个 checkpoint。
+Next safe task: 等用户表态是否继续 CPU 适配/推理验证；若继续，需要先确认资源上限
+  （沿用默认 4 threads / 15 分钟 / 12GiB，或新数值）以及范围边界（先做"权重键名/shape 与
+  config 声明的架构逐项核对"这种只读检查，还是直接构造模型做前向）。
+```
