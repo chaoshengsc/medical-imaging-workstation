@@ -386,3 +386,57 @@ Next safe task: 若里程碑 D 判定通过，四个里程碑（A/B/C/D）已按
   (3) 本轮的"里程碑 D 第 4 条是否需要独立代码"。三项都不阻塞已完成的验收，可等用户方便时逐一批复；
   在没有新指示前，不建议再新增没有真实模型/真实调用方的候选接入代码。
 ```
+
+## 当前交接（里程碑 D 反馈包：执行包第 4 条，四条全部完成）
+
+```text
+Feedback for review
+Commit: feef2be
+Scope completed: 里程碑 D 执行包第 4 条——只有权重、输入契约、患者级验证和运行资源均有证据时，
+  才单独提出执行申请。新增只读闸门 `execution_request_admission(card)`
+  （tumor_model_admission.py，纯新增，未改任何既有函数/字段/证据卡）：判定"能否提出执行申请"，
+  比 `product_execution_admission`（"申请能不能被批准"）更窄——只看 weights/input_contract/
+  patient_validation/cpu_budget 这四项，不看 code/license/task_compatibility/negative_validation/
+  ood_rejection，也不看 automatic_execution/product_execution 两个标记；通过只代表达到"可以去问"
+  的最低门槛，不是获准执行、不是获准采用。
+  对仓库里两张真实证据卡的判定（未修改任一字段）：
+    - BIOMEDPARSE_CARD：缺 weights/patient_validation/cpu_budget，不能提出申请。
+    - VS_SEG_CARD：缺 weights/input_contract/patient_validation/cpu_budget，不能提出申请。
+  两者都通不过这个更低的门槛，因此本轮没有写、也不会去写任何"执行申请"文本或运行代码——
+  写了就是给不存在的证据编一份申请。
+Files changed:
+  - tumor_model_admission.py（纯新增一个常量 + 一个闸门函数）
+  - tests/test_milestone_d_execution_request_admission.py（新增）
+Validation（逐条对应 AGENT_SYNC 要求的验收命令，均现场重跑非缓存结果）:
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_a_mri_workflow.py` → 38/38 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_b_annotation_workflow.py` → 76/76 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_c_workspace_continuity.py` → 44/44 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_vs_t1_source_qualification.py` → 12/12 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_candidate_mask_admission.py` → 31/31 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_evidence_card_completeness.py` → 14/14 通过（防回归）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python tests/test_milestone_d_execution_request_admission.py` → 20/20 通过
+    （两张真实卡拒绝 6 项 + 申请门槛窄于批准门槛 9 项 + 描述符缺失同样拒绝 2 项 + 其余细分断言）
+  - `SKIP_REAL_DATA=1 /opt/miniconda3/envs/dicom_gui/bin/python tests/test_gui.py` → 1487/1487 全绿（保持）
+  - `/opt/miniconda3/envs/dicom_gui/bin/python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过
+  - `ruff check tumor_model_admission.py tests/test_milestone_d_execution_request_admission.py`
+    → All checks passed；`git diff --check` → 无残留
+Known limits / failures:
+  - 没有写"执行申请"本身的模板/文档（比如一份正式提交给谁、以什么格式记录的申请书）——两张真实卡
+    都过不了 execution_request_admission，没有真实场景可以驱动这份模板的形状，写了就是为假设的
+    未来预先设计。若以后有一张卡真的四项证据齐备，到那时再决定申请的实际格式更可靠。
+  - 里程碑 D 执行包 1-4 条现在全部有对应的代码+测试落地（qualify_vs_t1_source 修复、
+    candidate_mask_admission、evidence_card_completeness、execution_request_admission）。
+    这轮没有再去动 study_data.py/annotation_lab.py/main.py，四条改动全部限定在
+    tumor_model_admission.py 内新增，没有一条需要新建模型运行路径或下载权重。
+Decision requested: 里程碑 D 是否可以判定整体通过？验收句"无模型包、缺少序列证据、空间身份不
+  匹配、伪造结果均会被拒绝；不产生诊断或效能声明"现在由四个测试文件（外加既有 6 项准入测试、
+  外加里程碑 A/B/C 的真实数据回归）共同覆盖，且对仓库里仅有的两个真实候选（BiomedParse、VS-SEG）
+  逐层验证过确实全部被拒绝，没有一层是靠放宽或删检查侥幸通过的。
+Next safe task: 若里程碑 D 判定通过，四个里程碑均已按 AGENT_SYNC 走完第一轮，进入纯审查/决策
+  阶段。累积的开放决策项（不阻塞任何已完成验收，供用户方便时逐一批复）：
+    1. 里程碑 C item 4——3D 视角随切片/病灶位置联动该怎么定义、是否要做；
+    2. candidate_mask_admission 的 HISTORICAL 证据口径是否要收紧为只接受 VERIFIED；
+    3. 是否需要为"执行申请"设计正式模板（本轮判断尚无真实场景，未做）。
+  在收到新指示前，不建议再新增没有真实模型/真实调用方的候选接入代码；四个 test_milestone_*.py
+  文件加上既有测试构成的回归基线，建议作为后续任何改动的强制门槛（须继续保持全绿）。
+```
