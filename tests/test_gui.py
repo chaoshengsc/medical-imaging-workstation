@@ -6470,6 +6470,29 @@ def test_doc_code_consistency():
           "known-bad inventory：synthetic 移除 dicom_geometry 会被 checker 拒绝")
 
 
+def test_vs_seg_t1_adapter_contract():
+    """The new image-space adapter is part of the normal data-independent gate."""
+    import importlib
+    import io
+    import unittest
+
+    print("[VS-Seg T1 image-only preprocessing / source-grid inversion]")
+    tests_directory = os.path.join(_ROOT, "tests")
+    sys.path.insert(0, tests_directory)
+    try:
+        module = importlib.import_module("test_vs_seg_t1_adapter")
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(
+            module.VSSegT1AdapterTests)
+        output = io.StringIO()
+        result = unittest.TextTestRunner(stream=output, verbosity=2).run(suite)
+        print(output.getvalue().rstrip())
+        check(result.wasSuccessful(),
+              f"合成 adapter 测试全部通过（{result.testsRun} 项）")
+    finally:
+        if sys.path and sys.path[0] == tests_directory:
+            sys.path.pop(0)
+
+
 def test_model_card():
     """模型说明卡：数字必须来自实验产物、局限段必须在场、双语都不夹带对方语言。
 
@@ -10738,6 +10761,7 @@ def main_run():
     test_compare_physical_grid_chain(app)
     test_spatial_landmark_roundtrips(app)
     test_signed_dicom_orientation_chain(app)
+    test_vs_seg_t1_adapter_contract()
     test_runner_catches_qt_slot_exceptions()
     test_raw_display_window_limits()
     test_ct_preview_rescale_contract()
