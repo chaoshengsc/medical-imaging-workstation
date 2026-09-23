@@ -98,7 +98,7 @@ Next safe task: <one bounded task>
 ## 当前交接
 
 ```text
-Milestone: A/B/C/D 的工程验收已通过；NeuroVFM 权重契约、CPU state dict 读取及诊断头合成输入冒烟已通过。自动肿瘤分割与逐病灶分类未完成。
+Milestone: A/B/C/D 的工程验收已通过；NeuroVFM 权重契约、CPU state dict 读取、诊断头及编码器的合成输入冒烟已通过。自动肿瘤分割与逐病灶分类未完成。
 Base commit: 80be4cb（本轮研究开始点）
 Writer: Codex；本轮仅研究脚本、定向测试和交接记录写入，未改产品运行路径。
 
@@ -108,10 +108,11 @@ Verified 2026-09-23:
   - 静态审计：encoder 136 个张量、MRI 诊断头 16 个张量，键名/shape 与固定 config 精确一致；MRI 标签 74 个唯一项；9 项检查全通过。
   - PyTorch 2.5.1、4 CPU 线程、weights_only=True/mmap=True 成功读取两份 state dict，加载元数据逐张量一致；没有构造编码器。
   - 官方 ClassifyThenAggregate 在 CPU 替换 FusedDense 和 segment_csr 后，真实权重 strict=True 加载，用合成 patch 特征输出 [2,74]；两段注意力和误差 1.19e-7，分批与单独运行最大差 0；缺失键被拒绝。
+  - 固定官方 VisionTransformer 类体在隔离 CPU namespace 中替换 fused dense/MLP/残差 norm 后，真实编码器权重 strict=True 加载；合成 8 patch 输出 [8,768]，接诊断头得到检查级 [2,74]；两序列合批与分开运行最大差 0，故意缺少 norm.bias 被拒绝。
   - 静态审计恶意 GLOBAL、未知 opcode、非张量顶层、错误摘要 4 个反例测试通过。具体命令与忽略目录下的 JSON 结果见 docs/annotation_tumor_plan.md 的 2026-09-23 节。
 
 Limits:
-  - 这不是从 MRI 到 74 标签的整模型推理；编码器 FlashAttention/BF16 路径、位置编码与预处理尚未跑通。没有真实病例效果或类型准确性结论。
+  - 这是合成 token 的有限 CPU 运算，不是从 MRI 到 74 标签的整例推理；尚未对照 GPU fused kernel 的数值、官方预处理和真实病例。没有效果或类型准确性结论。
   - 官方 StudyPreprocessor.load_study 对 DICOM 目录逐文件枚举，需先按 UID 建立正确的 3D 序列输入与几何记录。
   - NeuroVFM 只有检查级标签，不生成 mask，也不能自动把类型绑定至某个病灶；产品未接入其权重。
   - A/B 仅有 Undo 无 Redo；C 的主观 UI 验收仍不全；D 的准入拒绝门不是模型效能证明。
@@ -119,12 +120,12 @@ Limits:
 
 Feedback for review
 Commit: 本提交（以 git log -1 的实际哈希为准）
-Scope completed: 固定权重与源码静态契约核对、CPU 安全载入及官方检查级诊断头合成输入冒烟。
-Files changed: experiments/neurovfm_static_audit.py, experiments/neurovfm_static_source_manifest.json, experiments/neurovfm_checkpoint_load_probe.py, experiments/neurovfm_cpu_head_probe.py, tests/test_neurovfm_static_audit.py, docs/annotation_tumor_plan.md, docs/AGENT_SYNC.md。
+Scope completed: 固定权重与源码静态契约核对、CPU 安全载入及官方编码器+检查级诊断头合成输入冒烟。
+Files changed: 前一提交的静态审计/诊断头脚本与文档，加本次 experiments/neurovfm_cpu_encoder_probe.py、docs/annotation_tumor_plan.md、docs/AGENT_SYNC.md。
 Validation: 见本节 Verified 和 docs/annotation_tumor_plan.md 的 2026-09-23 精确命令；本轮新产物均通过。
-Known limits / failures: 完整编码器与真实 MRI 未跑；DICOM 目录输入契约有已定位缺口；诊断头不产生病灶 mask/类型绑定。
+Known limits / failures: 完整编码器仅跑合成 token，未证 GPU 数值等价；真实 MRI 未跑；DICOM 目录输入契约有已定位缺口；诊断头不产生病灶 mask/类型绑定。
 Decision requested: none。
-Next safe task: 在忽略目录隔离实现固定 encoder 配置的 CPU 等价路径，先以小型合成输入对照注意力、残差归一化、MLP 和位置编码，再 strict 加载已下载权重；同时单独设计按 UID 选 3D DICOM 序列的输入适配及空间记录。达不到数值/空间核查时停止真实病例推理。4 线程、15 分钟、12 GiB 上限；不进入产品运行路径。自动分割仍需独立病灶模型。
+Next safe task: 使用现有两例的元数据，设计并验证按 Study/Series UID 唯一选择 3D DICOM 序列的适配与空间记录；再核对模型官方预处理（RPI、1×1×4mm、归一化、token/坐标）及 GPU/CPU 数值等价限制。空间或预处理不成立时停止真实病例推理。4 线程、15 分钟、12 GiB 上限；不进入产品运行路径。自动分割仍需独立病灶模型。
 ```
 
 ## 每轮交接模板

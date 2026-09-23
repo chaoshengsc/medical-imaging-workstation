@@ -710,3 +710,15 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experime
 ```
 
 **进入整例推理之前的两个独立缺口：** 固定官方 `vit.py` 顶层依赖 FlashAttention，编码器的 BF16 注意力、残差归一化、MLP 和位置编码尚未完成 CPU 等价实现与数值对照；不能凭诊断头通过推出整模型可用。固定官方 `StudyPreprocessor.load_study` 对目录枚举 `*.dcm` 并逐文件送入 `load_image`，而 `load_image` 的 DICOM series 读取入口是**目录**；需先建立按 Study/Series UID 选择单一 3D 序列的适配并保留方向、层间距、变换记录，不能把一个切片当一套 MRI。随后才做有界整例技术试跑与患者级验证。这个模型本身只有检查级 74 标签，既不生成分割 mask，也不能给具体病灶自动贴瘤种。
+
+### 同日续进：编码器合成输入 CPU 冒烟
+
+前段所说的“编码器尚未运行”已在同日被本节**部分推进**，仍不等于数值等价或真实病例推理。`experiments/neurovfm_cpu_encoder_probe.py` 在静态核对固定源码/权重后，以 AST 载入上游 `VisionTransformer`、`Block`、`SelfAttention`、`PatchEmbed`、`PositionalEncoding3DWrapper` 的原类体，只在隔离实验 namespace 中替换 GPU fused dense、MLP 和残差 LayerNorm；位置编码使用上游固定依赖 `positional-encodings==6.0.3` 的本机缓存 wheel（SHA256 `714135704d54f42adc77585d54747e9d42580e03746ca90441e869ba7b3fc324`），没有安装到现有环境。实验所用 PyTorch 2.5.1、4 CPU 线程，BF16 autocast。第一次构造失败是 AST namespace 遗漏 `_pair`，补齐后通过；没有改上游源码或产品模块。
+
+真实编码器权重 `strict=True` 全量载入，故意去掉 `norm.bias` 时严格加载拒绝。用两个序列共 8 个**合成**体素 patch，经编码器得到 `[8,768]` 特征，经同样严格载入的官方诊断头得到检查级 `[2,74]` 分数；输出有限，编码器两序列合批与各自单独运行的最大差为 0。JSON 在忽略目录 `Annotation_Projects/neurovfm-static-20260923/cpu-encoder-probe.json`。重跑命令（沿用上节的 `ENC`、`DX`、`SRC`、`OUT`）：
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experiments/neurovfm_cpu_encoder_probe.py --encoder "$ENC" --diagnostic "$DX" --source-root "$SRC" --position-wheel "$OUT/dependency-source/positional_encodings-6.0.3-py3-none-any.whl" --output "$OUT/cpu-encoder-probe.json"
+```
+
+**仍未证明：** 显式 FP32 残差 LayerNorm、tanh 近似 GELU 和 BF16 标准注意力与发布时 GPU fused kernel 的逐层数值一致性；合成 8 patch 不是实际 MRI 的 token 分布，也未验证整例内存/速度。下一步先处理单一 DICOM 3D 序列选择及官方预处理一致性，再做有界技术试跑；输出仍是检查级分数，不能替代分割或逐病灶分类。单次合成冒烟用时约 2.4 秒，不能外推整例速度。
