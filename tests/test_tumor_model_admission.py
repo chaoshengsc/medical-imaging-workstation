@@ -106,6 +106,11 @@ class TumorModelAdmissionTests(unittest.TestCase):
                 self.assertFalse(lesion_type_admission(card).admitted)
                 self.assertFalse(card.automatic_execution)
                 self.assertFalse(card.product_execution)
+        self.assertIs(VS_SEG_CARD.weights, EvidenceState.VERIFIED)
+        denied = product_execution_admission(VS_SEG_CARD)
+        self.assertIn('input_contract', denied.failed_gates)
+        self.assertIn('cpu_budget', denied.failed_gates)
+        self.assertIn('task_compatibility', denied.failed_gates)
         self.assertEqual(BIOMEDPARSE_CARD.task_compatibility,
                          EvidenceState.NOT_ESTABLISHED)
 
