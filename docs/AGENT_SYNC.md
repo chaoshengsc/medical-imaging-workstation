@@ -111,8 +111,10 @@ Verified 2026-09-23:
   - 固定官方 VisionTransformer 类体在隔离 CPU namespace 中替换 fused dense/MLP/残差 norm 后，真实编码器权重 strict=True 加载；合成 8 patch 输出 [8,768]，接诊断头得到检查级 [2,74]；两序列合批与分开运行最大差 0，故意缺少 norm.bias 被拒绝。
   - VS-SEG-002/003 各 120 帧单一 MR Series，SimpleITK 3D 读取与 DICOM 患者空间逐片原点最大差 9.33e-14/2.05e-13 mm；混序列、重复 SOP、缺片反例被拒绝。
   - 两例真实 T1 经固定官方预处理及归一化，分别生成 335/283 个 token，CPU 编码器+诊断头输出有限的检查级 [1,74] 分数；前向各约 1.0–1.3 秒、进程峰值 RSS 约 2.4–2.5 GB（仅此本机两例技术测量）。
-  - 作者固定 split 为 176/20/46，vs_gk_2/3 在训练组；恢复的 VS-SEG-002/003 在本项目准入卡中按训练重叠隔离。作者 test 的 46 例 T1 与各自两份候选 RTSTRUCT 已下载：138/138 series，TCIA API 解压数据量 2,985,054,416 bytes，逐文件 MD5/ZIP CRC/实例数通过。DICOM 引用核对 46/46 唯一配对成功，原始 ROI 名保留（TV 39、AN 7）。因本机 Slicer/SlicerRT 为 amd64 而主机 arm64，未能运行官方 SlicerRT 转换；改用既有 `rt-utils 1.2.7` 做探索性栅格，46/46 临时 NIfTI 几何自检通过，最大轮廓平面偏差约 5e-8 mm、非空、SHA-256 逐例记录。此状态仅为 `PROVISIONAL_GEOMETRY_PASS`，不等同官方转换或模型效能验证。证据和脚本在忽略目录 `Annotation_Projects/vs-seg-test-20260923/`，不进 Git。
-  - 权重包官方大小/MD5 匹配，本地 ZIP SHA-256、CRC 与内部 best/last checkpoint SHA-256 已记录；`Annotation_Projects/vs-seg-t1-20260923/` 被 `.gitignore` 忽略。PyTorch 2.13.0 `weights_only=True` 安全读取 best checkpoint 成功；256 个张量条目，首层 shape 与固定上游配置一致。已检查本机多个 Python 环境：仅 `denoise` 有 MONAI 1.5，但新进程导入因重复 `libomp.dylib` abort；未安装依赖，未因当前 mask 准备而构造模型/执行 forward。严格全网加载未通过，准入卡的 `weights` 仍保持 PENDING。
+  - 作者固定 split 为 176/20/46，vs_gk_2/3 在训练组；恢复的 VS-SEG-002/003 在本项目准入卡中按训练重叠隔离。作者 test 的 46 例 T1 与各自两份候选 RTSTRUCT 已下载：138/138 series，TCIA API 解压数据量 2,985,054,416 bytes，逐文件 MD5/ZIP CRC/实例数通过。DICOM 引用核对 46/46 唯一配对成功，原始 ROI 名保留（TV 39、AN 7）。首轮 `rt-utils 1.2.7` 输出后来查明面内行列轴转置错误，46 份旧 mask 已隔离在 `rtutils-reference-masks-axis-transposed-invalid/`，标记为无效。修正为 transpose(2,0,1) 后重建 46 份 NIfTI，并用预装 VTK 9.6.0 按物理轮廓独立栅格复核：占用切片逐例相同，几何实现 Dice 中位数 0.96543、范围 0.92758–0.98275；差异是边界填充离散化差异，不是模型分数。Slicer/SlicerRT 当前安装为 x86_64；官方稳定版和预览版 macOS 下载当前均 amd64，arm64 build 指南标记为 work-in-progress。官方 Debug 构建需超过 20 GB，当前仅余约 26 GiB，不安全启动。证据和脚本在忽略目录 `Annotation_Projects/vs-seg-test-20260923/`，不进 Git。
+  - 权重包官方大小/MD5 匹配，本地 ZIP SHA-256、CRC 与内部 best/last checkpoint SHA-256 已记录；`Annotation_Projects/vs-seg-t1-20260923/` 被 `.gitignore` 忽略。PyTorch 2.13.0 `weights_only=True` 安全读取 best checkpoint 成功；256 个张量条目，首层 shape 与固定上游配置一致。现有 base（torch 2.13）、boa（torch 2.5.1）均无 MONAI；denoise（torch 2.8/MONAI 1.5）新进程因重复 `libomp.dylib` abort；dicom_gui（torch 2.11）无 MONAI，当前不可构造官方网络。作者固定 requirements 为 torch 1.6/MONAI 0.4；尚未安装依赖、没有严格全网加载或执行 forward，准入卡的 `weights` 仍保持 PENDING。
+  - 静态依赖可行性（2026-09-23）：本轮只读重查 boa 为 Python 3.10.20 / arm64、torch 2.5.1、NumPy 1.26.4；MONAI、natsort、TensorBoard 缺失，torchvision、pydicom、nibabel、matplotlib 已有。固定上游 requirements.txt 要求 torch~=1.6.0、MONAI==0.4.0、torchvision~=0.7.0 等；作者网络本身主要用 PyTorch 原生卷积/归一化层及 MONAI 的 Norm/Act factory、SkipConnection、same_padding，完整 VSparams.py 另会拉入未安装的 natsort/TensorBoard，但可由最小加载器绕开。MONAI 0.4.0 官方 PyPI wheel 是 350,941-byte 的纯 Python wheel，元数据最低要求 Python>=3.6、torch>=1.5、NumPy>=1.17；现有 boa 满足元数据，但没有证据保证旧 MONAI 与 torch 2.5.1 组合兼容。官方 Apple Silicon 原生 PyTorch 包从 1.12 才以 prototype 形式出现，故作者锁定 torch 1.6 不能作为本机原样 arm64 环境。预装 denoise 中 MONAI 1.5.0 源码虽保留网络 factory/skip/same_padding，但缺少作者直接导入的 monai.utils.aliases 旧路径，且该环境 torch 导入会因重复 libomp abort；不能直接复用。静态评估完成时未创建环境、未下载/安装 MONAI、未加载 checkpoint 或运行模型。详见 docs/annotation_tumor_plan.md 2026-09-23 静态依赖段。
+  - 依赖 wheel 下载（2026-09-23）：用户允许下载后，从官方 PyPI 下载 `monai-0.4.0-202012151415-py3-none-any.whl` 至 Git 忽略目录 `Annotation_Projects/vs-seg-t1-20260923/dependency-source/`；大小 350,941 bytes，SHA-256 `da0395de904acdfeb261dbbe46d6fecadfc274991385604dcf5e5b49a483242e` 与 PyPI 元数据一致，137 个归档成员路径检查无绝对路径或 `..`。wheel 未解包、未安装；未创建环境、未加载 checkpoint 或运行模型。MONAI 官方安全公告 [GHSA-x6ww-pf9m-m73m](https://github.com/Project-MONAI/MONAI/security/advisories/GHSA-x6ww-pf9m-m73m) 标明 <=1.5.0 版本存在 bundle ZIP 路径穿越漏洞；若获准试探，只在一次性隔离环境中导入网络层，不调用 bundle 下载/解压 API，也不处理外部压缩包。该下载不证明与当前 torch 兼容，strict=True 全网加载仍待验证。
   - TCIA VS-MC-RC2 提供约 6 GB 的外域 NIfTI/T1CE mask 候选，但当前只确认资料与 Aspera 传输要求；未安装插件、未下载或证明训练无交叉。
   - 静态审计恶意 GLOBAL、未知 opcode、非张量顶层、错误摘要 4 个反例测试通过。具体命令与忽略目录下的 JSON 结果见 docs/annotation_tumor_plan.md 的 2026-09-23 节。
 
@@ -121,17 +123,17 @@ Limits:
   - 官方 StudyPreprocessor.load_study 对直接传入的 DICOM 目录逐文件枚举；本轮用已证唯一序列目录的单元素列表入口规避，产品通用输入适配尚未实现。
   - NeuroVFM 只有检查级标签，不生成 mask，也不能自动把类型绑定至某个病灶；产品未接入其权重。
   - A/B 仅有 Undo 无 Redo；C 的主观 UI 验收仍不全；D 的准入拒绝门不是模型效能证明。
-  - KCL 权重包身份与字节完整性已验证，best checkpoint 仅做 safe tensor parse 和首层 shape 对照；全网 strict load、CPU/空间往返、无标签输入和患者级效果均未验证，所以研究/产品准入卡的 `weights` 仍为 PENDING。官方推理脚本使用标签做评分/导出元数据；产品侧 no-label adapter 仍未实现。下载包内的训练/测试日志与示例图不构成本项目独立验证。新生成的 RTSTRUCT mask 仅由 rt-utils 临时产生，未和 SlicerRT 逐体素对照；没有安装模型依赖，也没有运行模型或报告 Dice/HD95。
+  - KCL 权重包身份与字节完整性已验证，best checkpoint 仅做 safe tensor parse 和首层 shape 对照；全网 strict load、CPU/空间往返、无标签输入和患者级模型效果均未验证，所以研究/产品准入卡的 `weights` 仍为 PENDING。官方推理脚本使用标签做评分/导出元数据；产品侧 no-label adapter 仍未实现。下载包内的训练/测试日志与示例图不构成本项目独立验证。正确轴顺序的 RTSTRUCT masks 与独立 VTK 物理栅格已做几何交叉核对，但没有与 SlicerRT 完整 labelmap conversion 逐体素对照；没有安装模型依赖，也没有运行模型或报告模型 Dice/HD95。
   - 当前非商用用途已确认；未来若分发权重或改变用途，仍核对许可、署名和分发条件。没有 push。
 
 Feedback for review
 Commit: 本提交（以 git log -1 的实际哈希为准）
-Scope completed: 下载固定作者 test split 的 46 例 T1 与配套 RTSTRUCT 候选，核对作者/TCIA 病例映射和 DICOM 引用，生成并检查 provisional rt-utils NIfTI masks；更新计划记录和交接，不改产品代码。
-Files changed: `docs/annotation_tumor_plan.md`、`docs/AGENT_SYNC.md`。影像、RTSTRUCT、mask、脚本和 JSON 均保存在忽略目录 `Annotation_Projects/vs-seg-test-20260923/`，不进入 Git。
-Validation: 对 manifest、pairing、conversion summary 执行 JSON 断言 → PASS（138/138 series 且每项 TCIA MD5/ZIP CRC 已验证；46/46 T1/RTSTRUCT series、frame、SOP 引用配对；46/46 临时转换几何、切片引用与 mask SHA-256）；TCIA API 声明解压字节 2,985,054,416；`shasum -a 256` 已记录三个机器报告摘要；`git check-ignore -v` 确认 manifest 与 NIfTI mask 被忽略；`git diff --check` → PASS。完整报告位于 `Annotation_Projects/vs-seg-test-20260923/`。
-Known limits / failures: SlicerRT 当前只有 amd64 构建，未在 arm64 主机运行；临时 rt-utils 结果未与官方 SlicerRT 或第二实现逐体素对照。没有安装依赖，没有 strict checkpoint load、模型推理或效能验证；`weights` 仍为 PENDING。几何自检不是临床标注质量或模型性能证据。
-Decision requested: none。
-Next safe task: 在不安装依赖/改系统的范围内，核查原生 arm64 SlicerRT 或可复核官方转换路径，并静态判断现有环境能否严格加载固定 checkpoint；形成可执行、资源受限的下一阶段提案后再进行模型测试。不得把临时 mask 几何通过表述成官方 conversion 或效能通过。
+Scope completed: 完成 46 例作者 test 参考 mask 的轴序更正与 VTK 空间交叉核对；静态核查 VS_Seg CPU 加载候选并按用户允许下载固定 MONAI wheel，验证文件大小、SHA-256 和归档成员路径；未安装、未加载模型、未运行推理；更新计划与交接，不改产品代码。
+Files changed: `docs/annotation_tumor_plan.md`、`docs/AGENT_SYNC.md`。影像、RTSTRUCT、无效/修正后的 mask、wheel、脚本和 JSON 均保存在被忽略的 `Annotation_Projects/` 子目录，不进入 Git。
+Validation: manifest 138/138 series、0 下载失败、每项 TCIA MD5/ZIP CRC 通过；配对 46/46 T1/RTSTRUCT series/frame/SOP 引用通过；轴序纠正与 VTK 交叉检查 46/46 完成，切片集合相同、保存几何通过、交叉实现 Dice 中位数 0.96543（范围 0.92758–0.98275）；MONAI wheel 为 350,941 bytes、SHA-256 与官方 PyPI 一致、137 个成员路径安全；`git check-ignore -v` 确认数据、mask 和 wheel 被忽略；文档 `git diff --check` → PASS。机器报告和逐例 SHA 在 `Annotation_Projects/vs-seg-test-20260923/`。
+Known limits / failures: SlicerRT 当前只有 x86_64 构建，未在 arm64 主机运行；VTK 交叉栅格不是完整的 SlicerRT labelmap conversion，边界离散化有差异。没有安装依赖，没有 strict checkpoint load、模型推理或效能验证；`weights` 仍为 PENDING。几何交叉不是临床标注质量或模型性能证据。
+Decision requested: 是否授权在 Git 忽略目录创建一次性 CPU 探针环境，使用已下载的 MONAI 0.4.0 wheel（离线、no-deps）和 boa 现有 Torch/NumPy，仅做安全 checkpoint 读取与 strict=True 全网加载；不运行 patient forward，不调用 MONAI bundle 下载/解压 API。
+Next safe task: 获准后执行上述 strict-load 探针并记录加载结果；若加载通过，再单独请求有界合成 ROI CPU/RSS shape 冒烟。只有输入预处理和原图空间往返冻结后，才考虑 46 例作者 test。不得把下载、strict load 或参考 mask 几何核对表述为推理兼容、模型效能或临床验证。
 ```
 
 ## 每轮交接模板
