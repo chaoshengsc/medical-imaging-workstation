@@ -111,6 +111,7 @@ Verified 2026-09-23:
   - 固定官方 VisionTransformer 类体在隔离 CPU namespace 中替换 fused dense/MLP/残差 norm 后，真实编码器权重 strict=True 加载；合成 8 patch 输出 [8,768]，接诊断头得到检查级 [2,74]；两序列合批与分开运行最大差 0，故意缺少 norm.bias 被拒绝。
   - VS-SEG-002/003 各 120 帧单一 MR Series，SimpleITK 3D 读取与 DICOM 患者空间逐片原点最大差 9.33e-14/2.05e-13 mm；混序列、重复 SOP、缺片反例被拒绝。
   - 两例真实 T1 经固定官方预处理及归一化，分别生成 335/283 个 token，CPU 编码器+诊断头输出有限的检查级 [1,74] 分数；前向各约 1.0–1.3 秒、进程峰值 RSS 约 2.4–2.5 GB（仅此本机两例技术测量）。
+  - KCL VS_Seg T1 官方约 34.4 MB 权重包仍可定位，但本机未下载；作者固定 split 为 176/20/46，vs_gk_2/3 在训练组；恢复的 VS-SEG-002/003 在本项目准入卡中按训练重叠隔离。本机没有可用参考 mask，作者测试入口依赖 label，不可原样用于无真值推理。
   - 静态审计恶意 GLOBAL、未知 opcode、非张量顶层、错误摘要 4 个反例测试通过。具体命令与忽略目录下的 JSON 结果见 docs/annotation_tumor_plan.md 的 2026-09-23 节。
 
 Limits:
@@ -127,7 +128,7 @@ Files changed: 前两次提交的实验脚本与文档；本次增补 experiment
 Validation: 见本节 Verified 和 docs/annotation_tumor_plan.md 的 2026-09-23 精确命令；本轮新产物均通过。
 Known limits / failures: GPU/CPU 数值等价未证；两例是联调不是独立测试；产品通用输入适配未接；检查级诊断头不产生病灶 mask/类型绑定。
 Decision requested: none。
-Next safe task: 停止用 VS-SEG-002/003 反复调分类分数，回到病灶分割模型准入：核对专用模型权重、许可、输入序列、患者级参考 mask 与空间契约，先完成一个病种的独立真实病例测试设计。NeuroVFM 仅作为检查级候选线索；类型与具体 mask 的绑定需额外病灶级证据。无合格模型时保留人工/候选 mask 工作流，不开放自动诊断。
+Next safe task: VS_Seg T1 的下一关口是固定权重实物核验（官方约 34.4 MB，当前交接规则禁止新增模型下载，需当前用户对这项下载明确授权）、无标签 CPU 输入/源空间往返设计，以及作者 test 划分或外域患者的参考 mask 获取。VS-SEG-002/003 禁用于独立效果验收。NeuroVFM 只作检查级候选线索，类型与具体 mask 的绑定需额外证据；无合格模型时保留人工/候选 mask 工作流。
 ```
 
 ## 每轮交接模板

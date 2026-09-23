@@ -741,3 +741,13 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experime
 ```
 
 **尚需的证据与产品工作：** CPU 运算替换尚未与官方 GPU 参考逐层对照，检查级分数未经患者级正负样本验证，也没有病灶级对应依据。NeuroVFM 不产生 mask；原目标中的自动分割必须由独立、合格的病灶模型承担，并与手工编辑、3D、保存链路另行验收。当前两例已经用于联调，不能再充当独立效能测试集。下一轮优先转回病灶分割模型准入与真实参考 mask 验证；NeuroVFM 的检查级输出只保留为研究候选线索，不因整例技术通路可跑就开放自动瘤种按钮。
+
+### 同日病灶模型准入复查：KCL VS_Seg T1
+
+这项复查只读本地准入卡与固定上游公开资料，**没有下载或运行新的分割模型**。现有 `tumor_model_admission.py` 固定上游提交 `33410a2`、T1 权重名 `UNet2d5_Att_Hard_T1_final.zip` 与 Zenodo DOI。作者 [GitHub 仓库](https://github.com/KCL-BMEIS/VS_Seg) 和 [Zenodo 产物](https://zenodo.org/records/6323472) 仍公开列出该约 34.4 MB 的训练后权重包；但当前工作区及本机模型缓存没有此包，故本地 SHA、内部文件、CPU 严格加载与 mask 输出均未验证。公开元数据不等于模型准入通过。
+
+固定 [作者划分表](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/params/split_TCIA.csv) 共 242 人：176 training、20 validation、46 test；其中 `vs_gk_2`、`vs_gk_3` 列为 training。现有准入代码把 VS-SEG-002/003 列入训练重叠隔离名单，因此这两例只能用于接入调试，不能作为独立性能结论。当前只恢复这两例 T1 DICOM，未找到可用于分割效能比较的本地参考 mask/RTSTRUCT。[TCIA 原集合](https://www.cancerimagingarchive.net/collection/vestibular-schwannoma-seg/)约 28 GB；可考虑从其 test 划分选择少量病例与参考轮廓做有界下载，但需先核对病例 ID 对应、来源几何和训练排除。不能拿当前两例已知答案继续调参数并宣称模型有效。
+
+固定上游 [`VS_inference.py`](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/VS_inference.py) 调用 `load_T1_or_T2_data()` 读取图像/标签配对；[VSparams.py](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/params/VSparams.py) 的测试 transform 同时加载 `image` 与 `label`，并在后续用标签算 Dice、画中心切片。模型计算可另写无标签的推理适配，但不能把作者测试脚本原样当作用户无真值输入的生产入口。该分割器只针对前庭神经鞘瘤：有 mask 也不能凭模型名称确认未知患者是什么瘤，仍需独立类型/拒绝证据。
+
+**当前结论：** VS_Seg T1 是可继续核查的固定病种分割候选，尚未获准作为自动结果。下一具体关口是取得固定 34.4 MB 权重实物并核验摘要/包内依赖、设计无标签 CPU 输入与源空间往返，同时获得至少一例不在作者 training/validation 的参考 mask（最好另有外域病例），随后才测 Dice、HD95、检出和假阳性。当前交接规则禁止新增模型下载；在权重未取得前保持公开资料审查，不伪造运行结果。
