@@ -690,7 +690,7 @@ NeuroVFM访问复查：用户告知“做了”后，使用现有独立环境及
 
 ### NeuroVFM 固定权重静态契约与 CPU 分类头冒烟（2026-09-23）
 
-本轮继续研究已缓存的两份固定权重，未重新下载、安装依赖、运行 GPU、训练或读取病例。固定上游源码为 [`MLNeurosurg/neurovfm@9240021`](https://github.com/MLNeurosurg/neurovfm/tree/9240021d4ef5c262b21cee5d219c2adf65f4d42f)；14 个必要源码文件按 Git blob 摘要核对，副本仅在忽略目录 `Annotation_Projects/neurovfm-static-20260923/source/`，清单为 `experiments/neurovfm_static_source_manifest.json`。两份权重使用 2026-09-22 已记录的 SHA256，均来自本机 Hugging Face 缓存，不进仓库。
+本轮继续研究已缓存的两份固定权重，首段未重新下载、安装依赖、运行 GPU、训练或读取病例。固定上游源码为 [`MLNeurosurg/neurovfm@9240021`](https://github.com/MLNeurosurg/neurovfm/tree/9240021d4ef5c262b21cee5d219c2adf65f4d42f)；随后补入归一化模块，现有 15 个必要源码文件按 Git blob 摘要核对，副本仅在忽略目录 `Annotation_Projects/neurovfm-static-20260923/source/`，清单为 `experiments/neurovfm_static_source_manifest.json`。两份权重使用 2026-09-22 已记录的 SHA256，均来自本机 Hugging Face 缓存，不进仓库。
 
 - `experiments/neurovfm_static_audit.py` 先校验固定 SHA256，再用受限 pickle opcode 解释器只读 PyTorch ZIP 中的元数据，不调用 `pickle.load` 或 `torch.load`，不读 tensor payload。核对 136 个编码器张量、16 个诊断头张量的**完整键名与 shape**、储存文件大小、配置及 74 个唯一 MRI 标签；所有检查通过。恶意 `GLOBAL`、未知 opcode、非张量顶层和错误摘要四个反例均被测试拒绝。结果：`Annotation_Projects/neurovfm-static-20260923/checkpoint-contract.json`。
 - 在现有 `boa` 环境中用 PyTorch 2.5.1、4 CPU 线程、`weights_only=True`、`mmap=True`、`map_location='cpu'` 读取固定权重；加载后每个 tensor 的键名、shape、dtype 与静态审计逐项一致。编码器 85,803,234 个元素（36 个 BF16、100 个 FP32 张量），诊断头 946,088 个元素（16 个 FP32 张量）。结果：同目录 `cpu-state-dict-load.json`。这是 state dict 解码，不是模型实例化或前向。
@@ -722,3 +722,22 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experime
 ```
 
 **仍未证明：** 显式 FP32 残差 LayerNorm、tanh 近似 GELU 和 BF16 标准注意力与发布时 GPU fused kernel 的逐层数值一致性；合成 8 patch 不是实际 MRI 的 token 分布，也未验证整例内存/速度。下一步先处理单一 DICOM 3D 序列选择及官方预处理一致性，再做有界技术试跑；输出仍是检查级分数，不能替代分割或逐病灶分类。单次合成冒烟用时约 2.4 秒，不能外推整例速度。
+
+### 同日续进：两例真实 MRI 的输入空间核查与整例技术试跑
+
+这是**接入技术试跑**，不用于诊断、效能或瘤种准确性结论。`experiments/neurovfm_dicom_input_preflight.py` 对恢复病例 ZIP 先验 SHA256、再只读 DICOM 头；要求唯一 Study/Series UID、唯一 SOP、Classic 单帧 MR、完整帧数、统一矩阵与几何。对两例各 120 帧用 SimpleITK 指定 Series UID 重建 3D 体，并把每个 z 索引的物理原点逐一对照 DICOM 的 `ImagePositionPatient`：两例最大误差分别 `9.33e-14`、`2.05e-13` mm；体数据均为 `[120,512,512]` (zyx)，间距均为 `[0.41015625,0.41015625,1.5]` mm (xyz)。混入第二个 Series UID、重复 SOP、缺片等反例在 `tests/test_neurovfm_dicom_input_preflight.py` 中被拒绝。临时 DICOM 文件随临时目录销毁；本轮未永久解压复制病例。
+
+上游 `StudyPreprocessor.load_study` 对“直接给 DICOM 目录”逐个枚举 `.dcm`，所以技术入口明确为 `load_study([single_series_directory], modality='mri')`；单一序列目录已由上述 UID/几何规则证明。随后 `experiments/neurovfm_real_input_technical_probe.py` 执行固定上游预处理、上游 `NormalizationModule` 与本轮 CPU 适配编码器/诊断头；归一化源码已增补入 Git blob 清单（现共 15 文件）。两例预处理体均为 `[44,208,208]`，目标 spacing `[1,1,4]` mm，背景过滤后分别 335、283 个 token。两例均得到有限的检查级 `[1,74]` 分数向量，保存在忽略目录 `Annotation_Projects/neurovfm-static-20260923/VS-SEG-00{2,3}-technical-scores.json`，标记 `technical_research_unvalidated_not_diagnostic`；不在产品界面显示，亦不把最高分称为病灶类型。
+
+4 CPU 线程、15 分钟超时监护下，两例的官方预处理每例约 1.2 秒、模型前向每例约 1.0–1.3 秒，进程峰值 RSS 约 2.4–2.5 GB（均低于 12 GiB）；精确值以各次 JSON 为准。这只是当前两例与本机 Python/PyTorch 环境的测量，不可推广为一般速度。使用的是已有 `boa` 环境，没有安装包、GPU、训练、上传、远端推送或产品功能接入。原始像素不进 Git；JSON 内的逐标签分数只留在忽略目录。
+
+复现（沿用上节 `ENC`、`DX`、`SRC`、`OUT`；当前病例包位于 `Annotation_Projects/recovered_vestibular_schwannoma_cases`）：
+
+```bash
+/opt/miniconda3/envs/boa/bin/python experiments/neurovfm_dicom_input_preflight.py --cases-root Annotation_Projects/recovered_vestibular_schwannoma_cases --output "$OUT/dicom-input-preflight.json"
+/opt/miniconda3/envs/boa/bin/python -m unittest discover -s tests -p test_neurovfm_dicom_input_preflight.py -v
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experiments/neurovfm_real_input_technical_probe.py --cases-root Annotation_Projects/recovered_vestibular_schwannoma_cases --case-id VS-SEG-002 --encoder "$ENC" --diagnostic "$DX" --source-root "$SRC" --position-wheel "$OUT/dependency-source/positional_encodings-6.0.3-py3-none-any.whl" --output "$OUT/VS-SEG-002-technical-scores.json"
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experiments/neurovfm_real_input_technical_probe.py --cases-root Annotation_Projects/recovered_vestibular_schwannoma_cases --case-id VS-SEG-003 --encoder "$ENC" --diagnostic "$DX" --source-root "$SRC" --position-wheel "$OUT/dependency-source/positional_encodings-6.0.3-py3-none-any.whl" --output "$OUT/VS-SEG-003-technical-scores.json"
+```
+
+**尚需的证据与产品工作：** CPU 运算替换尚未与官方 GPU 参考逐层对照，检查级分数未经患者级正负样本验证，也没有病灶级对应依据。NeuroVFM 不产生 mask；原目标中的自动分割必须由独立、合格的病灶模型承担，并与手工编辑、3D、保存链路另行验收。当前两例已经用于联调，不能再充当独立效能测试集。下一轮优先转回病灶分割模型准入与真实参考 mask 验证；NeuroVFM 的检查级输出只保留为研究候选线索，不因整例技术通路可跑就开放自动瘤种按钮。
