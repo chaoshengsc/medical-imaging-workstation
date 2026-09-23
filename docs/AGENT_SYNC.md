@@ -98,31 +98,33 @@ Next safe task: <one bounded task>
 ## 当前交接
 
 ```text
-Milestone: 恢复范围 A/B/C/D 的工程验收已通过；原目标中的自动肿瘤分割和逐病灶分类未完成。
-Base commit: 9b1c3ea（本次修复其覆盖掉的最新交接；被删的历史反馈仍可从 ba21e40 读取）
-Writer: Codex 负责后续进度核对与回复；模型或产品实施另按当前用户指示执行。
+Milestone: A/B/C/D 的工程验收已通过；NeuroVFM 权重契约、CPU state dict 读取及诊断头合成输入冒烟已通过。自动肿瘤分割与逐病灶分类未完成。
+Base commit: 80be4cb（本轮研究开始点）
+Writer: Codex；本轮仅研究脚本、定向测试和交接记录写入，未改产品运行路径。
 
 Verified 2026-09-23:
-  - 核对前工作树干净，main 比 origin/main 领先 34 个本地提交；本次交接修复另加一个本地提交，未推送。
-  - `SKIP_REAL_DATA=1 .../python tests/test_gui.py` → 1487/1487。
-  - 里程碑 A/B/C/D 七个脚本逐个运行 → 38/38、76/76、44/44、12/12、36/36、14/14、20/20；
-    合计 240/240。另 `python -m unittest tests.test_tumor_model_admission -v` → 6/6。
-    A/B/C 脚本实际读取恢复的 VS-SEG-002/003 病例，没有因缺数据跳过。
-  - NeuroVFM 两个权重仍在本机 HuggingFace 缓存，SHA256 与 d10b893 一致；产品未接入这些权重。
-  - 用户已确认当前项目不商用（c50fbc8 / ba21e40）；旧交接中的“等待许可决策”不再成立。
+  - A/B/C/D 基线见上一提交 80be4cb；本轮没有修改其产品代码，未把旧 PASS 当新性能证据。
+  - 固定源码 MLNeurosurg/neurovfm@9240021，14 个文件的 Git blob 摘要通过；两个已缓存权重的 SHA256 与 d10b893 一致。
+  - 静态审计：encoder 136 个张量、MRI 诊断头 16 个张量，键名/shape 与固定 config 精确一致；MRI 标签 74 个唯一项；9 项检查全通过。
+  - PyTorch 2.5.1、4 CPU 线程、weights_only=True/mmap=True 成功读取两份 state dict，加载元数据逐张量一致；没有构造编码器。
+  - 官方 ClassifyThenAggregate 在 CPU 替换 FusedDense 和 segment_csr 后，真实权重 strict=True 加载，用合成 patch 特征输出 [2,74]；两段注意力和误差 1.19e-7，分批与单独运行最大差 0；缺失键被拒绝。
+  - 静态审计恶意 GLOBAL、未知 opcode、非张量顶层、错误摘要 4 个反例测试通过。具体命令与忽略目录下的 JSON 结果见 docs/annotation_tumor_plan.md 的 2026-09-23 节。
 
 Limits:
-  - A/B 验证的是已实现的 Undo，没有 Redo；早期 A 文字中的 Redo 是措辞错误，已更正。
-  - C 验证工作区切换、保存重开与真实 mask 的 3D 可用性；没有完成所有主观 UI 体验验收。
-  - D 是候选与运行申请的拒绝规则，不证明任何新模型能正确运行或有效分割。
-  - 旧 AI 结果未恢复；B 对原始 AI 层与人工层的隔离使用接口构造验证，未声称验证旧缓存。
-  - NeuroVFM 目前只有权重下载和哈希；本次未做真实权重 CPU 加载、前向、患者级效果验证。
-    它的诊断头是检查级输出，不能直接给具体病灶贴瘤种标签，也不能产生分割 mask。
-  - 当前非商用用途已确认；未来如分发权重或改变用途，仍需核对权重许可、署名和分发条件。
+  - 这不是从 MRI 到 74 标签的整模型推理；编码器 FlashAttention/BF16 路径、位置编码与预处理尚未跑通。没有真实病例效果或类型准确性结论。
+  - 官方 StudyPreprocessor.load_study 对 DICOM 目录逐文件枚举，需先按 UID 建立正确的 3D 序列输入与几何记录。
+  - NeuroVFM 只有检查级标签，不生成 mask，也不能自动把类型绑定至某个病灶；产品未接入其权重。
+  - A/B 仅有 Undo 无 Redo；C 的主观 UI 验收仍不全；D 的准入拒绝门不是模型效能证明。
+  - 当前非商用用途已确认；未来若分发权重或改变用途，仍核对许可、署名和分发条件。没有 push。
 
-Next safe task: 先静态核对 NeuroVFM 权重键名/shape 与固定 config、输入和标签契约；
-  如要进一步验证 CPU，按既有 4 线程、15 分钟、12 GiB 上限做隔离原型，单独记录结果。
-  这仍只是检查级分类组件研究；自动病灶分割与逐病灶类型绑定需另选有证据的组件并独立验收。
+Feedback for review
+Commit: 本提交（以 git log -1 的实际哈希为准）
+Scope completed: 固定权重与源码静态契约核对、CPU 安全载入及官方检查级诊断头合成输入冒烟。
+Files changed: experiments/neurovfm_static_audit.py, experiments/neurovfm_static_source_manifest.json, experiments/neurovfm_checkpoint_load_probe.py, experiments/neurovfm_cpu_head_probe.py, tests/test_neurovfm_static_audit.py, docs/annotation_tumor_plan.md, docs/AGENT_SYNC.md。
+Validation: 见本节 Verified 和 docs/annotation_tumor_plan.md 的 2026-09-23 精确命令；本轮新产物均通过。
+Known limits / failures: 完整编码器与真实 MRI 未跑；DICOM 目录输入契约有已定位缺口；诊断头不产生病灶 mask/类型绑定。
+Decision requested: none。
+Next safe task: 在忽略目录隔离实现固定 encoder 配置的 CPU 等价路径，先以小型合成输入对照注意力、残差归一化、MLP 和位置编码，再 strict 加载已下载权重；同时单独设计按 UID 选 3D DICOM 序列的输入适配及空间记录。达不到数值/空间核查时停止真实病例推理。4 线程、15 分钟、12 GiB 上限；不进入产品运行路径。自动分割仍需独立病灶模型。
 ```
 
 ## 每轮交接模板

@@ -687,3 +687,26 @@ NeuroVFM访问复查：用户告知“做了”后，使用现有独立环境及
 **结论：** 权重已下载并有真实哈希，但许可条款（Non-Commercial）目前构成一个需要用户决策的具体障碍，不是留白的"未核实"。在这个许可问题解决之前，继续做 CPU 适配原型或推理验证的实际价值有限——即便技术验证全部通过，Non-Commercial 权重也不能直接支撑商业产品的自动接入。下一步建议：用户先确认这份许可对项目商业模式是否可接受（例如是否有另行获取商用许可的渠道），再决定是否值得继续投入 CPU 适配和推理验证的工作。产品代码未改，未新增依赖安装，`tumor_model_admission.py` 未改动。
 
 **2026-09-22 用户明确答复"我们不商用"**：CC-BY-NC-SA-4.0 的 Non-Commercial 限制对本项目当前定位不构成阻碍，上面标的许可障碍解除。注意这只是用户对项目自身用途的确认，不等于 `pyproject.toml` 里 `Proprietary — All rights reserved` 的表述已经改写为与非商业许可一致——若日后项目性质变化（例如决定商业化），需要重新核对这份许可，不能假设本次确认永久有效。许可障碍解除不等于自动获得"可以安装依赖、构造模型、执行 CPU 推理"的许可：那一步涉及在本机运行第三方模型代码，是另一类需要单独确认的动作，尚未获得授权，本节未做任何新的技术验证。
+
+### NeuroVFM 固定权重静态契约与 CPU 分类头冒烟（2026-09-23）
+
+本轮继续研究已缓存的两份固定权重，未重新下载、安装依赖、运行 GPU、训练或读取病例。固定上游源码为 [`MLNeurosurg/neurovfm@9240021`](https://github.com/MLNeurosurg/neurovfm/tree/9240021d4ef5c262b21cee5d219c2adf65f4d42f)；14 个必要源码文件按 Git blob 摘要核对，副本仅在忽略目录 `Annotation_Projects/neurovfm-static-20260923/source/`，清单为 `experiments/neurovfm_static_source_manifest.json`。两份权重使用 2026-09-22 已记录的 SHA256，均来自本机 Hugging Face 缓存，不进仓库。
+
+- `experiments/neurovfm_static_audit.py` 先校验固定 SHA256，再用受限 pickle opcode 解释器只读 PyTorch ZIP 中的元数据，不调用 `pickle.load` 或 `torch.load`，不读 tensor payload。核对 136 个编码器张量、16 个诊断头张量的**完整键名与 shape**、储存文件大小、配置及 74 个唯一 MRI 标签；所有检查通过。恶意 `GLOBAL`、未知 opcode、非张量顶层和错误摘要四个反例均被测试拒绝。结果：`Annotation_Projects/neurovfm-static-20260923/checkpoint-contract.json`。
+- 在现有 `boa` 环境中用 PyTorch 2.5.1、4 CPU 线程、`weights_only=True`、`mmap=True`、`map_location='cpu'` 读取固定权重；加载后每个 tensor 的键名、shape、dtype 与静态审计逐项一致。编码器 85,803,234 个元素（36 个 BF16、100 个 FP32 张量），诊断头 946,088 个元素（16 个 FP32 张量）。结果：同目录 `cpu-state-dict-load.json`。这是 state dict 解码，不是模型实例化或前向。
+- `experiments/neurovfm_cpu_head_probe.py` 在核对固定源码和权重后，直接执行上游 `ClassifyThenAggregate` 类，仅把 `FusedDense` 替换为 `torch.nn.Linear`、`torch_scatter.segment_csr` 替换为显式的 CPU 分段 max/sum。诊断头真实权重 `strict=True` 全量载入；故意删除 `W.bias` 时严格加载拒绝。用 3、5 个 patch 的**合成**特征验证输出 `[2, 74]`，每段注意力和为 1（最大误差 `1.19e-7`），分批与逐序列输出完全一致（最大差 0）。结果：同目录 `cpu-head-probe.json`。这证明分类头的有限 CPU 运行，不证明编码器、图像输入或临床效能。
+
+可重复命令（工作目录为仓库根；将路径中的固定 revision 按本机缓存位置使用）：
+
+```bash
+ENC=/Users/sc/.cache/huggingface/hub/models--mlinslab--neurovfm-encoder/snapshots/d5194fc70a162185f8ef062e362bd522a35312a9/pytorch_model.bin
+DX=/Users/sc/.cache/huggingface/hub/models--mlinslab--neurovfm-dx-mri/snapshots/628b661744482e528374d9c9ef1b54aded3d4c6e/pytorch_model.bin
+SRC=Annotation_Projects/neurovfm-static-20260923/source
+OUT=Annotation_Projects/neurovfm-static-20260923
+/opt/miniconda3/envs/dicom_gui/bin/python experiments/neurovfm_static_audit.py --encoder "$ENC" --diagnostic "$DX" --source-root "$SRC" --output "$OUT/checkpoint-contract.json"
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experiments/neurovfm_checkpoint_load_probe.py --encoder "$ENC" --diagnostic "$DX" --source-root "$SRC" --output "$OUT/cpu-state-dict-load.json"
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experiments/neurovfm_cpu_head_probe.py --encoder "$ENC" --diagnostic "$DX" --source-root "$SRC" --output "$OUT/cpu-head-probe.json"
+/opt/miniconda3/envs/dicom_gui/bin/python -m unittest discover -s tests -p test_neurovfm_static_audit.py -v
+```
+
+**进入整例推理之前的两个独立缺口：** 固定官方 `vit.py` 顶层依赖 FlashAttention，编码器的 BF16 注意力、残差归一化、MLP 和位置编码尚未完成 CPU 等价实现与数值对照；不能凭诊断头通过推出整模型可用。固定官方 `StudyPreprocessor.load_study` 对目录枚举 `*.dcm` 并逐文件送入 `load_image`，而 `load_image` 的 DICOM series 读取入口是**目录**；需先建立按 Study/Series UID 选择单一 3D 序列的适配并保留方向、层间距、变换记录，不能把一个切片当一套 MRI。随后才做有界整例技术试跑与患者级验证。这个模型本身只有检查级 74 标签，既不生成分割 mask，也不能给具体病灶自动贴瘤种。

@@ -1,0 +1,20 @@
+{
+  "repo": "MLNeurosurg/neurovfm",
+  "commit": "9240021d4ef5c262b21cee5d219c2adf65f4d42f",
+  "files": [
+    {"path": "neurovfm/models/vit.py", "git_blob": "31dde7620c28518a14c4c19c27163ca5b8723cdd", "bytes": 56408},
+    {"path": "neurovfm/models/mil.py", "git_blob": "f5e5631991dfeea57a8f6e54924b7a4ac59d325d", "bytes": 18349},
+    {"path": "neurovfm/models/patch_embed.py", "git_blob": "5f3faa38139aeced8497ddc83245cd463c6327bc", "bytes": 3150},
+    {"path": "neurovfm/models/pos_embed.py", "git_blob": "0479b5d2964ad78d6b1e0d96397202c98cf1989d", "bytes": 3882},
+    {"path": "neurovfm/models/projector.py", "git_blob": "843557271e8a5c71a52512293f5acecbb78b8a52", "bytes": 5371},
+    {"path": "neurovfm/pipelines/encoder.py", "git_blob": "a62b448d5ffdbbade72b2a8575796bd5dedfe5c7", "bytes": 6707},
+    {"path": "neurovfm/pipelines/diagnostic.py", "git_blob": "592178e11ebecfb1968f2cf3accd0368134e0e0a", "bytes": 7913},
+    {"path": "neurovfm/pipelines/preprocessor.py", "git_blob": "ceafecaef26abb73810416f12f847c847874be35", "bytes": 9132},
+    {"path": "neurovfm/pipelines/resources/mri_label_names.txt", "git_blob": "93d8f141ef68a32cb621c9f4af6b9c393ead9805", "bytes": 1441},
+    {"path": "neurovfm/data/preprocess.py", "git_blob": "68ffcc11da09dcfd14bed41c9f9b8a5ede1d2daf", "bytes": 15172},
+    {"path": "neurovfm/data/io.py", "git_blob": "a69aecf74d47e6707dd2b07839664c53c7917368", "bytes": 5738},
+    {"path": "neurovfm/data/utils.py", "git_blob": "0a61e838f1c6a90b4ff23d887c34c7ac22940d6d", "bytes": 8507},
+    {"path": "pyproject.toml", "git_blob": "68d2277d567d5f06877a013022a1a3676f0b931f", "bytes": 1620},
+    {"path": "neurovfm/pipelines/README.md", "git_blob": "119574728ed15998e9ac5af4640e52d02212179a", "bytes": 8452}
+  ]
+}
