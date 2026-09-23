@@ -4,7 +4,7 @@ Technical reference for the module layout, the segmentation-model reverse-engine
 
 ## Module layout
 
-The main window is a `MedicalViewer` **God object** decomposed into five UI mixins plus 18 Qt-free compute modules that are unit-tested in isolation. The packaging inventory is the 28 top-level modules declared by `pyproject.toml`; `constants.py` is Qt-free but is a data table rather than a compute module. `help_center.py` provides a non-modal Qt help reader with nine bilingual topics, section search, reading history and isolated teaching diagrams; it does not modify image or project state. `help_topics.py` holds shared content and the pure section-search function.
+The main window is a `MedicalViewer` **God object** decomposed into five UI mixins plus 19 Qt-free compute modules that are unit-tested in isolation. The packaging inventory is the 29 top-level modules declared by `pyproject.toml`; `constants.py` is Qt-free but is a data table rather than a compute module. `help_center.py` provides a non-modal Qt help reader with nine bilingual topics, section search, reading history and isolated teaching diagrams; it does not modify image or project state. `help_topics.py` holds shared content and the pure section-search function.
 
 ```
 main.py            MedicalViewer + entry point (--data load, clinical render, W/L, tools, layout, AI scheduling, i18n, keyboard nav)
@@ -35,6 +35,7 @@ registration.py    2-D rigid registration (phase correlation + rotation search) 
 model_card.py      model card: reads experiments/results/ live and renders provenance, validated scope and unmeasured limits
 tumor_model_admission.py  fail-closed evidence-card gates for candidate tumor models; does not authorize model execution
 vs_seg_t1_adapter.py  evidence-gated KCL VS-Seg T1 image-only RAS preprocessing and source-grid mask inversion; currently accepts identity MR rescale only and does not run inference
+vs_seg_t1_worker.py  isolated CPU worker CLI, digest-bound NPY/JSON protocol, fixed Gaussian sliding-window settings, and source-bound candidate return; product execution remains closed
 constants.py       tool / plane constants + multi-organ palette
 —— resources ——
 style.qss          dark theme

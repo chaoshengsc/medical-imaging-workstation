@@ -98,9 +98,9 @@ Next safe task: <one bounded task>
 ## 当前交接
 
 ```text
-Milestone: A/B/C/D 工程验收已通过；NeuroVFM 固定权重的两例 DICOM→官方预处理→CPU 编码器→检查级分类头技术链路已跑通。KCL VS_Seg 作者 test 参考数据已取得并临时栅格化；自动肿瘤分割与逐病灶分类仍未完成。
-Base commit: f220cf5（VS-Seg T1 checkpoint 检查限制）
-Writer: Codex；本轮完成作者 test 数据映射、DICOM 配对和临时参考 mask 几何检查，仅更新研究记录及交接文档，未改产品代码或 UI。
+Milestone: A/B/C/D 工程验收已通过；NeuroVFM 仅有检查级技术链路。KCL VS-Seg T1 输入 adapter 与隔离 worker 协议已完成合成验证；自动分割效果、逐病灶分类和产品执行仍未完成。
+Base commit: 9152502（VS-Seg T1 来源绑定图像适配器）
+Writer: Codex；本轮实现固定源码/权重校验、CPU worker CLI、官方滑窗和 source-bound NPY/JSON 协议；未做患者推理、未接入 UI。
 
 Verified 2026-09-23:
   - A/B/C/D 基线见上一提交 80be4cb；本轮没有修改其产品代码，未把旧 PASS 当新性能证据。
@@ -118,6 +118,7 @@ Verified 2026-09-23:
   - VS-Seg strict-load 探针（2026-09-23）：固定 KCL commit 的 3 个网络源码文件逐文件核对 Git blob SHA；按 VSparams.py 的作者配置构造 UNet2d5_spvPA。PyTorch 2.5.1 `weights_only=True` 安全读取已校验 checkpoint，以 `strict=True` 完整加载 256 个张量（3,455,790 个元素），missing/unexpected keys 均为空。运行环境 Python 3.10.20 arm64、CPU 单线程、Torch 2.5.1、MONAI 0.4.0、NumPy 1.26.4。裸 MONAI import 因 NumPy 移除 `np.bool` 失败；只在探针进程临时设置 `np.bool = bool` 后成功，不改包或产品代码。未执行 forward、未读取患者影像。报告与源码清单在忽略目录 `Annotation_Projects/vs-seg-t1-20260923/cpu-strict-load-20260923/`；VS_SEG_CARD 的 `weights` 已标为 VERIFIED，但其余运行和验证门仍关闭。
   - VS-Seg 合成 CPU shape 冒烟（2026-09-23）：固定 KCL 网络及 T1 checkpoint 对确定性合成输入 `[1,1,384,384,64]` 执行一次全精度、单线程前向，输出 `[1,2,384,384,64]` 且 logits 全有限；模型前向 65.88 秒。0.5 秒采样的进程组峰值 RSS 为 11.73 GiB，低于 12 GiB 终止线但余量很小；采样不是硬隔离，可能低估瞬时峰值。未读取病例、未计算分割指标。初次 worker 在成功输出后因异常捕获范围过宽多打印一条 `SystemExit(0)` 诊断，返回码为 0 且最终 JSON 为 PASS；随后已修正脚本处理，未为该日志问题重复高内存前向。报告、脚本与固定 VSparams 源码均在忽略目录。此单 patch 冒烟不够把 `cpu_budget` 标为 VERIFIED。
   - VS-Seg no-label adapter（2026-09-23）：新增 `vs_seg_t1_adapter.py`，输入必须先通过固定 `VST1Request` / 来源资格门；执行产品 `SeriesVolume zyx → xyz`、LPS→RAS、官方 MONAI 0.4 RAS orientation、含零背景的全卷 NormalizeIntensity，并保留来源/request digest 与 affine。二值 mask inverse 要求同一来源、shape 与 0/1 值域，并返回原始 zyx/LPS；不加载权重、不运行网络、不接入人工层。5 种合成朝向下与 MONAI Orientation/Normalize 数组逐 bit 一致、affine `atol=1e-7`，结果见忽略目录 `product-adapter-monai-crosscheck.json`。另对作者 test split 的 5680 张 MR DICOM 仅读取头信息，46/46 T1 序列的 RescaleSlope/Intercept 均为恒等变换；产品 MR `SeriesVolume` 保留 stored values，故适配器只接受恒等 rescale，非恒等、空值或非有限 metadata 均 fail-closed。KCL 官方 DICOM→NIfTI 路径经 Slicer/ITK，ITK GDCM 会应用 RescaleSlope/Intercept，但当前 x86_64 Slicer 不能在 arm64 主机原生运行，非恒等 rescale 尚未有 Slicer 逐体素对照，不宣称支持。`tests/test_vs_seg_t1_adapter.py` 5/5 通过且纳入统一 GUI runner。首轮对照抓到 affine 更新但像素漏翻，已修复并由逐体素映射断言覆盖。`VS_SEG_CARD.input_contract` 标为工程变换合同 VERIFIED；不表示真实序列自动识别或模型效果已验证。产品执行 gate 仍独立 fail closed。
+  - VS-Seg 隔离 worker（2026-09-23）：新增 `vs_seg_t1_worker.py`，导入时不加载 Torch/MONAI；通过显式 CLI 和新建 job 目录，使用 `allow_pickle=False` NPY 与严格 JSON 交换输入/输出。manifest 绑定模型/权重/预处理、request/source-binding、MR rescale、RAS affine、shape/axes、输入字节与数组 SHA-256、官方 ROI 及输出类别，不含原始 Study/Series UID。子进程核对固定 KCL 源码 Git blob SHA-1/SHA-256、权重 ZIP/checkpoint SHA-256，以 `weights_only=True` 与 `strict=True` 加载固定网络；运行限定 Python 3.10 / arm64 / NumPy 1.26.4 / Torch 2.5.1 / MONAI 0.4.0，CPU 单线程，并只在 worker 进程设置 `np.bool = bool` 兼容垫片。分割调用官方 Gaussian sliding window，ROI `384×384×64`、batch 1、overlap 0.25、sigma 0.125，二通道 argmax 取通道 1，输出 RAS `xyz` uint8 二值候选、类型 unknown。父侧校验请求未变、摘要回显、输出文件/数组摘要、shape/dtype/值域，再由 adapter 映射回源 `zyx`。9/9 合成协议测试通过；固定资产 strict-load 通过；隔离 MONAI 0.4 小型滑窗 fake predictor 得到 `5×6×4`、18 个预期前景 voxel，模型 forward=0、patient input=false。全套 `SKIP_REAL_DATA=1` 回归 1495/1495。空间回映与 IPC 验证不代表真实 worker 推理、整例 CPU 预算或分割效果；`validate_vs_result` 与执行准入仍 fail closed。
   - TCIA VS-MC-RC2 提供约 6 GB 的外域 NIfTI/T1CE mask 候选，但当前只确认资料与 Aspera 传输要求；未安装插件、未下载或证明训练无交叉。
   - 静态审计恶意 GLOBAL、未知 opcode、非张量顶层、错误摘要 4 个反例测试通过。具体命令与忽略目录下的 JSON 结果见 docs/annotation_tumor_plan.md 的 2026-09-23 节。
 
@@ -126,19 +127,17 @@ Limits:
   - 官方 StudyPreprocessor.load_study 对直接传入的 DICOM 目录逐文件枚举；本轮用已证唯一序列目录的单元素列表入口规避，产品通用输入适配尚未实现。
   - NeuroVFM 只有检查级标签，不生成 mask，也不能自动把类型绑定至某个病灶；产品未接入其权重。
   - A/B 仅有 Undo 无 Redo；C 的主观 UI 验收仍不全；D 的准入拒绝门不是模型效能证明。
-  - KCL 权重身份、安全读取与固定网络 `strict=True` 全网加载已验证；MONAI 0.4/NumPy 1.26 仍需仅限探针进程的 `np.bool = bool` 兼容垫片。全尺寸合成 patch 前向 shape 正确但采样峰值接近 12 GiB，不能证明整例 CPU 预算。产品 no-label 预处理和合成空间还原已实现/逐项对照，但目前无隔离模型 worker 或 GUI 接线；完整病例运行、患者级效果、阴性/OOD 验证均未完成。`cpu_budget`、`task_compatibility` 仍 PENDING，患者/阴性/OOD 等准入门未通过，产品执行仍关闭。作者 test 参考 mask 与独立 VTK 物理栅格交叉核对，不等同 SlicerRT 完整 labelmap conversion 的逐体素复现；MONAI 依赖只装在一次性忽略目录环境。没有患者前向或模型 Dice/HD95。
+  - KCL 权重身份、安全读取与固定网络 `strict=True` 全网加载已验证；MONAI 0.4/NumPy 1.26 仍需仅限探针进程的 `np.bool = bool` 兼容垫片。全尺寸合成 patch 前向 shape 正确但采样峰值接近 12 GiB，不能证明整例 CPU 预算。产品 no-label adapter、source-bound worker IPC 与合成空间回映已实现/验证，但尚无桌面进程 supervisor 或 GUI 接线；完整 worker 病例运行、患者级效果、阴性/OOD 验证均未完成。`cpu_budget`、`task_compatibility` 仍 PENDING，患者/阴性/OOD 等准入门未通过，产品执行仍关闭。作者 test 参考 mask 与独立 VTK 物理栅格交叉核对，不等同 SlicerRT 完整 labelmap conversion 的逐体素复现；MONAI 依赖只装在一次性忽略目录环境。没有患者前向或模型 Dice/HD95。
   - 当前非商用用途已确认；未来若分发权重或改变用途，仍核对许可、署名和分发条件。没有 push。
 
 Feedback for review
-Commit: 本提交（以 `git log -1` 的实际哈希为准）
-Scope completed: 在已核对 KCL 输入约定后，实现来源/序列证据门控的 T1c image-only 适配器及精确 inverse mask 映射；工程输入合同以 5 类合成几何逐项对照 MONAI 0.4 验证后标记 VERIFIED。无权重加载、患者像素输入、前向或 UI 接线。
-Files changed: `vs_seg_t1_adapter.py`、`tests/test_vs_seg_t1_adapter.py`、`tests/test_tumor_model_admission.py`、`tests/test_gui.py`、`tumor_model_admission.py`、`pyproject.toml`、`docs/ARCHITECTURE.md`、`docs/annotation_tumor_plan.md`、`docs/AGENT_SYNC.md`。官方 MONAI crosscheck 与 JSON 报告在 Git 忽略目录，不入库。
-Validation: 5 种 axial LPS / reversed axial / coronal / sagittal / oblique 合成 `SeriesVolume` 中，产品 adapter 图像与 MONAI 0.4 `Orientation(axcodes=RAS)+NormalizeIntensity(nonzero=False,channel_wise=False)` 逐 bit 一致，affine `atol=1e-7` 一致，恢复的 mask 与 zyx 来源逐体素相等。`/opt/miniconda3/envs/boa/bin/python -m unittest discover -s tests -p 'test_vs_seg_t1_adapter.py' -v`（5/5），同环境 `test_tumor_model_admission.py`（6/6）；`SKIP_REAL_DATA=1 QT_QPA_PLATFORM=offscreen /opt/miniconda3/envs/dicom_gui/bin/python -u tests/test_gui.py`（1488/1488）；`/opt/miniconda3/envs/boa/bin/ruff check vs_seg_t1_adapter.py tests/test_vs_seg_t1_adapter.py tests/test_tumor_model_admission.py tests/test_gui.py tumor_model_admission.py`、`git diff --check`、`py_compile` 均退出 0；依赖与架构 known-bad 模块清单自检通过。
-Known limits / failures: 首轮官方方向对照暴露“affine 更新但像素数组未翻转”；已修复并加入每像素 RAS/source 映射断言。输入合同限定为恒等 MR rescale 子集；非恒等 rescale 明确拒绝，尚未通过 Slicer/ITK 实际导入对照。未验证真实序列自动识别、推理输出、整例资源预算或分割效果。模型运行仍被 execution gate 拒绝；没有 push。
+Commit: 由提交后的 `git log -1 --format=%H` 确认（此记录不嵌入自引用哈希）
+Scope completed: 实现隔离 KCL VS-Seg T1 CPU worker CLI 与 source-bound NPY/JSON 输入输出协议，固定模型加载、官方滑窗和二分类 argmax 规则；通过合成协议验证将候选 mask 精确映射回来源网格。
+Files changed: `vs_seg_t1_worker.py`、`tests/test_vs_seg_t1_worker.py`、`tests/test_gui.py`、`pyproject.toml`、`docs/ARCHITECTURE.md`、`docs/annotation_tumor_plan.md`、`docs/AGENT_SYNC.md`。worker probe 和报告位于 Git 忽略目录，不入库。
+Validation: `/opt/miniconda3/envs/boa/bin/python -m unittest discover -s tests -p 'test_vs_seg_t1_worker.py' -v`（9/9）；隔离 probe `Annotation_Projects/vs-seg-t1-20260923/cpu-strict-load-20260923/venv/bin/python Annotation_Projects/vs-seg-t1-20260923/cpu-strict-load-20260923/worker-contract-probe.py`（PASS_WORKER_STRICT_LOAD_AND_SMALL_SYNTHETIC_MONAI_WINDOW；模型 forward=0、patient input=false）；`SKIP_REAL_DATA=1 QT_QPA_PLATFORM=offscreen /opt/miniconda3/envs/dicom_gui/bin/python -u tests/test_gui.py`（1495/1495）；Ruff、`py_compile`、`git diff --check` 均退出 0。
+Known limits / failures: 首轮完整 GUI 回归因静态依赖清单把隔离 worker 的延迟导入误判为桌面依赖而失败；增加有源码注释的窄范围例外后回归全绿。未执行模型 forward 或患者推理；没有桌面进程 supervisor/UI 接线、整例 CPU/内存预算、阴性/OOD 或分割效果验证。产品准入仍关闭。
 Decision requested: 无。
-Next safe task: 设计并实现隔离 KCL 模型 worker 的加载、滑窗与结果协议，接收适配器输出并返回绑定同一 SourceBinding 的二值 mask；先用合成输入验证，继续保持产品执行 gate 关闭，不运行患者推理。
-```
-
+Next safe task: 实现桌面侧隔离 worker supervisor，以显式 Python 环境启动单任务子进程并覆盖取消、超时、失败、病例切换和迟到结果；只用 fake child 与合成 job 测试，不加 UI 运行按钮、不运行患者前向、不打开产品准入门。
 ## 每轮交接模板
 
 ```text

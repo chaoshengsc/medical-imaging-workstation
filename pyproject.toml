@@ -52,6 +52,7 @@ py-modules = [
     "series_registration",
     "tumor_model_admission",
     "vs_seg_t1_adapter",
+    "vs_seg_t1_worker",
 ]
 
 [tool.ruff]

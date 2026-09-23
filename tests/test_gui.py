@@ -3341,9 +3341,9 @@ def test_dependency_declaration_complete():
     模块（`roots & actual`），第三方 import 从未与 `requirements.txt` 对账。少声明一个
     包，本机因为环境里恰好有而全绿，别人 clone 下来直接 ImportError——一切归零。
 
-    唯一的豁免是 `shiboken6`：它是 PySide6 的硬依赖，随 PySide6 一并装上。豁免不是
-    白名单里加一行就算数——**必须在 import 处写明理由**，本断言会去源码里核实那条注释
-    确实存在，否则豁免无效。这样豁免不能被悄悄扩大。
+    豁免只允许已说明的传递依赖 `shiboken6`，以及隔离 KCL worker 的可选运行时依赖
+    `torch`/`monai` 和固定源码包 `params`。它们不属于桌面应用 requirements；理由必须
+    写在 import 处，本断言会核实对应源码注释，不能只在白名单中静默添加。
     """
     print("[依赖声明完整性]")
     import ast
@@ -3367,8 +3367,13 @@ def test_dependency_declaration_complete():
 
     # import 名 → 发行包名（两者不总相同）
     DIST = {"skimage": "scikit-image", "pyside6": "pyside6"}
-    # 豁免：传递依赖，且理由必须写在源码 import 处
-    TRANSITIVE = {"shiboken6": ("ai_engine.py", "PySide6")}
+    # 仅对明确的传递/隔离运行时依赖豁免，且理由必须写在源码 import 处。
+    TRANSITIVE = {
+        "shiboken6": ("ai_engine.py", "PySide6"),
+        "monai": ("vs_seg_t1_worker.py", "isolated CPU worker"),
+        "torch": ("vs_seg_t1_worker.py", "isolated CPU worker"),
+        "params": ("vs_seg_t1_worker.py", "Pinned KCL source bundle"),
+    }
 
     prod = sorted(f[:-3] for f in os.listdir(_ROOT) if re.fullmatch(r"[a-z_0-9]+\.py", f))
     check(len(prod) >= 15, f"扫到 {len(prod)} 个产品顶层模块")
@@ -3401,17 +3406,18 @@ def test_dependency_declaration_complete():
     for imp, (where, parent) in TRANSITIVE.items():
         src = rd(where)
         line = next((ln for ln in src.split("\n")
-                     if re.match(rf"\s*import\s+{re.escape(imp)}\b", ln)), None)
+                     if re.match(rf"\s*(?:import\s+|from\s+)"
+                                 rf"{re.escape(imp)}\b", ln)), None)
         check(line is not None, f"{where} 里确实 import 了 {imp}（豁免针对的是真实存在的 import）")
         check(bool(line and parent in line and "#" in line),
-              f"{imp} 的豁免在源码 import 处写明了它随 {parent} 一并安装"
+              f"{imp} 的豁免在源码 import 处写明了适用范围 {parent}"
               f"（该行：{(line or '').strip()[:80]}）")
 
     # —— 门本身承重 ——
     check(bool(undeclared(req - {"numpy"}, set(TRANSITIVE))),
           "从 requirements 拿掉 numpy 会被判为未声明")
     check(bool(undeclared(req, set())),
-          "撤销 shiboken6 豁免会让它被判为未声明（豁免确实在起作用，不是摆设）")
+          "撤销依赖豁免会将可选依赖判为未声明（豁免确实在起作用）")
     fake = dict(third)
     fake["requests"] = {"main"}
     saved, third = third, fake
@@ -6488,6 +6494,29 @@ def test_vs_seg_t1_adapter_contract():
         print(output.getvalue().rstrip())
         check(result.wasSuccessful(),
               f"合成 adapter 测试全部通过（{result.testsRun} 项）")
+    finally:
+        if sys.path and sys.path[0] == tests_directory:
+            sys.path.pop(0)
+
+
+def test_vs_seg_t1_worker_protocol_contract():
+    """The isolated KCL worker protocol is checked using synthetic MRI only."""
+    import importlib
+    import io
+    import unittest
+
+    print("[VS-Seg T1 isolated worker IPC / sliding-window contract]")
+    tests_directory = os.path.join(_ROOT, "tests")
+    sys.path.insert(0, tests_directory)
+    try:
+        module = importlib.import_module("test_vs_seg_t1_worker")
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(
+            module.VSSegT1WorkerProtocolTests)
+        output = io.StringIO()
+        result = unittest.TextTestRunner(stream=output, verbosity=2).run(suite)
+        print(output.getvalue().rstrip())
+        check(result.wasSuccessful(),
+              f"合成 worker IPC/sliding-window 测试全部通过（{result.testsRun} 项）")
     finally:
         if sys.path and sys.path[0] == tests_directory:
             sys.path.pop(0)
@@ -10762,6 +10791,7 @@ def main_run():
     test_spatial_landmark_roundtrips(app)
     test_signed_dicom_orientation_chain(app)
     test_vs_seg_t1_adapter_contract()
+    test_vs_seg_t1_worker_protocol_contract()
     test_runner_catches_qt_slot_exceptions()
     test_raw_display_window_limits()
     test_ct_preview_rescale_contract()
