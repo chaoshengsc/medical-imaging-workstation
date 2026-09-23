@@ -760,8 +760,10 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experime
 - 本地 ZIP SHA-256：`b83619d9ee475c862a2038eda3ff81282c3c33104e22d714b6b7ab892e53a774`。
 - 压缩包 CRC 全项通过；57 个成员、展开大小 `37,381,748` bytes，没有绝对路径或 `..` 路径成员。
 - 内含 `best_metric_model.pth`（SHA-256 `14b77d2b5f6d2d83bb8ac036e7ab2ef64d2d9c8a03db2c065a2a71fdc63eb123`，与代码中预先固定的摘要一致）和 `last_epoch_model.pth`（SHA-256 `9f930d3768f254bfff2df20b64494a2d5cbc1b590f330f368734e38d6c788f8b`），以及训练/测试日志和示例图。
-- 文件由 `.gitignore` 中的 `Annotation_Projects/` 规则忽略。未安装依赖、解包、加载权重或运行推理。
+- 文件由 `.gitignore` 中的 `Annotation_Projects/` 规则忽略。未安装依赖或解包到磁盘。使用 PyTorch 2.13.0 的 `torch.load(..., weights_only=True)` 从 ZIP 流安全读取 best checkpoint：得到仅含张量的 `OrderedDict`，256 项、3,455,790 个张量元素；首个卷积权重形状为 `(16, 1, 3, 3, 1)`，与上游单通道、首层 16 通道、`3×3×1` 配置相符。该局部 shape 对照不是严格整网加载；本机 Python 与 `boa` 环境均无 MONAI，因此未构造网络或执行 forward。
 
-**当前状态：** 权重包身份和传输完整性已核实；checkpoint 键/shape 与固定上游网络是否匹配、无标签 CPU 输入、模型坐标与原始 DICOM 空间往返仍未验证。压缩包里的测试日志/示例图不是本项目的独立评估证据。VS-SEG-002/003 在作者 training split 中，只能用于工程调试；患者级分割效果仍需作者独立 test 或来源可核对的外部参考 mask。
+- 固定上游 [`VSparams.py`](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/params/VSparams.py) 将测试输入组织为 T1 NIfTI、`AddChannel`、`Orientationd(RAS)`、`NormalizeIntensityd`，模型为 3D `UNet2d5_spvPA`，1 输入通道、2 输出通道，测试滑窗为 `384×384×64` 并用 Gaussian blending。上游测试 transform 与推理代码仍依赖 label 做 Dice、导出元数据和作图；软件无标签推理与回到原始 DICOM 空间的适配仍须自行验证。以上为源码合同读取，不表示运行过模型。
+
+**当前状态：** 权重包身份和传输完整性已核实，checkpoint 可安全解析且首层 shape 与公开配置相符；严格全网 state-dict 加载、无标签 CPU 输入、模型坐标与原始 DICOM 空间往返仍未验证。因此应用准入卡的 `weights` 仍保持 `PENDING`，候选 mask 与执行门禁继续关闭。压缩包里的测试日志/示例图不是本项目的独立评估证据。VS-SEG-002/003 在作者 training split 中，只能用于工程调试；患者级分割效果仍需作者独立 test 或来源可核对的外部参考 mask。
 
 独立参考来源的新增线索：TCIA [Vestibular-Schwannoma-MC-RC2](https://www.cancerimagingarchive.net/collection/vestibular-schwannoma-mc-rc2/) 提供约 6 GB 的 NIfTI 影像和成对 T1CE 肿瘤 mask，190 名患者、跨多个采集医院；它与原 VS-SEG 标准化单中心放疗规划数据在采集域上不同，可作为**待核对训练排除**的外域验证候选。作者页面说明公开下载需 IBM Aspera Connect，当前未安装该传输插件、未下载影像，也未证明与任何模型训练数据完全无交叉；不能把这条线索写成已经获得独立测试集。旧 [VS-MC-RC 集合](https://www.cancerimagingarchive.net/collection/vestibular-schwannoma-mc-rc/) 亦有参考分割，但全部下载约 14 GB，且 DICOM 与 NIfTI mask 的来源空间匹配仍需单独证明。
