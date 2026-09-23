@@ -750,6 +750,18 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experime
 
 固定上游 [`VS_inference.py`](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/VS_inference.py) 调用 `load_T1_or_T2_data()` 读取图像/标签配对；[VSparams.py](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/params/VSparams.py) 的测试 transform 同时加载 `image` 与 `label`，并在后续用标签算 Dice、画中心切片。模型计算可另写无标签的推理适配，但不能把作者测试脚本原样当作用户无真值输入的生产入口。该分割器只针对前庭神经鞘瘤：有 mask 也不能凭模型名称确认未知患者是什么瘤，仍需独立类型/拒绝证据。
 
-**当前结论：** VS_Seg T1 是可继续核查的固定病种分割候选，尚未获准作为自动结果。下一具体关口是取得固定 34.4 MB 权重实物并核验摘要/包内依赖、设计无标签 CPU 输入与源空间往返，同时获得至少一例不在作者 training/validation 的参考 mask（最好另有外域病例），随后才测 Dice、HD95、检出和假阳性。当前交接规则禁止新增模型下载；在权重未取得前保持公开资料审查，不伪造运行结果。
+**下载前结论（截至上一交接）：** VS_Seg T1 是可继续核查的固定病种分割候选，尚未获准作为自动结果。当时尚未取得 34.4 MB 权重包；后续关口包括核验实物、设计无标签 CPU 输入与源空间往返，并取得至少一例不在作者 training/validation 的参考 mask（最好另有外域病例），之后再测 Dice、HD95、检出和假阳性。当前不伪造运行结果。
+
+### 同日 T1 权重包下载与完整性核验（2026-09-23）
+
+用户明确授权下载后，从 [Zenodo 官方记录 6323472](https://zenodo.org/records/6323472) 取得 `UNet2d5_Att_Hard_T1_final.zip`，保存于忽略目录 `Annotation_Projects/vs-seg-t1-20260923/`。Zenodo API 元数据将该记录标为 CC-BY-4.0；这是权重记录的许可信息，与上游代码 Apache-2.0 分开记录。此处核验不代表已决定把权重再分发或打包进产品。
+
+- 文件大小 `34,377,805` bytes，与官方值一致；官方 MD5 与本地计算均为 `2fb744a616756c08519e79878326f8f8`。
+- 本地 ZIP SHA-256：`b83619d9ee475c862a2038eda3ff81282c3c33104e22d714b6b7ab892e53a774`。
+- 压缩包 CRC 全项通过；57 个成员、展开大小 `37,381,748` bytes，没有绝对路径或 `..` 路径成员。
+- 内含 `best_metric_model.pth`（SHA-256 `14b77d2b5f6d2d83bb8ac036e7ab2ef64d2d9c8a03db2c065a2a71fdc63eb123`，与代码中预先固定的摘要一致）和 `last_epoch_model.pth`（SHA-256 `9f930d3768f254bfff2df20b64494a2d5cbc1b590f330f368734e38d6c788f8b`），以及训练/测试日志和示例图。
+- 文件由 `.gitignore` 中的 `Annotation_Projects/` 规则忽略。未安装依赖、解包、加载权重或运行推理。
+
+**当前状态：** 权重包身份和传输完整性已核实；checkpoint 键/shape 与固定上游网络是否匹配、无标签 CPU 输入、模型坐标与原始 DICOM 空间往返仍未验证。压缩包里的测试日志/示例图不是本项目的独立评估证据。VS-SEG-002/003 在作者 training split 中，只能用于工程调试；患者级分割效果仍需作者独立 test 或来源可核对的外部参考 mask。
 
 独立参考来源的新增线索：TCIA [Vestibular-Schwannoma-MC-RC2](https://www.cancerimagingarchive.net/collection/vestibular-schwannoma-mc-rc2/) 提供约 6 GB 的 NIfTI 影像和成对 T1CE 肿瘤 mask，190 名患者、跨多个采集医院；它与原 VS-SEG 标准化单中心放疗规划数据在采集域上不同，可作为**待核对训练排除**的外域验证候选。作者页面说明公开下载需 IBM Aspera Connect，当前未安装该传输插件、未下载影像，也未证明与任何模型训练数据完全无交叉；不能把这条线索写成已经获得独立测试集。旧 [VS-MC-RC 集合](https://www.cancerimagingarchive.net/collection/vestibular-schwannoma-mc-rc/) 亦有参考分割，但全部下载约 14 GB，且 DICOM 与 NIfTI mask 的来源空间匹配仍需单独证明。

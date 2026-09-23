@@ -99,7 +99,7 @@ Next safe task: <one bounded task>
 
 ```text
 Milestone: A/B/C/D 工程验收已通过；NeuroVFM 固定权重的两例 DICOM→官方预处理→CPU 编码器→检查级分类头技术链路已跑通。自动肿瘤分割与逐病灶分类未完成。
-Base commit: 80be4cb（本轮研究开始点）
+Base commit: 809e855（VS-Seg 权重包下载前的研究基线）
 Writer: Codex；本轮仅研究脚本、定向测试和交接记录写入，未改产品运行路径。
 
 Verified 2026-09-23:
@@ -111,7 +111,8 @@ Verified 2026-09-23:
   - 固定官方 VisionTransformer 类体在隔离 CPU namespace 中替换 fused dense/MLP/残差 norm 后，真实编码器权重 strict=True 加载；合成 8 patch 输出 [8,768]，接诊断头得到检查级 [2,74]；两序列合批与分开运行最大差 0，故意缺少 norm.bias 被拒绝。
   - VS-SEG-002/003 各 120 帧单一 MR Series，SimpleITK 3D 读取与 DICOM 患者空间逐片原点最大差 9.33e-14/2.05e-13 mm；混序列、重复 SOP、缺片反例被拒绝。
   - 两例真实 T1 经固定官方预处理及归一化，分别生成 335/283 个 token，CPU 编码器+诊断头输出有限的检查级 [1,74] 分数；前向各约 1.0–1.3 秒、进程峰值 RSS 约 2.4–2.5 GB（仅此本机两例技术测量）。
-  - KCL VS_Seg T1 官方约 34.4 MB 权重包仍可定位，但本机未下载；作者固定 split 为 176/20/46，vs_gk_2/3 在训练组；恢复的 VS-SEG-002/003 在本项目准入卡中按训练重叠隔离。本机没有可用参考 mask，作者测试入口依赖 label，不可原样用于无真值推理。
+  - 上一交接时，KCL VS_Seg T1 官方约 34.4 MB 权重包仍未下载；本轮用户明确授权后已下载并完成归档完整性核验，细节见 `docs/annotation_tumor_plan.md` 的“同日 T1 权重包下载与完整性核验”。作者固定 split 为 176/20/46，vs_gk_2/3 在训练组；恢复的 VS-SEG-002/003 在本项目准入卡中按训练重叠隔离。本机仍没有可用参考 mask，作者测试入口依赖 label，不可原样用于无真值推理。
+  - 权重包官方大小/MD5 匹配，本地 ZIP SHA-256、CRC 与内部 best/last checkpoint SHA-256 已记录；`Annotation_Projects/vs-seg-t1-20260923/` 被 `.gitignore` 忽略。此次没有安装依赖、加载 checkpoint、运行 forward 或生成 mask。
   - TCIA VS-MC-RC2 提供约 6 GB 的外域 NIfTI/T1CE mask 候选，但当前只确认资料与 Aspera 传输要求；未安装插件、未下载或证明训练无交叉。
   - 静态审计恶意 GLOBAL、未知 opcode、非张量顶层、错误摘要 4 个反例测试通过。具体命令与忽略目录下的 JSON 结果见 docs/annotation_tumor_plan.md 的 2026-09-23 节。
 
@@ -120,16 +121,17 @@ Limits:
   - 官方 StudyPreprocessor.load_study 对直接传入的 DICOM 目录逐文件枚举；本轮用已证唯一序列目录的单元素列表入口规避，产品通用输入适配尚未实现。
   - NeuroVFM 只有检查级标签，不生成 mask，也不能自动把类型绑定至某个病灶；产品未接入其权重。
   - A/B 仅有 Undo 无 Redo；C 的主观 UI 验收仍不全；D 的准入拒绝门不是模型效能证明。
+  - KCL 权重包身份与字节完整性已验证；checkpoint 张量键/shape 与网络的严格兼容性、CPU/空间往返、无标签输入和患者级效果均未验证。下载包内的训练/测试日志与示例图不构成本项目独立验证。
   - 当前非商用用途已确认；未来若分发权重或改变用途，仍核对许可、署名和分发条件。没有 push。
 
 Feedback for review
 Commit: 本提交（以 git log -1 的实际哈希为准）
-Scope completed: 固定权重静态核对、CPU 合成输入与两例真实 T1 的检查级技术链路，且 DICOM 空间身份前检成立。
-Files changed: 前两次提交的实验脚本与文档；本次增补 experiments/neurovfm_dicom_input_preflight.py、experiments/neurovfm_real_input_technical_probe.py、tests/test_neurovfm_dicom_input_preflight.py、experiments/neurovfm_static_source_manifest.json、docs/annotation_tumor_plan.md、docs/AGENT_SYNC.md。
-Validation: 见本节 Verified 和 docs/annotation_tumor_plan.md 的 2026-09-23 精确命令；本轮新产物均通过。
-Known limits / failures: GPU/CPU 数值等价未证；两例是联调不是独立测试；产品通用输入适配未接；检查级诊断头不产生病灶 mask/类型绑定。
+Scope completed: 在用户明确授权后下载 KCL VS_Seg T1 权重包，核对官方文件身份、压缩包完整性和内部 checkpoint 摘要；记录权重许可与尚未完成的运行/验证边界。
+Files changed: `docs/annotation_tumor_plan.md`、`docs/AGENT_SYNC.md`。权重仅保存在忽略目录 `Annotation_Projects/vs-seg-t1-20260923/`，不进入提交。
+Validation: `stat -f '%z' Annotation_Projects/vs-seg-t1-20260923/UNet2d5_Att_Hard_T1_final.zip` → 34377805；`md5 -q Annotation_Projects/vs-seg-t1-20260923/UNet2d5_Att_Hard_T1_final.zip` → 官方 MD5 匹配；`shasum -a 256 Annotation_Projects/vs-seg-t1-20260923/UNet2d5_Att_Hard_T1_final.zip` → ZIP SHA-256 已记录；Python `ZipFile.testzip()` → `None`（所有成员 CRC 通过）；流式计算两个内部 checkpoint SHA-256；`git check-ignore -v Annotation_Projects/vs-seg-t1-20260923/UNet2d5_Att_Hard_T1_final.zip` → 被 `Annotation_Projects/` 忽略；`git diff --check` → 通过。未运行产品测试套件（本提交仅文档改动，模型文件未加载或执行）。
+Known limits / failures: checkpoint 键/shape 严格兼容、依赖隔离、无标签 CPU 预处理、mask 空间往返、CPU 资源和患者级效果均未验证；当前两例 VS 病例在作者训练 split 中，只能用于工程调试。
 Decision requested: none。
-Next safe task: VS_Seg T1 的下一关口是固定权重实物核验（官方约 34.4 MB，当前交接规则禁止新增模型下载，需当前用户对这项下载明确授权）、无标签 CPU 输入/源空间往返设计，以及作者 test 划分或外域患者的参考 mask 获取。VS-SEG-002/003 禁用于独立效果验收。NeuroVFM 只作检查级候选线索，类型与具体 mask 的绑定需额外证据；无合格模型时保留人工/候选 mask 工作流。
+Next safe task: 用 `weights_only=True` 静态读取已下载的 best checkpoint 键/shape 并与固定上游网络核对，不执行 forward；随后完成 VS_Seg 无标签输入预处理、mask 回到原始 DICOM 空间的变换链设计，并继续核对作者 test 或可证明训练排除的外部参考 mask。VS-SEG-002/003 仅可用于工程调试，不能作为独立效果验收。完成这些前置核查后再提出边界明确的 CPU 运行步骤。NeuroVFM 只作检查级候选线索，类型与具体 mask 的绑定需额外证据；无合格病灶级分类模型时保留人工/候选 mask 工作流。
 ```
 
 ## 每轮交接模板
