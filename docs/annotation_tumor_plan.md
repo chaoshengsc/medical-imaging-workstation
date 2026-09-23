@@ -1,10 +1,12 @@
 # CT / MRI 标注与肿瘤功能计划
 
-2026-09-09本地版本补记：用户要求先git再继续UI优化，既有CT/MRI工程基础功能已单独保存为本地commit `fe37ed6a72bbd8e52633db1dae71a83d059e0624`，第一轮已验收UI为 `574e9414233d02f26b2c76658e9923b3a397aaf7`。未push，不代表新的远端CI或模型研究结论。下方2026-09-08的“未提交”是当日历史状态；UI后续记录见 [ui_review.md](ui_review.md)。
+**当前状态（2026-09-23）：** 工作站工程里程碑 A/B/C/D 已在 `docs/AGENT_SYNC.md` 记录为通过；肿瘤功能仍未达到自动分割或逐病灶分类准入。KCL VS_Seg 作者 test split 的 46 例 T1 与参考 RTSTRUCT 已下载、配对，并以预装 rt-utils 生成 46 份 **临时几何通过**的 NIfTI mask；SlicerRT 官方转换未在 Apple Silicon 主机运行，故这些不是正式转换或模型效能证据。没有安装模型依赖、没有运行 VS_Seg 推理或报告 Dice/HD95；模型权重 `PENDING`。下一步先核对可复现的官方 mask 转换方式，并静态判断现有环境能否严格加载固定 checkpoint。原始数据与机器报告位于被忽略的 `Annotation_Projects/vs-seg-test-20260923/`，不进入 Git。本文是唯一计划与候选研究记录，不代替已实施架构、既有实验报告或软著材料。
 
-更新：2026-09-08。代码核查基线：`6619cf5edec75ea1c831f243a9b438ba81064a3d`。
+历史记录：2026-09-09 用户要求先 git 再继续 UI 优化，既有 CT/MRI 工程基础功能已单独保存为本地 commit `fe37ed6a72bbd8e52633db1dae71a83d059e0624`，第一轮已验收 UI 为 `574e9414233d02f26b2c76658e9923b3a397aaf7`。未 push，不代表新的远端 CI 或模型研究结论。UI 记录见 [ui_review.md](ui_review.md)。
 
-状态：2026-09-08，E0–E5 已完成工程验收及独立复验，当前为未提交的本地工作区。最新复验数据无关层 1342/1342、全套 1467/1467、真实 MRI 交互 21/21、参考显示/候选保存 6/6，证据在 `Annotation_Projects/reaccept-20260908-130954/`。R2 BiomedParse v2 单例 CPU 技术探针已完成，累计三个获准作业、一次实际 forward；依赖和权重位于独立研究目录，未接入产品。R3 自动类型识别准入仍为 NO-GO，R4 未启动；下一步是分类组件与患者级验证证据补齐。最新工程/模型证据核对见 `Annotation_Projects/r2-biomedparse-20260908/goal-completion-audit.json`。下方按日期顺序保留的“未安装／未运行／待批准”是历史状态。本文是唯一计划与候选研究记录，不代替已实施架构、既有实验报告或软著材料。
+历史代码核查基线：2026-09-08，`6619cf5edec75ea1c831f243a9b438ba81064a3d`。
+
+历史工程状态：2026-09-08，E0–E5 已完成当时记录的工程验收及独立复验，复验数据无关层 1342/1342、全套 1467/1467、真实 MRI 交互 21/21、参考显示/候选保存 6/6，证据在 `Annotation_Projects/reaccept-20260908-130954/`。R2 BiomedParse v2 单例 CPU 技术探针已完成，累计三个获准作业、一次实际 forward；依赖和权重位于独立研究目录，未接入产品。R3 自动类型识别准入仍为 NO-GO，R4 未启动；细节见 `Annotation_Projects/r2-biomedparse-20260908/goal-completion-audit.json`。下方按日期顺序保留的“未安装／未运行／待批准”是历史记录。
 
 ## 当前结论
 
@@ -746,7 +748,7 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experime
 
 这项复查只读本地准入卡与固定上游公开资料，**没有下载或运行新的分割模型**。现有 `tumor_model_admission.py` 固定上游提交 `33410a2`、T1 权重名 `UNet2d5_Att_Hard_T1_final.zip` 与 Zenodo DOI。作者 [GitHub 仓库](https://github.com/KCL-BMEIS/VS_Seg) 和 [Zenodo 产物](https://zenodo.org/records/6323472) 仍公开列出该约 34.4 MB 的训练后权重包；但当前工作区及本机模型缓存没有此包，故本地 SHA、内部文件、CPU 严格加载与 mask 输出均未验证。公开元数据不等于模型准入通过。
 
-固定 [作者划分表](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/params/split_TCIA.csv) 共 242 人：176 training、20 validation、46 test；其中 `vs_gk_2`、`vs_gk_3` 列为 training。现有准入代码把 VS-SEG-002/003 列入训练重叠隔离名单，因此这两例只能用于接入调试，不能作为独立性能结论。当前只恢复这两例 T1 DICOM，未找到可用于分割效能比较的本地参考 mask/RTSTRUCT。[TCIA 原集合](https://www.cancerimagingarchive.net/collection/vestibular-schwannoma-seg/)约 28 GB；可考虑从其 test 划分选择少量病例与参考轮廓做有界下载，但需先核对病例 ID 对应、来源几何和训练排除。不能拿当前两例已知答案继续调参数并宣称模型有效。
+固定 [作者划分表](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/params/split_TCIA.csv) 共 242 人：176 training、20 validation、46 test；其中 `vs_gk_2`、`vs_gk_3` 列为 training。现有准入代码把 VS-SEG-002/003 列入训练重叠隔离名单，因此这两例只能用于接入调试，不能作为独立性能结论。**截至本段原始记录时**仅恢复这两例 T1 DICOM，未找到可用于分割效能比较的本地参考 mask/RTSTRUCT。后续已按作者 test 划分取得 46 例数据，状态见下方 2026-09-23 数据获取记录；不能拿当前两例已知答案继续调参数并宣称模型有效。
 
 固定上游 [`VS_inference.py`](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/VS_inference.py) 调用 `load_T1_or_T2_data()` 读取图像/标签配对；[VSparams.py](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/params/VSparams.py) 的测试 transform 同时加载 `image` 与 `label`，并在后续用标签算 Dice、画中心切片。模型计算可另写无标签的推理适配，但不能把作者测试脚本原样当作用户无真值输入的生产入口。该分割器只针对前庭神经鞘瘤：有 mask 也不能凭模型名称确认未知患者是什么瘤，仍需独立类型/拒绝证据。
 
@@ -760,10 +762,22 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /opt/miniconda3/envs/boa/bin/python experime
 - 本地 ZIP SHA-256：`b83619d9ee475c862a2038eda3ff81282c3c33104e22d714b6b7ab892e53a774`。
 - 压缩包 CRC 全项通过；57 个成员、展开大小 `37,381,748` bytes，没有绝对路径或 `..` 路径成员。
 - 内含 `best_metric_model.pth`（SHA-256 `14b77d2b5f6d2d83bb8ac036e7ab2ef64d2d9c8a03db2c065a2a71fdc63eb123`，与代码中预先固定的摘要一致）和 `last_epoch_model.pth`（SHA-256 `9f930d3768f254bfff2df20b64494a2d5cbc1b590f330f368734e38d6c788f8b`），以及训练/测试日志和示例图。
-- 文件由 `.gitignore` 中的 `Annotation_Projects/` 规则忽略。未安装依赖或解包到磁盘。使用 PyTorch 2.13.0 的 `torch.load(..., weights_only=True)` 从 ZIP 流安全读取 best checkpoint：得到仅含张量的 `OrderedDict`，256 项、3,455,790 个张量元素；首个卷积权重形状为 `(16, 1, 3, 3, 1)`，与上游单通道、首层 16 通道、`3×3×1` 配置相符。该局部 shape 对照不是严格整网加载；本机 Python 与 `boa` 环境均无 MONAI，因此未构造网络或执行 forward。
+- 文件由 `.gitignore` 中的 `Annotation_Projects/` 规则忽略。未安装依赖或解包到磁盘。使用 PyTorch 2.13.0 的 `torch.load(..., weights_only=True)` 从 ZIP 流安全读取 best checkpoint：得到仅含张量的 `OrderedDict`，256 项、3,455,790 个张量元素；首个卷积权重形状为 `(16, 1, 3, 3, 1)`，与上游单通道、首层 16 通道、`3×3×1` 配置相符。该局部 shape 对照不是严格整网加载。
 
 - 固定上游 [`VSparams.py`](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/params/VSparams.py) 将测试输入组织为 T1 NIfTI、`AddChannel`、`Orientationd(RAS)`、`NormalizeIntensityd`，模型为 3D `UNet2d5_spvPA`，1 输入通道、2 输出通道，测试滑窗为 `384×384×64` 并用 Gaussian blending。上游测试 transform 与推理代码仍依赖 label 做 Dice、导出元数据和作图；软件无标签推理与回到原始 DICOM 空间的适配仍须自行验证。以上为源码合同读取，不表示运行过模型。
 
-**当前状态：** 权重包身份和传输完整性已核实，checkpoint 可安全解析且首层 shape 与公开配置相符；严格全网 state-dict 加载、无标签 CPU 输入、模型坐标与原始 DICOM 空间往返仍未验证。因此应用准入卡的 `weights` 仍保持 `PENDING`，候选 mask 与执行门禁继续关闭。压缩包里的测试日志/示例图不是本项目的独立评估证据。VS-SEG-002/003 在作者 training split 中，只能用于工程调试；患者级分割效果仍需作者独立 test 或来源可核对的外部参考 mask。
+- 固定上游 [`requirements.txt`](https://github.com/KCL-BMEIS/VS_Seg/blob/33410a2d44e3f57b4df1c3ed005e6d40c0824aa6/requirements.txt) 的 SHA-256 为 `7ce0802b6e79cfbfa83b66f9c6a295a8f7d83e37edd70b449477913f96d42c77`，与代码中锁定摘要一致；其中 PyTorch 约 1.6.0、MONAI 0.4.0。已盘点本机 Conda 环境：base 为 PyTorch 2.13.0 无 MONAI；`boa` 为 PyTorch 2.5.1 无 MONAI；`denoise` 为 PyTorch 2.8.0/MONAI 1.5.0，但在新 Python 进程导入时因重复 `libomp.dylib` abort（exit 134），即使使用 `python -I` 仍复现；`dicom_gui` 为 PyTorch 2.11.0 无 MONAI。没有发现作者固定版本的可复用环境；未设置 `KMP_DUPLICATE_LIB_OK` 等绕过变量。
+
+**当前状态：** 权重包身份和传输完整性已核实，checkpoint 可安全解析且首层 shape 与公开配置相符；严格全网 state-dict 加载、无标签 CPU 输入、模型坐标与原始 DICOM 空间往返仍未验证。因此应用准入卡的 `weights` 仍保持 `PENDING`，候选 mask 与执行门禁继续关闭。兼容推理环境尚未找到。压缩包里的测试日志/示例图不是本项目的独立评估证据。VS-SEG-002/003 在作者 training split 中，只能用于工程调试；作者 test 影像和 RTSTRUCT 后续已获取，但尚未用于模型效果评估，详见下方本日数据记录。
 
 独立参考来源的新增线索：TCIA [Vestibular-Schwannoma-MC-RC2](https://www.cancerimagingarchive.net/collection/vestibular-schwannoma-mc-rc2/) 提供约 6 GB 的 NIfTI 影像和成对 T1CE 肿瘤 mask，190 名患者、跨多个采集医院；它与原 VS-SEG 标准化单中心放疗规划数据在采集域上不同，可作为**待核对训练排除**的外域验证候选。作者页面说明公开下载需 IBM Aspera Connect，当前未安装该传输插件、未下载影像，也未证明与任何模型训练数据完全无交叉；不能把这条线索写成已经获得独立测试集。旧 [VS-MC-RC 集合](https://www.cancerimagingarchive.net/collection/vestibular-schwannoma-mc-rc/) 亦有参考分割，但全部下载约 14 GB，且 DICOM 与 NIfTI mask 的来源空间匹配仍需单独证明。
+
+### 2026-09-23 作者 test 参考数据获取与临时 RTSTRUCT 栅格化
+
+按用户授权，从 TCIA [Vestibular-Schwannoma-SEG](https://www.cancerimagingarchive.net/collection/vestibular-schwannoma-seg/) 仅下载固定 KCL `VS_Seg` 作者划分表中的 46 名 test 患者，每例一套 T1 MRI 和两份候选 RTSTRUCT；不下载整合集、不取 T2 MRI。作者划分表固定在上文所列 Git commit，SHA-256 为 `366b182e9cd3f842556a8abc8182da3fd7260b2b088f4d8ba0fe4a8dc1974365`。通过作者 `vs_gk_<n>` 与 TCIA `VS-SEG-<n>` 同号规则匹配 46 例；这是据命名的一致性映射，不是独立发布的 crosswalk 文件。TCIA API 共列出 1928 个 collection series，本次计划并下载 138 个 series，API 声明解压数据量 `2,985,054,416` bytes（约 2.99 GB），低于 20 GB 授权上限。全部 138/138 完成下载；逐文件 TCIA MD5、ZIP CRC 与实例计数核验通过，下载清单无失败。原始 DICOM、下载/配对/转换脚本、JSON 与 mask 均位于被 `.gitignore` 忽略的 `Annotation_Projects/vs-seg-test-20260923/`，不进入 Git。
+
+- 46/46 患者均有且仅有一个 RTSTRUCT 的 `ReferencedSeriesSequence` 与该病例 T1 `SeriesInstanceUID` 一致；Frame of Reference 一致，目标 ROI 轮廓引用的 SOP UID 均属于所配 T1 序列。每例原有两个 RTSTRUCT 候选，按 DICOM 引用确定 T1 对应者，而非按文件名猜测。源数据的结构标签保留：39 例目标 ROI 名为 `TV`，7 例为 `AN`，不能把 ROI 名当作模型预测的组织学分类。
+- Apple Silicon 主机上的 `/Applications/Slicer.app` 与 SlicerRT 扩展为 `amd64` 构建，不能在 arm64 原生运行；本轮未安装 Rosetta、未改系统设置，也没有冒称已走官方 SlicerRT 转换。为不中断几何准备，使用本机预装的 `rt-utils 1.2.7` 做探索性 rasterization，没有安装软件包。46/46 均成功输出临时 NIfTI；SimpleITK 与 mask 的尺寸、spacing、origin、direction 对应 T1 几何，切片序与轮廓引用切片一致，ROI 的轮廓平面最大偏差约 `5.0e-8 mm`，全部掩膜非空且逐例 SHA-256 已记录。机器可读汇总为 `rtutils-conversion-summary.json`，配对证据为 `pairing.json`。三个 JSON 的 SHA-256（manifest / pairing / conversion summary）依次为 `0036df58de6b8648be14cd18b7368941038b926a96d2ed19e5debceb075e612c`、`d9cd68a0d7f28391995c0bfe31b8dd6b6a4896cf767a2010d551659ea3b67581`、`dfcc7fc113ab9e48d4884b301e8b8c5f290281de0bb99b23faac3194396450a9`。
+- 这些文件状态为 **`PROVISIONAL_GEOMETRY_PASS`**：只能说明配对和临时栅格结果通过本轮几何自检，不能代替 SlicerRT 官方转换复现或独立第二实现逐体素对照，也不证明边界填充语义完全一致。它们来自作者 test 划分，具备做冻结流程下患者级验证的潜力；在确认转换语义、权重严格加载、模型输入/输出空间往返和允许的 CPU 资源前，不报告 Dice/HD95、不跑模型、不宣称 VS_Seg 效能。当前没有安装模型依赖、没有新增推理结果，产品准入仍关闭。
+
+**下一步：** 先评估在 arm64 主机上复现参考 mask 的安全路径：核对可用的原生 Slicer/SlicerRT 构建或独立官方转换证据，并与当前 `rt-utils` 结果做可审查对照；同时静态确认现有环境能否对固定 checkpoint 做严格加载而不安装依赖。满足这两个技术条件后，再提出有明确资源上限的 held-out CPU 推理与评价步骤。失败时保留临时参考数据与本记录，报告阻碍和可替代验证方案，不静默切换标准。

@@ -98,9 +98,9 @@ Next safe task: <one bounded task>
 ## 当前交接
 
 ```text
-Milestone: A/B/C/D 工程验收已通过；NeuroVFM 固定权重的两例 DICOM→官方预处理→CPU 编码器→检查级分类头技术链路已跑通。自动肿瘤分割与逐病灶分类未完成。
-Base commit: c9d7150（VS-Seg T1 权重包完整性核验）
-Writer: Codex；更新模型准入卡中的权重证据并加定向门禁测试，未改模型运行路径或 UI。
+Milestone: A/B/C/D 工程验收已通过；NeuroVFM 固定权重的两例 DICOM→官方预处理→CPU 编码器→检查级分类头技术链路已跑通。KCL VS_Seg 作者 test 参考数据已取得并临时栅格化；自动肿瘤分割与逐病灶分类仍未完成。
+Base commit: f220cf5（VS-Seg T1 checkpoint 检查限制）
+Writer: Codex；本轮完成作者 test 数据映射、DICOM 配对和临时参考 mask 几何检查，仅更新研究记录及交接文档，未改产品代码或 UI。
 
 Verified 2026-09-23:
   - A/B/C/D 基线见上一提交 80be4cb；本轮没有修改其产品代码，未把旧 PASS 当新性能证据。
@@ -111,8 +111,8 @@ Verified 2026-09-23:
   - 固定官方 VisionTransformer 类体在隔离 CPU namespace 中替换 fused dense/MLP/残差 norm 后，真实编码器权重 strict=True 加载；合成 8 patch 输出 [8,768]，接诊断头得到检查级 [2,74]；两序列合批与分开运行最大差 0，故意缺少 norm.bias 被拒绝。
   - VS-SEG-002/003 各 120 帧单一 MR Series，SimpleITK 3D 读取与 DICOM 患者空间逐片原点最大差 9.33e-14/2.05e-13 mm；混序列、重复 SOP、缺片反例被拒绝。
   - 两例真实 T1 经固定官方预处理及归一化，分别生成 335/283 个 token，CPU 编码器+诊断头输出有限的检查级 [1,74] 分数；前向各约 1.0–1.3 秒、进程峰值 RSS 约 2.4–2.5 GB（仅此本机两例技术测量）。
-  - 上一交接时，KCL VS_Seg T1 官方约 34.4 MB 权重包仍未下载；本轮用户明确授权后已下载并完成归档完整性核验，细节见 `docs/annotation_tumor_plan.md` 的“同日 T1 权重包下载与完整性核验”。作者固定 split 为 176/20/46，vs_gk_2/3 在训练组；恢复的 VS-SEG-002/003 在本项目准入卡中按训练重叠隔离。本机仍没有可用参考 mask，作者测试入口依赖 label，不可原样用于无真值推理。
-  - 权重包官方大小/MD5 匹配，本地 ZIP SHA-256、CRC 与内部 best/last checkpoint SHA-256 已记录；`Annotation_Projects/vs-seg-t1-20260923/` 被 `.gitignore` 忽略。PyTorch 2.13.0 `weights_only=True` 安全读取 best checkpoint 成功；256 个张量条目，首层 shape 与固定上游配置一致。两套本机 Python 均无 MONAI，未构造模型、执行 forward 或生成 mask；准入卡的 `weights` 仍保持 PENDING，直至模型可严格加载。
+  - 作者固定 split 为 176/20/46，vs_gk_2/3 在训练组；恢复的 VS-SEG-002/003 在本项目准入卡中按训练重叠隔离。作者 test 的 46 例 T1 与各自两份候选 RTSTRUCT 已下载：138/138 series，TCIA API 解压数据量 2,985,054,416 bytes，逐文件 MD5/ZIP CRC/实例数通过。DICOM 引用核对 46/46 唯一配对成功，原始 ROI 名保留（TV 39、AN 7）。因本机 Slicer/SlicerRT 为 amd64 而主机 arm64，未能运行官方 SlicerRT 转换；改用既有 `rt-utils 1.2.7` 做探索性栅格，46/46 临时 NIfTI 几何自检通过，最大轮廓平面偏差约 5e-8 mm、非空、SHA-256 逐例记录。此状态仅为 `PROVISIONAL_GEOMETRY_PASS`，不等同官方转换或模型效能验证。证据和脚本在忽略目录 `Annotation_Projects/vs-seg-test-20260923/`，不进 Git。
+  - 权重包官方大小/MD5 匹配，本地 ZIP SHA-256、CRC 与内部 best/last checkpoint SHA-256 已记录；`Annotation_Projects/vs-seg-t1-20260923/` 被 `.gitignore` 忽略。PyTorch 2.13.0 `weights_only=True` 安全读取 best checkpoint 成功；256 个张量条目，首层 shape 与固定上游配置一致。已检查本机多个 Python 环境：仅 `denoise` 有 MONAI 1.5，但新进程导入因重复 `libomp.dylib` abort；未安装依赖，未因当前 mask 准备而构造模型/执行 forward。严格全网加载未通过，准入卡的 `weights` 仍保持 PENDING。
   - TCIA VS-MC-RC2 提供约 6 GB 的外域 NIfTI/T1CE mask 候选，但当前只确认资料与 Aspera 传输要求；未安装插件、未下载或证明训练无交叉。
   - 静态审计恶意 GLOBAL、未知 opcode、非张量顶层、错误摘要 4 个反例测试通过。具体命令与忽略目录下的 JSON 结果见 docs/annotation_tumor_plan.md 的 2026-09-23 节。
 
@@ -121,17 +121,17 @@ Limits:
   - 官方 StudyPreprocessor.load_study 对直接传入的 DICOM 目录逐文件枚举；本轮用已证唯一序列目录的单元素列表入口规避，产品通用输入适配尚未实现。
   - NeuroVFM 只有检查级标签，不生成 mask，也不能自动把类型绑定至某个病灶；产品未接入其权重。
   - A/B 仅有 Undo 无 Redo；C 的主观 UI 验收仍不全；D 的准入拒绝门不是模型效能证明。
-  - KCL 权重包身份与字节完整性已验证，best checkpoint 仅做 safe tensor parse 和首层 shape 对照；全网 strict load、CPU/空间往返、无标签输入和患者级效果均未验证，所以研究/产品准入卡的 `weights` 仍为 PENDING。官方推理脚本使用标签做评分/导出元数据；产品侧 no-label adapter 仍未实现。下载包内的训练/测试日志与示例图不构成本项目独立验证。
+  - KCL 权重包身份与字节完整性已验证，best checkpoint 仅做 safe tensor parse 和首层 shape 对照；全网 strict load、CPU/空间往返、无标签输入和患者级效果均未验证，所以研究/产品准入卡的 `weights` 仍为 PENDING。官方推理脚本使用标签做评分/导出元数据；产品侧 no-label adapter 仍未实现。下载包内的训练/测试日志与示例图不构成本项目独立验证。新生成的 RTSTRUCT mask 仅由 rt-utils 临时产生，未和 SlicerRT 逐体素对照；没有安装模型依赖，也没有运行模型或报告 Dice/HD95。
   - 当前非商用用途已确认；未来若分发权重或改变用途，仍核对许可、署名和分发条件。没有 push。
 
 Feedback for review
 Commit: 本提交（以 git log -1 的实际哈希为准）
-Scope completed: 在用户明确授权后下载 KCL VS_Seg T1 权重包，核对官方文件身份、压缩包完整性和内部 checkpoint 摘要；安全解析 best checkpoint，保留准入卡的 weights=PENDING，避免将本机忽略文件状态硬编码成通用可用性。
-Files changed: `docs/annotation_tumor_plan.md`、`docs/AGENT_SYNC.md`。权重仅保存在忽略目录 `Annotation_Projects/vs-seg-t1-20260923/`，不进入提交。
-Validation: `stat -f '%z' Annotation_Projects/vs-seg-t1-20260923/UNet2d5_Att_Hard_T1_final.zip` → 34377805；`md5 -q Annotation_Projects/vs-seg-t1-20260923/UNet2d5_Att_Hard_T1_final.zip` → 官方 MD5 匹配；`shasum -a 256 Annotation_Projects/vs-seg-t1-20260923/UNet2d5_Att_Hard_T1_final.zip` → ZIP SHA-256 已记录；Python `ZipFile.testzip()` → `None`（所有成员 CRC 通过）；流式计算两个内部 checkpoint SHA-256；`torch.load(..., weights_only=True)` → 256 项纯 tensor OrderedDict，首层为 `(16, 1, 3, 3, 1)`；`python -m unittest tests.test_tumor_model_admission -v` → 6/6 通过；`git check-ignore -v Annotation_Projects/vs-seg-t1-20260923/UNet2d5_Att_Hard_T1_final.zip` → 被 `Annotation_Projects/` 忽略；`git diff --check` → 通过。未运行完整 GUI 测试（产品 UI 未改）。
-Known limits / failures: MONAI 不在两个现有 Python 环境中；未安装依赖或模型包、未进行全网 strict load/forward、无标签 CPU 预处理、mask 空间往返、CPU 资源与患者级效果均未验证。当前两例 VS 病例在作者训练 split 中，只能用于工程调试。
+Scope completed: 下载固定作者 test split 的 46 例 T1 与配套 RTSTRUCT 候选，核对作者/TCIA 病例映射和 DICOM 引用，生成并检查 provisional rt-utils NIfTI masks；更新计划记录和交接，不改产品代码。
+Files changed: `docs/annotation_tumor_plan.md`、`docs/AGENT_SYNC.md`。影像、RTSTRUCT、mask、脚本和 JSON 均保存在忽略目录 `Annotation_Projects/vs-seg-test-20260923/`，不进入 Git。
+Validation: 对 manifest、pairing、conversion summary 执行 JSON 断言 → PASS（138/138 series 且每项 TCIA MD5/ZIP CRC 已验证；46/46 T1/RTSTRUCT series、frame、SOP 引用配对；46/46 临时转换几何、切片引用与 mask SHA-256）；TCIA API 声明解压字节 2,985,054,416；`shasum -a 256` 已记录三个机器报告摘要；`git check-ignore -v` 确认 manifest 与 NIfTI mask 被忽略；`git diff --check` → PASS。完整报告位于 `Annotation_Projects/vs-seg-test-20260923/`。
+Known limits / failures: SlicerRT 当前只有 amd64 构建，未在 arm64 主机运行；临时 rt-utils 结果未与官方 SlicerRT 或第二实现逐体素对照。没有安装依赖，没有 strict checkpoint load、模型推理或效能验证；`weights` 仍为 PENDING。几何自检不是临床标注质量或模型性能证据。
 Decision requested: none。
-Next safe task: 静态审阅固定上游 requirements 和本机现有环境，判断严格加载能否在不安装依赖的前提下完成；同步设计无标签输入与原始 DICOM 空间往返方案，并继续取得作者 test 或训练排除可证明的外部参考 mask。当前两套 Python 均缺 MONAI，不下载/安装依赖或运行模型。VS-SEG-002/003 只作工程调试。NeuroVFM 仍是检查级线索，不能绑定具体病灶；没有病灶级分类证据时保留人工/候选 mask 工作流。
+Next safe task: 在不安装依赖/改系统的范围内，核查原生 arm64 SlicerRT 或可复核官方转换路径，并静态判断现有环境能否严格加载固定 checkpoint；形成可执行、资源受限的下一阶段提案后再进行模型测试。不得把临时 mask 几何通过表述成官方 conversion 或效能通过。
 ```
 
 ## 每轮交接模板
